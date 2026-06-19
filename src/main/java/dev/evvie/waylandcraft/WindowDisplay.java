@@ -95,7 +95,7 @@ public class WindowDisplay {
 		return down.scale(pixelScale() * viewScale);
 	}
 	
-	// World coordinates of the origin of the root surface surface-local coordinate space
+	// World coordinates of the window geometry origin
 	public Vec3 origin() {
 		return pivot.add(localX().scale(-width/2)).add(localY().scale(-height/2));
 	}
@@ -125,15 +125,15 @@ public class WindowDisplay {
 		int yoff = window.framebuffer.getYOff();
 		int bufWidth = window.framebuffer.getWidth();
 		int bufHeight = window.framebuffer.getHeight();
-
+		
 		Vec3 localX = localX();
 		Vec3 localY = localY();
-
+		
 		Vec3 cameraPos = ctx.levelState().cameraRenderState.pos;
 		Vec3 originRel = origin().subtract(cameraPos);
-
-		Vec3 bufOffset = localX.scale(-xoff).add(localY.scale(-yoff));
-
+		
+		Vec3 bufOffset = localX.scale(-xoff - window.geometry.x()).add(localY.scale(-yoff - window.geometry.y()));
+		
 		Vec3 tl = bufOffset;
 		Vec3 bl = bufOffset.add(localY.scale(bufHeight));
 		Vec3 br = bl.add(localX.scale(bufWidth));
@@ -163,6 +163,10 @@ public class WindowDisplay {
 		
 		Vec3 hitPos = intersection.world();
 		Vec3 localCoords = intersection.local();
+		
+		// Change from relative to geometry origin (our plane local) to surface-local coords
+		localCoords = localCoords.add(window.geometry.x(), window.geometry.y(), 0);
+		
 		double dist = intersection.dist();
 		
 		WLCSurface hitSurface = null;
@@ -405,7 +409,7 @@ public class WindowDisplay {
 		// World position
 		public final Vec3 position;
 		
-		// Surface-local coordinates relative to WindowDisplay origin
+		// Root surface surface-local coordinates
 		public final Vec3 surfaceLocalOrigin;
 		
 		// Surface-local coordinates relative to hit surface. Always guaranteed to not be null, if `surface` is non-null.
