@@ -329,4 +329,24 @@ public class RenderUtils {
 		renderTexture2D(context, framebuffer.getTextureLocation(), x, y, w, h, false);
 	}
 	
+	public static void renderLineStrip(PoseStack poseStack, SubmitNodeCollector collector, Vec3[] points, int color, float width) {
+		collector.submitCustomGeometry(poseStack, RenderTypes.lines(), new LineStripDraw(points, color, width));
+	}
+	
+	private static final record LineStripDraw(Vec3[] points, int color, float width) implements CustomGeometryRenderer {
+		
+		@Override
+		public void render(Pose pose, VertexConsumer buffer) {
+			for(int i = 1; i < points.length; i++) {
+				Vec3 start = points[i - 1];
+				Vec3 end = points[i];
+				Vector3f normal = end.subtract(start).toVector3f();
+				
+				buffer.addVertex(pose, start.toVector3f()).setColor(color).setNormal(pose, normal).setLineWidth(width);
+				buffer.addVertex(pose,   end.toVector3f()).setColor(color).setNormal(pose, normal).setLineWidth(width);
+			}
+		}
+		
+	}
+	
 }
