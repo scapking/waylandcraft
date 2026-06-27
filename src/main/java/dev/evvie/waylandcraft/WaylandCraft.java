@@ -28,6 +28,7 @@ import dev.evvie.waylandcraft.grabs.PointerGrabMap.ImplicitGrab;
 import dev.evvie.waylandcraft.grabs.ResizeGrab;
 import dev.evvie.waylandcraft.gui.WaylandHudRenderer;
 import dev.evvie.waylandcraft.gui.WindowManagerScreen;
+import dev.evvie.waylandcraft.item.WindowHandle;
 import dev.evvie.waylandcraft.item.WindowItem;
 import dev.evvie.waylandcraft.item.WindowItemManager;
 import dev.evvie.waylandcraft.render.WindowInHandRenderer;
@@ -643,19 +644,24 @@ public class WaylandCraft implements ClientModInitializer {
 		if(item == null) return null;
 		if(WaylandCraft.instance == null || WaylandCraft.instance.bridge == null) return null;
 		
-		Long data = item.get(WindowItem.WINDOW_HANDLE);
+		WindowHandle data = item.get(WindowItem.WINDOW_HANDLE);
 		if(data == null) return null;
+		if(!data.matchesPlayer(Minecraft.getInstance().player)) return null;
 		
-		long handle = data.longValue();
-		return WaylandCraft.instance.bridge.getToplevel(handle);
+		return WaylandCraft.instance.bridge.getToplevel(data.handle());
 	}
 	
 	private void addWindowItemTooltip(ItemStack itemStack, TooltipContext ctx, TooltipFlag flag, List<Component> list) {
-		Long handle = itemStack.get(WindowItem.WINDOW_HANDLE);
+		WindowHandle handle = itemStack.get(WindowItem.WINDOW_HANDLE);
 		if(handle != null) {
-			String text = "Handle 0x" + Long.toHexString(handle.longValue());
+			String text = "Handle 0x" + Long.toHexString(handle.handle());
 			Component component = Component
 					.literal(text)
+					.withStyle(ChatFormatting.GRAY);
+			list.add(component);
+			String owner = "Owner " + handle.player();
+			component = Component
+					.literal(owner)
 					.withStyle(ChatFormatting.GRAY);
 			list.add(component);
 		}

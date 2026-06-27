@@ -1,6 +1,7 @@
 package dev.evvie.waylandcraft.item;
 
 import java.util.List;
+import java.util.UUID;
 import java.util.stream.StreamSupport;
 
 import dev.evvie.waylandcraft.utils.IMyServerPlayer;
@@ -22,7 +23,7 @@ public class ServerItemManager implements ServerTickEvents.StartLevelTick {
 				ItemStack item = inv.getItem(i);
 				if(!item.is(WindowItem.WINDOW)) continue;
 				
-				Long handle = item.get(WindowItem.WINDOW_HANDLE);
+				WindowHandle handle = item.get(WindowItem.WINDOW_HANDLE);
 				if(!isHandleValid(level, handle)) {
 					inv.setItem(i, ItemStack.EMPTY);
 				}
@@ -49,15 +50,21 @@ public class ServerItemManager implements ServerTickEvents.StartLevelTick {
 			});
 	}
 	
-	private boolean isHandleValid(ServerLevel level, Long handle) {
+	private static ServerPlayer getPlayer(ServerLevel level, UUID id) {
+		for(ServerPlayer player : level.players()) {
+			UUID pid = WindowHandle.getPlayerUUID(player);
+			if(pid.equals(id)) return player;
+		}
+		return null;
+	}
+	
+	private boolean isHandleValid(ServerLevel level, WindowHandle handle) {
 		if(handle == null) return false;
 		
-		for(ServerPlayer player : level.players()) {
-			IMyServerPlayer plr = (IMyServerPlayer) player;
-			if(plr.getAliveWindows().contains(handle)) return true;
-		}
+		ServerPlayer player = getPlayer(level, handle.player());
+		if(player == null) return false;
 		
-		return false;
+		return ((IMyServerPlayer) player).getAliveWindows().contains(handle.handle());
 	}
 	
 	public void giveItems(ServerPlayer player, List<Long> handles) {
@@ -69,33 +76,35 @@ public class ServerItemManager implements ServerTickEvents.StartLevelTick {
 	}
 	
 	public void giveItem(ServerPlayer player, long handle) {
-		ItemStack item = createItem(handle);
+		ItemStack item = createItem(player, handle);
 		player.addItem(item);
 	}
 	
 	public void giveItemIfMissing(ServerPlayer player, long handle) {
 		Inventory inv = player.getInventory();
+		WindowHandle searched = WindowHandle.forPlayer(player, handle);
 		
 		boolean foundToplevel = false;
 		for(int i = 0; i < inv.getContainerSize(); i++) {
 			ItemStack item = inv.getItem(i);
+			WindowHandle data = item.get(WindowItem.WINDOW_HANDLE);
 			
 			if(!item.is(WindowItem.WINDOW)) continue;
-			if(item.get(WindowItem.WINDOW_HANDLE) == handle) {
+			if(data != null && data.equals(searched)) {
 				foundToplevel = true;
 				break;
 			}
 		}
 		
 		if(!foundToplevel) {
-			ItemStack item = createItem(handle);
+			ItemStack item = createItem(player, handle);
 			player.addItem(item);
 		}
 	}
 	
-	public static ItemStack createItem(long handle) {
+	public static ItemStack createItem(ServerPlayer player, long handle) {
 		ItemStack stack = new ItemStack(WindowItem.WINDOW, 1);
-		stack.set(WindowItem.WINDOW_HANDLE, handle);
+		stack.set(WindowItem.WINDOW_HANDLE, WindowHandle.forPlayer(player, handle));
 		return stack;
 	}
 	

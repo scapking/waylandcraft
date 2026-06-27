@@ -1,7 +1,5 @@
 package dev.evvie.waylandcraft.item;
 
-import com.mojang.serialization.Codec;
-
 import dev.evvie.waylandcraft.WaylandCraftCommon;
 import net.minecraft.core.Registry;
 import net.minecraft.core.component.DataComponentType;
@@ -24,11 +22,11 @@ public class WindowItem extends Item {
 	
 	public static Item WINDOW;
 	public static ResourceKey<Item> WINDOW_RESOURCE_KEY = ResourceKey.create(Registries.ITEM, Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "window"));
-	public static DataComponentType<Long> WINDOW_HANDLE;
+	public static DataComponentType<WindowHandle> WINDOW_HANDLE;
 	
 	public static void register() {
 		WINDOW = Registry.register(BuiltInRegistries.ITEM, WINDOW_RESOURCE_KEY, new WindowItem());
-		WINDOW_HANDLE = Registry.register(BuiltInRegistries.DATA_COMPONENT_TYPE, Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "window_handle"), DataComponentType.<Long>builder().persistent(Codec.LONG).build());
+		WINDOW_HANDLE = Registry.register(BuiltInRegistries.DATA_COMPONENT_TYPE, Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "window_handle"), DataComponentType.<WindowHandle>builder().persistent(WindowHandle.CODEC).build());
 	}
 	
 	public WindowItem() {
