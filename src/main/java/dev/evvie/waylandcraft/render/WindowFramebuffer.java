@@ -74,6 +74,7 @@ public class WindowFramebuffer {
 		.withFragmentShader(Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "window_damage"))
 		.withVertexFormat(DefaultVertexFormat.POSITION_TEX, VertexFormat.Mode.QUADS)
 		.withUniform("window_info", UniformType.UNIFORM_BUFFER)
+		.withColorTargetState(new ColorTargetState(new BlendFunction(SourceFactor.ONE, DestFactor.ONE_MINUS_SRC_ALPHA)))
 		.withCull(false)
 		.build()
 	);
@@ -197,13 +198,13 @@ public class WindowFramebuffer {
 			}
 		}
 		
+		if(debugDamage) drawDebugDamage(opaqueUniforms);
+		
 		try(RenderPass pass = RenderSystem.getDevice().createCommandEncoder().createRenderPass(() -> "window framebuffer unpremultiply", target.getColorTextureView(), OptionalInt.empty())) {
 			pass.setPipeline(UNPREMULTIPLY_PIPELINE);
 			pass.bindTexture("sampler", tempTarget.getColorTextureView(), RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST));
 			pass.draw(0, 3);
 		}
-		
-		if(debugDamage) drawDebugDamage(opaqueUniforms);
 	}
 	
 	private void drawDebugDamage(GpuBufferSlice opaqueUniforms) {
@@ -218,7 +219,7 @@ public class WindowFramebuffer {
 		}
 		
 		try {
-			try(RenderPass pass = RenderSystem.getDevice().createCommandEncoder().createRenderPass(() -> "window framebuffer damage", target.getColorTextureView(), OptionalInt.empty())) {
+			try(RenderPass pass = RenderSystem.getDevice().createCommandEncoder().createRenderPass(() -> "window framebuffer damage", tempTarget.getColorTextureView(), OptionalInt.empty())) {
 				pass.setPipeline(DAMAGE_PIPELINE);
 				pass.setUniform("window_info", opaqueUniforms);
 				for(CompiledBufferDraw element : damageElements) {
