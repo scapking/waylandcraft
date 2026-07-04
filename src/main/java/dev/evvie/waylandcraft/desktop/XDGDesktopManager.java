@@ -19,6 +19,7 @@ public class XDGDesktopManager {
 	public XDGDesktopManager(WaylandCraft wlc) {
 		this.wlc = wlc;
 		systemEntryFetchThread = new Thread(this::loadSystemEntries);
+		systemEntryFetchThread.setDaemon(true);
 		systemEntryFetchThread.start();
 	}
 	
@@ -37,6 +38,7 @@ public class XDGDesktopManager {
 		WaylandCraftCommon.LOGGER.info("Completed desktop entry loading in " + Duration.between(start, Instant.now()).toMillis() / 1000.0f + "s");
 		
 		Thread iconPreloadThread = new Thread(this::preloadIcons);
+		iconPreloadThread.setDaemon(true);
 		iconPreloadThread.start();
 	}
 	
