@@ -2,7 +2,7 @@
 
 **Minecraft の中で Linux デスクトップアプリを動かす** — Wayland compositor を Minecraft に統合する Fabric mod。ゲームワールド内で Linux デスクトップのウィンドウを表示・操作でき、マルチプレイでのウィンドウ共有にも対応しています。
 
-> ⚠️ このプロジェクトは元の [WaylandCraft](https://github.com/evvie-jpg/waylandcraft) をベースに、マルチプレイ表示などの機能を AI 支援で実装したものです。**機能・安全性は保証されません。自己責任でご利用ください。**
+> ⚠️ このプロジェクトは元の [WaylandCraft](https://github.com/EVV1E/waylandcraft.git) をベースに、マルチプレイ表示などの機能を AI 支援で実装したものです。**機能・安全性は保証されません。自己責任でご利用ください。**
 
 <p align="center">
   <img src="https://img.shields.io/badge/Minecraft-26.1.2-green" />
@@ -256,6 +256,6 @@ MIT License
 
 ## 謝辞
 
-- [WaylandCraft](https://github.com/evvie-jpg/waylandcraft) — オリジナルプロジェクト
+- [WaylandCraft](https://github.com/EVV1E/waylandcraft.git) — オリジナルプロジェクト
 - [Smithay](https://github.com/Smithay/smithay) — Wayland compositor フレームワーク
 - [Fabric](https://fabricmc.net/) — Minecraft mod loader

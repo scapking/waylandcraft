@@ -2,7 +2,7 @@
 
 **Run Linux desktop apps inside Minecraft** — A Fabric mod that integrates a Wayland compositor into Minecraft, allowing players to view and interact with Linux desktop windows in-game. Supports multi-player window sharing.
 
-> ⚠️ This project is based on the original [WaylandCraft](https://github.com/evvie-jpg/waylandcraft). Multi-player display and other features were AI-implemented. **Functionality and security are NOT guaranteed.** Use at your own risk.
+> ⚠️ This project is based on the original [WaylandCraft](https://github.com/EVV1E/waylandcraft.git). Multi-player display and other features were AI-implemented. **Functionality and security are NOT guaranteed.** Use at your own risk.
 
 <p align="center">
   <img src="https://img.shields.io/badge/Minecraft-26.1.2-green" />
@@ -256,6 +256,6 @@ MIT License
 
 ## Acknowledgments
 
-- [WaylandCraft](https://github.com/evvie-jpg/waylandcraft) — Original project
+- [WaylandCraft](https://github.com/EVV1E/waylandcraft.git) — Original project
 - [Smithay](https://github.com/Smithay/smithay) — Wayland compositor framework
 - [Fabric](https://fabricmc.net/) — Minecraft mod loader
