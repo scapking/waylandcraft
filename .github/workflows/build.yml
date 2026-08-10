@@ -324,16 +324,40 @@ jobs:
           - platform: android
             jar_platform: android
             arch: arm64
+          # Viewer-only platforms: no native capture backend, jar bundles
+          # no native lib / satellite / deps (build.gradle skips them).
+          - platform: windows
+            jar_platform: windows
+            arch: x86_64
+            viewer: true
+          - platform: windows
+            jar_platform: windows
+            arch: arm64
+            viewer: true
+          - platform: macos
+            jar_platform: macos
+            arch: x86_64
+            viewer: true
+          - platform: macos
+            jar_platform: macos
+            arch: arm64
+            viewer: true
+          - platform: ios
+            jar_platform: ios
+            arch: arm64
+            viewer: true
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v6
     - name: Download native lib
+      if: ${{ !matrix.variant.viewer }}
       uses: actions/download-artifact@v8
       with:
         path: native-libs
         pattern: libwaylandcraft-${{ matrix.variant.platform }}-${{ matrix.variant.arch }}
         merge-multiple: true
     - name: Verify native lib
+      if: ${{ !matrix.variant.viewer }}
       run: |
         ls -la native-libs/
         ls -la native-libs/deps/ || true
@@ -382,7 +406,12 @@ jobs:
           gh release upload "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --clobber
         else
           echo "Creating release $TAG"
-          gh release create "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated multi-arch release (linux + android bionic):
-        - waylandcraft-linux-x86_64.jar / waylandcraft-linux-arm64.jar (desktop)
-        - waylandcraft-android-x86_64.jar / waylandcraft-android-arm64.jar (Android launchers like OnyxLauncher)"
+          gh release create "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated per-platform release (native + viewer):
+        Native (full capture + share + view):
+        - waylandcraft-linux-x86_64.jar / waylandcraft-linux-arm64.jar (desktop Linux)
+        - waylandcraft-android-x86_64.jar / waylandcraft-android-arm64.jar (Android launchers like OnyxLauncher)
+        Viewer-only (view shared windows, no local capture):
+        - waylandcraft-windows-x86_64.jar / waylandcraft-windows-arm64.jar
+        - waylandcraft-macos-x86_64.jar / waylandcraft-macos-arm64.jar
+        - waylandcraft-ios-arm64.jar (PojavLauncher/Amethyst)"
         fi

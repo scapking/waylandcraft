@@ -90,17 +90,23 @@
 
 ### 🗺️ 平台支持
 
-| 平台 | 捕获本地窗口 | 查看共享窗口 |
-|------|:---:|:---:|
-| Linux x86_64 / arm64 | ✅ | ✅ |
-| Android（仅查看） | ❌ | ✅ |
-| Windows（仅查看） | ❌ | ✅ |
-| macOS（仅查看） | ❌ | ✅ |
-| iOS（仅查看，实验性） | ❌ | ✅ |
+| 平台 | 捕获本地窗口 | 查看共享窗口 | 下载文件 |
+|------|:---:|:---:|---|
+| Linux x86_64 | ✅ | ✅ | `waylandcraft-linux-x86_64.jar` |
+| Linux arm64 | ✅ | ✅ | `waylandcraft-linux-arm64.jar` |
+| Android x86_64（仅查看） | ❌ | ✅ | `waylandcraft-android-x86_64.jar` |
+| Android arm64（仅查看） | ❌ | ✅ | `waylandcraft-android-arm64.jar` |
+| Windows x86_64（仅查看） | ❌ | ✅ | `waylandcraft-windows-x86_64.jar` |
+| Windows arm64（仅查看） | ❌ | ✅ | `waylandcraft-windows-arm64.jar` |
+| macOS x86_64（仅查看） | ❌ | ✅ | `waylandcraft-macos-x86_64.jar` |
+| macOS arm64（仅查看） | ❌ | ✅ | `waylandcraft-macos-arm64.jar` |
+| iOS arm64（仅查看，实验性） | ❌ | ✅ | `waylandcraft-ios-arm64.jar` |
+
+> **一个平台一个 jar。** 从 [Releases](https://github.com/scapking/waylandcraft/releases) 下载对应你设备的文件——每个 jar 只携带自己平台的 native 组件，因此 Windows/macOS/iOS 是精简的仅查看 jar（约 0.4 MB），自动检测平台并禁用本地捕获。
 
 - **完整模式（Linux）** — 可捕获、共享、查看。
-- **仅查看模式（Android / Windows / macOS）** — 安装同一份 `waylandcraft.jar`；mod 自动检测平台、禁用本地捕获、继续接收共享窗口。无需单独构建。
-- **iOS（仅查看，实验性）** — 通过 [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS)（或其继任者 [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)）在 iOS 上运行 Minecraft Java 版 + Fabric，装同一份 `waylandcraft.jar` 即仅查看模式。尚未实机验证。
+- **仅查看模式（Android / Windows / macOS）** — 安装对应平台的 jar；mod 自动检测平台、禁用本地捕获、继续接收共享窗口。
+- **iOS（仅查看，实验性）** — 通过 [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS)（或其继任者 [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)）在 iOS 上运行 Minecraft Java 版 + Fabric，安装 `waylandcraft-ios-arm64.jar` 即仅查看模式。尚未实机验证。
 
 ---
 
@@ -116,7 +122,7 @@
 ### 安装
 
 1. 安装 Fabric Loader 与 Fabric API。
-2. 将 `waylandcraft.jar` 放入 `.minecraft/mods/`。
+2. 从 [Releases](https://github.com/scapking/waylandcraft/releases) 下载对应你平台/架构的 jar（见 [平台支持](#️-平台支持)）放入 `.minecraft/mods/`——桌面 Linux 用 `waylandcraft-linux-x86_64.jar`，手机用 `waylandcraft-android-arm64.jar`，Apple Silicon 用 `waylandcraft-macos-arm64.jar`。
 3. **多人模式：服务端也必须装 mod**（give/权限/共享逻辑在服务端；不装则这些功能静默失效）。
 4. 启动游戏——单机世界内嵌服务端，共享同一个 `mods/` 目录。
 
@@ -130,7 +136,7 @@
 /wl share start <handle>        # 把窗口共享给队友
 ```
 
-> 💡 **手机观看？** 安装 `waylandcraft-android-<arch>.jar` 并加入服务器——共享窗口自动出现，无需任何配置。
+> 💡 **手机观看？** 安装 `waylandcraft-android-<arch>.jar`（多数手机为 arm64）并加入服务器——共享窗口自动出现，无需任何配置。
 
 ---
 

@@ -90,17 +90,26 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 
 ### 🗺️ Platform Support
 
-| Platform | Capture local windows | View shared windows |
-|----------|:---:|:---:|
-| Linux x86_64 / arm64 | ✅ | ✅ |
-| Android (viewer) | ❌ | ✅ |
-| Windows (viewer) | ❌ | ✅ |
-| macOS (viewer) | ❌ | ✅ |
-| iOS (viewer, experimental) | ❌ | ✅ |
+| Platform | Capture local windows | View shared windows | Download |
+|----------|:---:|:---:|---|
+| Linux x86_64 | ✅ | ✅ | `waylandcraft-linux-x86_64.jar` |
+| Linux arm64 | ✅ | ✅ | `waylandcraft-linux-arm64.jar` |
+| Android x86_64 (viewer) | ❌ | ✅ | `waylandcraft-android-x86_64.jar` |
+| Android arm64 (viewer) | ❌ | ✅ | `waylandcraft-android-arm64.jar` |
+| Windows x86_64 (viewer) | ❌ | ✅ | `waylandcraft-windows-x86_64.jar` |
+| Windows arm64 (viewer) | ❌ | ✅ | `waylandcraft-windows-arm64.jar` |
+| macOS x86_64 (viewer) | ❌ | ✅ | `waylandcraft-macos-x86_64.jar` |
+| macOS arm64 (viewer) | ❌ | ✅ | `waylandcraft-macos-arm64.jar` |
+| iOS arm64 (viewer, experimental) | ❌ | ✅ | `waylandcraft-ios-arm64.jar` |
+
+> **One jar per platform/arch.** Grab the exact file for your device from
+> [Releases](https://github.com/scapking/waylandcraft/releases) — each jar carries
+> only its own native payload, so Windows/macOS/iOS builds are slim viewer-only
+> jars (~0.4 MB) that auto-detect the platform and disable local capture.
 
 - **Full mode (Linux)** — capture, share and view.
-- **Viewer-only mode (Android / Windows / macOS)** — install the same `waylandcraft.jar`; the mod auto-detects the platform, disables local capture, and keeps receiving shared windows. No separate build needed.
-- **iOS (viewer, experimental)** — run Minecraft Java Edition + Fabric via [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS) (or its successor [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)), then install the same `waylandcraft.jar` in viewer-only mode. Not yet field-tested.
+- **Viewer-only mode (Android / Windows / macOS)** — install the jar for your platform; the mod auto-detects the platform, disables local capture, and keeps receiving shared windows.
+- **iOS (viewer, experimental)** — run Minecraft Java Edition + Fabric via [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS) (or its successor [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)), then install `waylandcraft-ios-arm64.jar`. Not yet field-tested.
 
 ---
 
@@ -116,7 +125,7 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 ### Installation
 
 1. Install Fabric Loader and Fabric API.
-2. Drop `waylandcraft.jar` into `.minecraft/mods/`.
+2. Drop the jar for your platform/arch (from [Releases](https://github.com/scapking/waylandcraft/releases), see [Platform Support](#️-platform-support)) into `.minecraft/mods/` — e.g. `waylandcraft-linux-x86_64.jar` on desktop Linux, `waylandcraft-android-arm64.jar` on a phone, `waylandcraft-macos-arm64.jar` on Apple Silicon.
 3. **Multi-player: the server must run the mod too** (give/permission/sharing logic lives server-side; without it these features silently no-op).
 4. Launch the game — single-player worlds embed a server and share the same `mods/` folder.
 
@@ -130,7 +139,7 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 /wl share start <handle>        # Share it with your teammates
 ```
 
-> 💡 **Android viewer?** Install `waylandcraft-android-<arch>.jar` and join the server — shared windows appear automatically, no configuration needed.
+> 💡 **Android viewer?** Install `waylandcraft-android-<arch>.jar` (arm64 for most phones) and join the server — shared windows appear automatically, no configuration needed.
 
 ---
 

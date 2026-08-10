@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Verify a single-arch waylandcraft jar contains exactly the expected
-arch's native lib and (for linux) satellite (used by CI).
+"""Verify a single-platform waylandcraft jar contains exactly the expected
+content: the arch's native lib + (for linux) satellite + bundled deps for
+native platforms; no native payload at all for viewer-only platforms.
 
 Usage: verify_jar.py <platform> <arch>
-  platform: linux-gnu | android
+  platform: linux-gnu | android | windows | macos | ios
   arch:     x86_64 | arm64
 """
 import glob
@@ -12,6 +13,8 @@ import zipfile
 
 platform = sys.argv[1]
 arch = sys.argv[2]
+
+VIEWER_PLATFORMS = ('windows', 'macos', 'ios')
 
 jar_platform = 'linux' if platform == 'linux-gnu' else platform
 jars = glob.glob(f"build/libs/waylandcraft-{jar_platform}-{arch}.jar")
@@ -28,6 +31,16 @@ print("jar:", jar)
 print("native libs:", libs)
 print("satellites:", sats)
 print("bundled deps:", deps)
+
+if platform in VIEWER_PLATFORMS:
+    # Viewer-only jar: no native payload whatsoever.
+    assert libs == [], f"viewer jar should not bundle native libs: {libs}"
+    assert sats == [], f"viewer jar should not bundle satellites: {sats}"
+    assert deps == [], f"viewer jar should not bundle deps: {deps}"
+    assert not any(n.startswith("libwaylandcraft-") for n in names), \
+        f"viewer jar should not bundle any native lib: {[n for n in names if n.startswith('libwaylandcraft-')]}"
+    print("OK (viewer-only)")
+    sys.exit(0)
 
 expected_lib = f"libwaylandcraft-{platform}-{arch}.so"
 assert libs == [expected_lib], f"unexpected native libs: {libs}"

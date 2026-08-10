@@ -90,17 +90,23 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 
 ### 🗺️ 対応プラットフォーム
 
-| プラットフォーム | ローカルウィンドウのキャプチャ | 共有ウィンドウの表示 |
-|------------------|:---:|:---:|
-| Linux x86_64 / arm64 | ✅ | ✅ |
-| Android（表示のみ） | ❌ | ✅ |
-| Windows（表示のみ） | ❌ | ✅ |
-| macOS（表示のみ） | ❌ | ✅ |
-| iOS（表示のみ、実験的） | ❌ | ✅ |
+| プラットフォーム | ローカルウィンドウのキャプチャ | 共有ウィンドウの表示 | ダウンロード |
+|------------------|:---:|:---:|---|
+| Linux x86_64 | ✅ | ✅ | `waylandcraft-linux-x86_64.jar` |
+| Linux arm64 | ✅ | ✅ | `waylandcraft-linux-arm64.jar` |
+| Android x86_64（表示のみ） | ❌ | ✅ | `waylandcraft-android-x86_64.jar` |
+| Android arm64（表示のみ） | ❌ | ✅ | `waylandcraft-android-arm64.jar` |
+| Windows x86_64（表示のみ） | ❌ | ✅ | `waylandcraft-windows-x86_64.jar` |
+| Windows arm64（表示のみ） | ❌ | ✅ | `waylandcraft-windows-arm64.jar` |
+| macOS x86_64（表示のみ） | ❌ | ✅ | `waylandcraft-macos-x86_64.jar` |
+| macOS arm64（表示のみ） | ❌ | ✅ | `waylandcraft-macos-arm64.jar` |
+| iOS arm64（表示のみ、実験的） | ❌ | ✅ | `waylandcraft-ios-arm64.jar` |
+
+> **プラットフォームごとに専用 jar。** [Releases](https://github.com/scapking/waylandcraft/releases) からお使いのデバイスに合ったファイルを入手してください——各 jar は自分のプラットフォームの native だけを同梱するため、Windows/macOS/iOS は軽量な表示のみ jar（約 0.4 MB）で、プラットフォームを自動検出してローカルキャプチャを無効化します。
 
 - **フルモード（Linux）** — キャプチャ・共有・表示が可能。
-- **表示のみモード（Android / Windows / macOS）** — 同じ `waylandcraft.jar` をインストールするだけ。プラットフォームを自動検出してローカルキャプチャを無効化し、共有ウィンドウの受信を継続。別ビルドは不要。
-- **iOS（表示のみ、実験的）** — [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS)（後継の [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)）で iOS 上に Minecraft Java Edition + Fabric を導入し、同じ `waylandcraft.jar` をインストールするだけで表示のみモード。未実機検証。
+- **表示のみモード（Android / Windows / macOS）** — 対応プラットフォームの jar をインストールするだけ。プラットフォームを自動検出してローカルキャプチャを無効化し、共有ウィンドウの受信を継続。
+- **iOS（表示のみ、実験的）** — [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS)（後継の [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)）で iOS 上に Minecraft Java Edition + Fabric を導入し、`waylandcraft-ios-arm64.jar` をインストールするだけで表示のみモード。未実機検証。
 
 ---
 
@@ -116,7 +122,7 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 ### インストール
 
 1. Fabric Loader と Fabric API をインストール。
-2. `waylandcraft.jar` を `.minecraft/mods/` に入れる。
+2. [Releases](https://github.com/scapking/waylandcraft/releases) からお使いのプラットフォーム/アーキテクチャに合った jar（[対応プラットフォーム](#️-対応プラットフォーム)参照）を `.minecraft/mods/` に入れる——デスクトップ Linux は `waylandcraft-linux-x86_64.jar`、スマホは `waylandcraft-android-arm64.jar`、Apple Silicon は `waylandcraft-macos-arm64.jar`。
 3. **マルチプレイ：サーバーにも mod が必要**（give/権限/共有ロジックはサーバー側。無い場合はこれらの機能が静かに無効化される）。
 4. ゲームを起動——シングルプレイの世界はサーバーを内蔵し、同じ `mods/` フォルダを共有。
 
@@ -130,7 +136,7 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 /wl share start <handle>        # ウィンドウをチームメイトへ共有
 ```
 
-> 💡 **スマホで見る？** `waylandcraft-android-<arch>.jar` を入れてサーバーに参加するだけ——共有ウィンドウが自動で表示されます。
+> 💡 **スマホで見る？** `waylandcraft-android-<arch>.jar`（多くのスマホは arm64）を入れてサーバーに参加するだけ——共有ウィンドウが自動で表示されます。
 
 ---
 
