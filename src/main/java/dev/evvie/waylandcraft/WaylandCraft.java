@@ -96,7 +96,7 @@ public class WaylandCraft implements ClientModInitializer {
 	public XDGDesktopManager xdgManager;
 	public PipeWireCaptureManager captureManager = new PipeWireCaptureManager();
 	
-	// 窗口实例别名（w1, w2, w3 …）
+	// 窗口实例别名（4 位随机，如 k7xq）
 	public WindowAliasRegistry windowAliases = new WindowAliasRegistry();
 	// 窗口模板（临时 + 永久）
 	public WindowTemplateManager templateManager = new WindowTemplateManager();
@@ -224,7 +224,7 @@ public class WaylandCraft implements ClientModInitializer {
 		// 窗口分辨率变化后重新执行垂直钳制（底部不低于地面 0.4 格）
 		displays.forEach((d) -> d.clampIfResized());
 		
-		// 维护窗口实例别名（清理已消失窗口，为新窗口分配 wN）
+		// 维护窗口实例别名（清理已消失窗口，为新窗口分配随机别名）
 		HashSet<Long> aliveHandles = new HashSet<>();
 		for(WLCToplevel t : bridge.getToplevels()) {
 			aliveHandles.add(t.getHandle());

@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20x86_64%20%7C%20arm64-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Android%20(viewer)-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.2.32-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.2.33-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -107,7 +107,7 @@
 
 ```text
 /wl launch firefox              # 启动应用（或按 V 键）
-/wl list windows                # 列出窗口；行尾 wN 即窗口别名
+/wl list windows                # 列出窗口；行尾 4 位随机码即窗口别名
 /wl give <handle>               # 把窗口变成物品；右键长按放置到世界
 /wl grab <handle>               # 抓取窗口拖动（G 键切换键盘捕获）
 /wl share start <handle>        # 把窗口共享给队友
@@ -138,7 +138,7 @@
 | 移动（绝对值或 `~` 相对值） | `/wl move <handle> <x> <y> <z>` |
 | 旋转（角度） | `/wl rotate <handle> <angle>` |
 
-**句柄格式** — `<handle>` 支持：`0x` 短句柄、完整句柄、**实例别名 `wN`**（来自 `/wl list windows`，本次会话内唯一）、应用别名（如 `firefox_esr`）。同一应用多窗口用 `别名:N`（如 `firefox:2`）。
+**句柄格式** — `<handle>` 支持：`0x` 短句柄、完整句柄、**实例别名**（4 位随机，如 `k7xq`，来自 `/wl list windows`，本次会话内唯一）、应用别名（如 `firefox_esr`）。同一应用多窗口用 `别名:N`（如 `firefox:2`）。
 
 ### 布局模板
 
@@ -345,6 +345,7 @@ cd .. && ./gradlew clean build
 
 **近期亮点：**
 
+- **v0.2.33** — 窗口实例别名改为 4 位随机码（如 `k7xq`），不再用 w1/w2…；剔除易混字符 `0/o/1/l/i`，更好输入。
 - **v0.2.32** — 透明窗口强制 JPEG 降级（质量调节真正生效）；单帧上限 600 KB → 1.8 MB。
 - **v0.2.31** — 服务端帧中继按窗口分片 N 线程（同窗口保序、异窗口并行）；注册/注销移出 netty 线程。
 - **v0.2.30** — 帧转发整体移出 Server 线程；PBO 永久降级；默认 q0.85 / 10 fps。

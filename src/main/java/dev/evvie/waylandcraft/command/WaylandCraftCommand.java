@@ -335,7 +335,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §e/wl template apply|applyp <name>§7 — 恢复/复现布局§r"));
 		source.sendFeedback(Component.literal(" §e/wl template list|remove|removep§7 — 管理模板§r"));
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
-		source.sendFeedback(Component.literal(" §7<handle> 支持 0x短句柄 / 完整句柄 / 实例别名 wN（wl list windows 显示）/ 应用别名（如 firefox_esr）§r"));
+		source.sendFeedback(Component.literal(" §7<handle> 支持 0x短句柄 / 完整句柄 / 实例别名（4位随机，wl list windows 显示）/ 应用别名（如 firefox_esr）§r"));
 		return 1;
 	}
 
@@ -391,8 +391,8 @@ public class WaylandCraftCommand {
 			if(t != null) return t;
 		}
 
-		// 1.2 实例别名（w1, w2, w3 …，由 /wl list windows 获得，会话内唯一）
-		if(handleStr.matches("w\\d+")) {
+		// 1.2 实例别名（4 位随机如 k7xq，兼容旧格式 w1/w2 …，由 /wl list windows 获得，会话内唯一）
+		if(handleStr.matches("w\\d+") || handleStr.matches("[a-z0-9]{4}")) {
 			Long h = wlc.windowAliases.resolve(handleStr);
 			if(h != null) {
 				WLCToplevel t = wlc.bridge.getToplevel(h);

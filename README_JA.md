@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20x86_64%20%7C%20arm64-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Android%20(viewer)-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.2.32-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.2.33-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -107,7 +107,7 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 
 ```text
 /wl launch firefox              # アプリ起動（または V キー）
-/wl list windows                # ウィンドウ一覧。行末の wN がエイリアス
+/wl list windows                # ウィンドウ一覧。行末の 4 桁ランダムコードがエイリアス
 /wl give <handle>               # ウィンドウをアイテム化。右クリック長押しで設置
 /wl grab <handle>               # ウィンドウを掴んでドラッグ（G キーでキーボードキャプチャ切替）
 /wl share start <handle>        # ウィンドウをチームメイトへ共有
@@ -138,7 +138,7 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 | 移動（絶対値または `~` 相対値） | `/wl move <handle> <x> <y> <z>` |
 | 回転（角度） | `/wl rotate <handle> <angle>` |
 
-**ハンドル形式** — `<handle>` は：`0x` 短ハンドル、完全ハンドル、**インスタンスエイリアス `wN`**（`/wl list windows` 由来、セッション内で一意）、アプリエイリアス（例 `firefox_esr`）に対応。同一アプリの複数ウィンドウは `エイリアス:N`（例 `firefox:2`）。
+**ハンドル形式** — `<handle>` は：`0x` 短ハンドル、完全ハンドル、**インスタンスエイリアス**（4 桁ランダム、例 `k7xq`、`/wl list windows` 由来、セッション内で一意）、アプリエイリアス（例 `firefox_esr`）に対応。同一アプリの複数ウィンドウは `エイリアス:N`（例 `firefox:2`）。
 
 ### レイアウトテンプレート
 
@@ -345,6 +345,7 @@ cd .. && ./gradlew clean build
 
 **最近のハイライト：**
 
+- **v0.2.33** — ウィンドウのインスタンスエイリアスを 4 桁のランダムコード（例 `k7xq`）に変更（w1/w2… は廃止）。紛らわしい `0/o/1/l/i` を除外し入力しやすく。
 - **v0.2.32** — 透明ウィンドウの JPEG 強制劣化（品質調整が実際に有効に）；単一フレーム上限を 600 KB → 1.8 MB に引き上げ。
 - **v0.2.31** — サーバーのフレーム中継をウィンドウ単位で N スレッドに分散（同一ウィンドウは順序維持、別ウィンドウは並列）；登録/登録解除を netty スレッドから分離。
 - **v0.2.30** — フレーム転送を Server スレッドから完全に分離；PBO を恒久フォールバック化；デフォルト q0.85 / 10 fps。

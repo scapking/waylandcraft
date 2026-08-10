@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20x86_64%20%7C%20arm64-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Android%20(viewer)-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.2.32-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.2.33-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -107,7 +107,7 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 
 ```text
 /wl launch firefox              # Launch an app (or press V)
-/wl list windows                # List windows; wN aliases shown at line end
+/wl list windows                # List windows; 4-char random aliases shown at line end
 /wl give <handle>               # Turn the window into an item; right-hold to place in the world
 /wl grab <handle>               # Grab the window and drag it around (G toggles keyboard capture)
 /wl share start <handle>        # Share it with your teammates
@@ -138,7 +138,7 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 | Move (abs or `~` relative) | `/wl move <handle> <x> <y> <z>` |
 | Rotate (degrees) | `/wl rotate <handle> <angle>` |
 
-**Handle formats** — `<handle>` accepts: `0x` short handle, full handle, **instance alias `wN`** (from `/wl list windows`, unique per session), or app alias (e.g. `firefox_esr`). Multiple windows of the same app: `alias:N` (e.g. `firefox:2`).
+**Handle formats** — `<handle>` accepts: `0x` short handle, full handle, **instance alias** (4-char random, e.g. `k7xq`, from `/wl list windows`, unique per session), or app alias (e.g. `firefox_esr`). Multiple windows of the same app: `alias:N` (e.g. `firefox:2`).
 
 ### Layout Templates
 
@@ -345,6 +345,7 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
 
 **Recent highlights:**
 
+- **v0.2.33** — Window instance aliases are now 4-char random codes (e.g. `k7xq`) instead of `w1/w2/…`; ambiguous characters `0/o/1/l/i` excluded for easier typing.
 - **v0.2.32** — Force-JPEG degrade for transparent windows (quality actually works now); single-frame limit raised 600 KB → 1.8 MB.
 - **v0.2.31** — Server frame relay sharded across N threads by window (same window ordered, different windows parallel); register/unregister off the netty thread.
 - **v0.2.30** — Frame relay moved off the Server thread entirely; PBO permanent fallback; default q0.85 / 10 fps.
