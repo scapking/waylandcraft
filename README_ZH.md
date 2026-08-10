@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.2.34-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.2.35-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -96,11 +96,11 @@
 | Android（仅查看） | ❌ | ✅ |
 | Windows（仅查看） | ❌ | ✅ |
 | macOS（仅查看） | ❌ | ✅ |
-| iOS | ❌ | ❌ |
+| iOS（仅查看，实验性） | ❌ | ✅ |
 
 - **完整模式（Linux）** — 可捕获、共享、查看。
 - **仅查看模式（Android / Windows / macOS）** — 安装同一份 `waylandcraft.jar`；mod 自动检测平台、禁用本地捕获、继续接收共享窗口。无需单独构建。
-- **iOS** — 不支持：iOS 上没有 Minecraft Java 版 / Fabric。
+- **iOS（仅查看，实验性）** — 通过 [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS)（或其继任者 [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)）在 iOS 上运行 Minecraft Java 版 + Fabric，装同一份 `waylandcraft.jar` 即仅查看模式。尚未实机验证。
 
 ---
 
@@ -264,7 +264,7 @@
 答：能。`xwayland-satellite` 已内置进 jar（`x86_64` 与 `arm64` 双架构），X11 程序会自动获得 `DISPLAY`。系统仍需 `Xwayland`——几乎所有 Wayland 桌面都自带。
 
 **问：支持 Windows / macOS 吗？**
-答：支持仅查看模式。安装同一份 `waylandcraft.jar`——mod 自动检测平台、禁用本地窗口捕获、仍可接收共享窗口。iOS 不支持（没有 Minecraft Java 版 / Fabric）。
+答：支持仅查看模式。安装同一份 `waylandcraft.jar`——mod 自动检测平台、禁用本地窗口捕获、仍可接收共享窗口。iOS 可用 PojavLauncher/Amethyst 运行 Java 版 + Fabric（实验性，未实机验证）。
 
 **问：共享画面模糊/卡顿，怎么提升？**
 答：调高画质或帧率：`/wl share quality <handle> <缩放> <质量> <帧率>`，或直接应用 `quality` 预设。默认是均衡档；画质降级时 UI 尺寸保持不变。
@@ -362,6 +362,7 @@ cd .. && ./gradlew clean build
 
 **近期亮点：**
 
+- **v0.2.35** — 新增 iOS 检测（PojavLauncher/Amethyst 运行时）：仅查看模式、同一份 jar、共享窗口可渲染；平台矩阵更新。
 - **v0.2.34** — Windows/macOS 支持**仅查看模式**：自动检测平台并跳过本地捕获；同一份 jar 在 Linux/Windows/macOS/Android 通用；共享窗口仍可渲染。
 - **v0.2.33** — 窗口实例别名改为 4 位随机码（如 `k7xq`），不再用 w1/w2…；剔除易混字符 `0/o/1/l/i`，更好输入。
 - **v0.2.32** — 透明窗口强制 JPEG 降级（质量调节真正生效）；单帧上限 600 KB → 1.8 MB。

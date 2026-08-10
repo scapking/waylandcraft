@@ -177,13 +177,28 @@ public class WaylandCraftBridge {
 	}
 
 	/**
+	 * Detect iOS (PojavLauncher / Amethyst runtime). The JVM there reports
+	 * os.name "Linux", so we probe for canonical iOS marker files as well.
+	 */
+	private static boolean isIOS() {
+		String os = System.getProperty("os.name", "");
+		if(os.toLowerCase().contains("ios")) return true;
+		try {
+			return new File("/System/Library/CoreServices/SystemVersion.plist").exists()
+					|| new File("/var/mobile").exists();
+		} catch (Throwable t) {
+			return false;
+		}
+	}
+
+	/**
 	 * Native lib name platform component, e.g. "linux-gnu" or "android".
-	 * Returns null on platforms with no native capture support (Windows/macOS):
+	 * Returns null on platforms with no native capture support (Windows/macOS/iOS):
 	 * the mod then runs in viewer-only mode — local window capture is unavailable,
 	 * but shared windows can still be received and rendered.
 	 */
 	private static String nativePlatform() {
-		if(isWindows() || isMac()) return null;
+		if(isWindows() || isMac() || isIOS()) return null;
 		return isAndroid() ? "android" : "linux-gnu";
 	}
 	

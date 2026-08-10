@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.2.34-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.2.35-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -96,11 +96,11 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 | Android (viewer) | ❌ | ✅ |
 | Windows (viewer) | ❌ | ✅ |
 | macOS (viewer) | ❌ | ✅ |
-| iOS | ❌ | ❌ |
+| iOS (viewer, experimental) | ❌ | ✅ |
 
 - **Full mode (Linux)** — capture, share and view.
 - **Viewer-only mode (Android / Windows / macOS)** — install the same `waylandcraft.jar`; the mod auto-detects the platform, disables local capture, and keeps receiving shared windows. No separate build needed.
-- **iOS** — not supported: Minecraft Java Edition / Fabric does not exist on iOS.
+- **iOS (viewer, experimental)** — run Minecraft Java Edition + Fabric via [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS) (or its successor [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)), then install the same `waylandcraft.jar` in viewer-only mode. Not yet field-tested.
 
 ---
 
@@ -264,7 +264,7 @@ A: Yes. Install `waylandcraft-android-<arch>.jar` and join the server. Windows s
 A: Yes. `xwayland-satellite` is bundled inside the jar (both `x86_64` and `arm64`), so X11 apps get a `DISPLAY` automatically. The system still needs `Xwayland`, which ships with virtually every Wayland desktop.
 
 **Q: Does it work on Windows/macOS?**
-A: Viewer-only. Install the same `waylandcraft.jar` — the mod auto-detects the platform, disables local window capture, and still receives shared windows. iOS is not supported (no Minecraft Java Edition / Fabric there).
+A: Viewer-only. Install the same `waylandcraft.jar` — the mod auto-detects the platform, disables local window capture, and still receives shared windows. On iOS, use PojavLauncher/Amethyst to run Java Edition + Fabric (experimental, not yet field-tested).
 
 **Q: Shared image is blurry / laggy. How do I improve it?**
 A: Raise quality or fps: `/wl share quality <handle> <scale> <quality> <fps>`, or apply the `quality` preset. Remember the default is a balanced profile; UI size is preserved even when quality degrades.
@@ -362,6 +362,7 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
 
 **Recent highlights:**
 
+- **v0.2.35** — iOS detection added (PojavLauncher/Amethyst runtime): viewer-only mode, same jar, shared windows render; platform matrix updated.
 - **v0.2.34** — Windows/macOS now supported in **viewer-only mode**: platform auto-detection skips native capture; the same jar works on Linux/Windows/macOS/Android; shared windows still render.
 - **v0.2.33** — Window instance aliases are now 4-char random codes (e.g. `k7xq`) instead of `w1/w2/…`; ambiguous characters `0/o/1/l/i` excluded for easier typing.
 - **v0.2.32** — Force-JPEG degrade for transparent windows (quality actually works now); single-frame limit raised 600 KB → 1.8 MB.
