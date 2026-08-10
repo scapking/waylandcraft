@@ -11,9 +11,9 @@
   <img src="https://img.shields.io/badge/Fabric%20Loader-0.19.2+-blue" />
   <img src="https://img.shields.io/badge/Fabric%20API-0.147.0%2B-blue" />
   <img src="https://img.shields.io/badge/Java-25-orange" />
-  <img src="https://img.shields.io/badge/Platform-Linux%20x86_64%20%7C%20arm64-lightgrey" />
-  <img src="https://img.shields.io/badge/Platform-Android%20(viewer)-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.2.33-brightgreen" />
+  <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
+  <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
+  <img src="https://img.shields.io/badge/Version-v0.2.34-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -25,6 +25,7 @@
 ## Table of Contents
 
 - [✨ Features](#-features)
+- [🗺️ Platform Support](#️-platform-support)
 - [🚀 Quick Start](#-quick-start)
 - [📖 Usage Guide](#-usage-guide)
 - [📚 Command Reference](#-command-reference)
@@ -87,6 +88,22 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 
 ---
 
+### 🗺️ Platform Support
+
+| Platform | Capture local windows | View shared windows |
+|----------|:---:|:---:|
+| Linux x86_64 / arm64 | ✅ | ✅ |
+| Android (viewer) | ❌ | ✅ |
+| Windows (viewer) | ❌ | ✅ |
+| macOS (viewer) | ❌ | ✅ |
+| iOS | ❌ | ❌ |
+
+- **Full mode (Linux)** — capture, share and view.
+- **Viewer-only mode (Android / Windows / macOS)** — install the same `waylandcraft.jar`; the mod auto-detects the platform, disables local capture, and keeps receiving shared windows. No separate build needed.
+- **iOS** — not supported: Minecraft Java Edition / Fabric does not exist on iOS.
+
+---
+
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -94,7 +111,7 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 - Minecraft **26.1.2** (Java Edition)
 - Fabric Loader **0.19.x** + Fabric API **0.147.0+26.1.2**
 - **Java 25**
-- Linux with a **Wayland** session (window capture requires Wayland; X11-only sessions are not supported)
+- Linux with a **Wayland** session for full mode (capture requires Wayland; X11-only sessions are not supported) — Windows/macOS/Android run in viewer-only mode, see [Platform Support](#️-platform-support)
 
 ### Installation
 
@@ -247,7 +264,7 @@ A: Yes. Install `waylandcraft-android-<arch>.jar` and join the server. Windows s
 A: Yes. `xwayland-satellite` is bundled inside the jar (both `x86_64` and `arm64`), so X11 apps get a `DISPLAY` automatically. The system still needs `Xwayland`, which ships with virtually every Wayland desktop.
 
 **Q: Does it work on Windows/macOS?**
-A: No. Window capture requires a Linux + Wayland session.
+A: Viewer-only. Install the same `waylandcraft.jar` — the mod auto-detects the platform, disables local window capture, and still receives shared windows. iOS is not supported (no Minecraft Java Edition / Fabric there).
 
 **Q: Shared image is blurry / laggy. How do I improve it?**
 A: Raise quality or fps: `/wl share quality <handle> <scale> <quality> <fps>`, or apply the `quality` preset. Remember the default is a balanced profile; UI size is preserved even when quality degrades.
@@ -345,6 +362,7 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
 
 **Recent highlights:**
 
+- **v0.2.34** — Windows/macOS now supported in **viewer-only mode**: platform auto-detection skips native capture; the same jar works on Linux/Windows/macOS/Android; shared windows still render.
 - **v0.2.33** — Window instance aliases are now 4-char random codes (e.g. `k7xq`) instead of `w1/w2/…`; ambiguous characters `0/o/1/l/i` excluded for easier typing.
 - **v0.2.32** — Force-JPEG degrade for transparent windows (quality actually works now); single-frame limit raised 600 KB → 1.8 MB.
 - **v0.2.31** — Server frame relay sharded across N threads by window (same window ordered, different windows parallel); register/unregister off the netty thread.

@@ -162,9 +162,28 @@ public class WaylandCraftBridge {
 			return false;
 		}
 	}
-	
-	/** Native lib name platform component, e.g. "linux-gnu" or "android". */
+
+	/** Detect Windows. */
+	private static boolean isWindows() {
+		String os = System.getProperty("os.name", "");
+		return os.toLowerCase().contains("win");
+	}
+
+	/** Detect macOS. */
+	private static boolean isMac() {
+		String os = System.getProperty("os.name", "");
+		String lower = os.toLowerCase();
+		return lower.contains("mac") || lower.contains("darwin");
+	}
+
+	/**
+	 * Native lib name platform component, e.g. "linux-gnu" or "android".
+	 * Returns null on platforms with no native capture support (Windows/macOS):
+	 * the mod then runs in viewer-only mode — local window capture is unavailable,
+	 * but shared windows can still be received and rendered.
+	 */
 	private static String nativePlatform() {
+		if(isWindows() || isMac()) return null;
 		return isAndroid() ? "android" : "linux-gnu";
 	}
 	
@@ -186,15 +205,20 @@ public class WaylandCraftBridge {
 		}
 		
 		if(arch != null) {
-			String platform = nativePlatform() + "-" + arch;
-			stream = loadResource("/libwaylandcraft-" + platform + ".so");
-			if(stream != null) return stream;
-			
-			// Fall back to the other platform's build (e.g. an android jar running
-			// in an emulator that reports linux-gnu, or a linux jar on android).
-			String otherPlatform = (isAndroid() ? "linux-gnu" : "android") + "-" + arch;
-			stream = loadResource("/libwaylandcraft-" + otherPlatform + ".so");
-			if(stream != null) return stream;
+			String platform = nativePlatform();
+			if(platform != null) {
+				String full = platform + "-" + arch;
+				stream = loadResource("/libwaylandcraft-" + full + ".so");
+				if(stream != null) return stream;
+				
+				// Fall back to the other platform's build (e.g. an android jar running
+				// in an emulator that reports linux-gnu, or a linux jar on android).
+				String otherPlatform = (isAndroid() ? "linux-gnu" : "android") + "-" + arch;
+				stream = loadResource("/libwaylandcraft-" + otherPlatform + ".so");
+				if(stream != null) return stream;
+			} else {
+				WaylandCraftCommon.LOGGER.info("WaylandCraft local window capture is not supported on this OS; running in viewer-only mode");
+			}
 		}
 		
 		/* Attempt to load manually built native library (fallback) */

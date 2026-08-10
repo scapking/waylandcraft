@@ -11,9 +11,9 @@
   <img src="https://img.shields.io/badge/Fabric%20Loader-0.19.2+-blue" />
   <img src="https://img.shields.io/badge/Fabric%20API-0.147.0%2B-blue" />
   <img src="https://img.shields.io/badge/Java-25-orange" />
-  <img src="https://img.shields.io/badge/Platform-Linux%20x86_64%20%7C%20arm64-lightgrey" />
-  <img src="https://img.shields.io/badge/Platform-Android%20(viewer)-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.2.33-brightgreen" />
+  <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
+  <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
+  <img src="https://img.shields.io/badge/Version-v0.2.34-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -25,6 +25,7 @@
 ## 目次
 
 - [✨ 特徴](#-特徴)
+- [🗺️ 対応プラットフォーム](#️-対応プラットフォーム)
 - [🚀 クイックスタート](#-クイックスタート)
 - [📖 使い方ガイド](#-使い方ガイド)
 - [📚 コマンドリファレンス](#-コマンドリファレンス)
@@ -87,6 +88,22 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 
 ---
 
+### 🗺️ 対応プラットフォーム
+
+| プラットフォーム | ローカルウィンドウのキャプチャ | 共有ウィンドウの表示 |
+|------------------|:---:|:---:|
+| Linux x86_64 / arm64 | ✅ | ✅ |
+| Android（表示のみ） | ❌ | ✅ |
+| Windows（表示のみ） | ❌ | ✅ |
+| macOS（表示のみ） | ❌ | ✅ |
+| iOS | ❌ | ❌ |
+
+- **フルモード（Linux）** — キャプチャ・共有・表示が可能。
+- **表示のみモード（Android / Windows / macOS）** — 同じ `waylandcraft.jar` をインストールするだけ。プラットフォームを自動検出してローカルキャプチャを無効化し、共有ウィンドウの受信を継続。別ビルドは不要。
+- **iOS** — 非対応：iOS には Minecraft Java Edition / Fabric が存在しません。
+
+---
+
 ## 🚀 クイックスタート
 
 ### 前提条件
@@ -94,7 +111,7 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 - Minecraft **26.1.2**（Java Edition）
 - Fabric Loader **0.19.x** + Fabric API **0.147.0+26.1.2**
 - **Java 25**
-- Linux **Wayland** セッション（ウィンドウキャプチャに Wayland が必要。X11 のみのセッションは非対応）
+- フルモードには Linux **Wayland** セッションが必要（キャプチャに Wayland 必須。X11 のみのセッションは非対応）——Windows/macOS/Android は表示のみモード（[対応プラットフォーム](#️-対応プラットフォーム)参照）
 
 ### インストール
 
@@ -247,7 +264,7 @@ A: 見られます。`waylandcraft-android-<arch>.jar` を入れてサーバー�
 A: 動きます。`xwayland-satellite` が jar に同梱されており（`x86_64`/`arm64` 両対応）、X11 アプリに `DISPLAY` が自動提供されます。システムに `Xwayland` が必要ですが、ほぼすべての Wayland デスクトップに付属しています。
 
 **Q: Windows / macOS は対応していますか？**
-A: いいえ。ウィンドウキャプチャには Linux + Wayland セッションが必要です。
+A: 表示のみモードで対応。同じ `waylandcraft.jar` をインストールするだけ——プラットフォームを自動検出してローカルキャプチャを無効化し、共有ウィンドウの受信は継続します。iOS は非対応（Java Edition / Fabric が存在しないため）。
 
 **Q: 共有画面がぼやける/遅い。どう改善する？**
 A: 品質かフレームレートを上げてください：`/wl share quality <handle> <スケール> <品質> <fps>`、または `quality` プリセットを適用。デフォルトはバランス設定です。画質を下げても UI サイズは変わりません。
@@ -345,6 +362,7 @@ cd .. && ./gradlew clean build
 
 **最近のハイライト：**
 
+- **v0.2.34** — Windows/macOS を**表示のみモード**で対応：プラットフォームを自動検出してローカルキャプチャをスキップ。同じ jar が Linux/Windows/macOS/Android で動作し、共有ウィンドウの表示は継続。
 - **v0.2.33** — ウィンドウのインスタンスエイリアスを 4 桁のランダムコード（例 `k7xq`）に変更（w1/w2… は廃止）。紛らわしい `0/o/1/l/i` を除外し入力しやすく。
 - **v0.2.32** — 透明ウィンドウの JPEG 強制劣化（品質調整が実際に有効に）；単一フレーム上限を 600 KB → 1.8 MB に引き上げ。
 - **v0.2.31** — サーバーのフレーム中継をウィンドウ単位で N スレッドに分散（同一ウィンドウは順序維持、別ウィンドウは並列）；登録/登録解除を netty スレッドから分離。

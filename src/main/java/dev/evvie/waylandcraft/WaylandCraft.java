@@ -311,7 +311,7 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		if(keyOpenScreen.consumeClick()) {
 			if(bridge == null) {
-				minecraft.getChatListener().handleSystemMessage(Component.literal("WaylandCraft native unavailable on this platform; mod disabled"), false);
+				minecraft.getChatListener().handleSystemMessage(Component.literal("WaylandCraft viewer-only mode: local window capture unavailable on this platform; you can still view shared windows"), false);
 				return;
 			}
 			keyboardCaptureMode = KeyboardCaptureMode.NONE;
@@ -329,9 +329,11 @@ public class WaylandCraft implements ClientModInitializer {
 	
 	private void onClientJoin(ClientPacketListener listener, PacketSender sender, Minecraft minecraft) {
 		if(bridge == null) {
-			// Native library unavailable (e.g. Android launcher): never pretend the
-			// compositor is running and never dereference the null bridge.
-			minecraft.getChatListener().handleSystemMessage(Component.literal("WaylandCraft native unavailable on this platform; mod disabled"), false);
+			// Native library unavailable (e.g. Android launcher, Windows, macOS):
+			// never pretend the compositor is running and never dereference the
+			// null bridge. The mod stays in viewer-only mode — shared windows
+			// (SharedWindowClientHandler) still render, capture commands no-op.
+			minecraft.getChatListener().handleSystemMessage(Component.literal("WaylandCraft viewer-only mode: local window capture unavailable on this platform; you can still view shared windows"), false);
 			return;
 		}
 		minecraft.getChatListener().handleSystemMessage(Component.literal("Wayland compositor running on " + waylandSocket), false);

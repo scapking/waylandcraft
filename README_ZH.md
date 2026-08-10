@@ -11,9 +11,9 @@
   <img src="https://img.shields.io/badge/Fabric%20Loader-0.19.2+-blue" />
   <img src="https://img.shields.io/badge/Fabric%20API-0.147.0%2B-blue" />
   <img src="https://img.shields.io/badge/Java-25-orange" />
-  <img src="https://img.shields.io/badge/Platform-Linux%20x86_64%20%7C%20arm64-lightgrey" />
-  <img src="https://img.shields.io/badge/Platform-Android%20(viewer)-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.2.33-brightgreen" />
+  <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
+  <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
+  <img src="https://img.shields.io/badge/Version-v0.2.34-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -25,6 +25,7 @@
 ## 目录
 
 - [✨ 特性](#-特性)
+- [🗺️ 平台支持](#️-平台支持)
 - [🚀 快速开始](#-快速开始)
 - [📖 使用指南](#-使用指南)
 - [📚 命令参考](#-命令参考)
@@ -87,6 +88,22 @@
 
 ---
 
+### 🗺️ 平台支持
+
+| 平台 | 捕获本地窗口 | 查看共享窗口 |
+|------|:---:|:---:|
+| Linux x86_64 / arm64 | ✅ | ✅ |
+| Android（仅查看） | ❌ | ✅ |
+| Windows（仅查看） | ❌ | ✅ |
+| macOS（仅查看） | ❌ | ✅ |
+| iOS | ❌ | ❌ |
+
+- **完整模式（Linux）** — 可捕获、共享、查看。
+- **仅查看模式（Android / Windows / macOS）** — 安装同一份 `waylandcraft.jar`；mod 自动检测平台、禁用本地捕获、继续接收共享窗口。无需单独构建。
+- **iOS** — 不支持：iOS 上没有 Minecraft Java 版 / Fabric。
+
+---
+
 ## 🚀 快速开始
 
 ### 前置要求
@@ -94,7 +111,7 @@
 - Minecraft **26.1.2**（Java 版）
 - Fabric Loader **0.19.x** + Fabric API **0.147.0+26.1.2**
 - **Java 25**
-- Linux **Wayland** 会话（窗口捕获依赖 Wayland；仅 X11 的会话不支持）
+- 完整模式需要 Linux **Wayland** 会话（捕获依赖 Wayland；仅 X11 的会话不支持）——Windows/macOS/Android 为仅查看模式，见 [平台支持](#️-平台支持)
 
 ### 安装
 
@@ -247,7 +264,7 @@
 答：能。`xwayland-satellite` 已内置进 jar（`x86_64` 与 `arm64` 双架构），X11 程序会自动获得 `DISPLAY`。系统仍需 `Xwayland`——几乎所有 Wayland 桌面都自带。
 
 **问：支持 Windows / macOS 吗？**
-答：不支持。窗口捕获要求 Linux + Wayland 会话。
+答：支持仅查看模式。安装同一份 `waylandcraft.jar`——mod 自动检测平台、禁用本地窗口捕获、仍可接收共享窗口。iOS 不支持（没有 Minecraft Java 版 / Fabric）。
 
 **问：共享画面模糊/卡顿，怎么提升？**
 答：调高画质或帧率：`/wl share quality <handle> <缩放> <质量> <帧率>`，或直接应用 `quality` 预设。默认是均衡档；画质降级时 UI 尺寸保持不变。
@@ -345,6 +362,7 @@ cd .. && ./gradlew clean build
 
 **近期亮点：**
 
+- **v0.2.34** — Windows/macOS 支持**仅查看模式**：自动检测平台并跳过本地捕获；同一份 jar 在 Linux/Windows/macOS/Android 通用；共享窗口仍可渲染。
 - **v0.2.33** — 窗口实例别名改为 4 位随机码（如 `k7xq`），不再用 w1/w2…；剔除易混字符 `0/o/1/l/i`，更好输入。
 - **v0.2.32** — 透明窗口强制 JPEG 降级（质量调节真正生效）；单帧上限 600 KB → 1.8 MB。
 - **v0.2.31** — 服务端帧中继按窗口分片 N 线程（同窗口保序、异窗口并行）；注册/注销移出 netty 线程。
