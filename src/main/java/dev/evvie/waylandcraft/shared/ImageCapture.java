@@ -159,6 +159,25 @@ public class ImageCapture {
 	 */
 	@Nullable
 	public static byte[] captureFromFramebuffer(long windowHandle, WindowFramebuffer framebuffer, float scale, float quality) {
+		return captureFromFramebufferInternal(windowHandle, framebuffer, scale, quality, false);
+	}
+	
+	/**
+	 * 强制 JPEG 捕获（v0.2.32）：与 captureFromFramebuffer 相同，但透明像素
+	 * 混合到黑色背景后一律走 JPEG 编码，绝不走 PNG。
+	 * 
+	 * 用途：JPEG 大小保护降级。原实现里窗口含透明像素时走 PNG（无损，
+	 * quality 参数无效），降级重编码前后字节数完全相同 → 降到阶梯底仍超限
+	 * → 所有帧被 DROP（用户实测 1139174 -> 1139174 恒定）。强制 JPEG 后
+	 * quality 才能真正生效，降级才有效。
+	 */
+	@Nullable
+	public static byte[] captureFromFramebufferJpeg(long windowHandle, WindowFramebuffer framebuffer, float scale, float quality) {
+		return captureFromFramebufferInternal(windowHandle, framebuffer, scale, quality, true);
+	}
+	
+	@Nullable
+	private static byte[] captureFromFramebufferInternal(long windowHandle, WindowFramebuffer framebuffer, float scale, float quality, boolean forceJpeg) {
 		if(!framebuffer.isValid()) {
 			return null;
 		}
@@ -235,7 +254,7 @@ public class ImageCapture {
 			}
 			
 			// Step 3: 直接RGBA→JPEG编码（跳过BufferedImage中间层）
-			return compressToJpegDirect(pixelData, dstW, dstH, quality, true);
+			return compressToJpegDirect(pixelData, dstW, dstH, quality, true, forceJpeg);
 			
 		} catch(Exception e) {
 			LOGGER.error("Failed to capture from framebuffer", e);
@@ -671,14 +690,25 @@ public class ImageCapture {
 	 */
 	@Nullable
 	public static byte[] compressToJpegDirect(ByteBuffer rgbaBuffer, int width, int height, float quality, boolean flipY) {
+		return compressToJpegDirect(rgbaBuffer, width, height, quality, flipY, false);
+	}
+	
+	/**
+	 * forceJpeg=true 时（v0.2.32）：透明像素混合到黑色背景后一律 JPEG，
+	 * 绝不走 PNG —— 供大小保护降级使用，保证 quality 参数真正生效。
+	 */
+	@Nullable
+	public static byte[] compressToJpegDirect(ByteBuffer rgbaBuffer, int width, int height, float quality, boolean flipY, boolean forceJpeg) {
 		try {
-			// 先检查是否有透明像素（决定用 PNG 还是 JPEG）
+			// 先检查是否有透明像素（决定用 PNG 还是 JPEG；forceJpeg 时跳过）
 			boolean hasAlpha = false;
-			// 采样检查：隔行扫描，减少开销；但为准确起见扫全部 alpha 通道
-			for(int i = 3; i < width * height * 4; i += 4) {
-				if((rgbaBuffer.get(i) & 0xFF) != 0xFF) {
-					hasAlpha = true;
-					break;
+			if(!forceJpeg) {
+				// 采样检查：隔行扫描，减少开销；但为准确起见扫全部 alpha 通道
+				for(int i = 3; i < width * height * 4; i += 4) {
+					if((rgbaBuffer.get(i) & 0xFF) != 0xFF) {
+						hasAlpha = true;
+						break;
+					}
 				}
 			}
 			// 回到缓冲区开头（上面的扫描用了绝对 get，不影响 position；保险起见 rewind）
@@ -708,7 +738,7 @@ public class ImageCapture {
 				return outputStream.toByteArray();
 			}
 			
-			// JPEG：无透明，直接 RGB
+			// JPEG：无透明，直接 RGB；forceJpeg 时透明像素混合到黑色背景
 			BufferedImage rgbImage = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
 			int[] rgbPixels = new int[width * height];
 			
@@ -722,6 +752,15 @@ public class ImageCapture {
 					int r = rgbaBuffer.get(pixelOffset) & 0xFF;
 					int g = rgbaBuffer.get(pixelOffset + 1) & 0xFF;
 					int b = rgbaBuffer.get(pixelOffset + 2) & 0xFF;
+					if(forceJpeg) {
+						// 透明像素按 alpha 混合到黑色背景（alpha<255 时压暗；全透明=纯黑）
+						int a = rgbaBuffer.get(pixelOffset + 3) & 0xFF;
+						if(a < 255) {
+							r = r * a / 255;
+							g = g * a / 255;
+							b = b * a / 255;
+						}
+					}
 					// 跳过alpha（JPEG不支持）
 					rgbPixels[y * width + x] = (r << 16) | (g << 8) | b;
 				}
@@ -934,9 +973,14 @@ public class ImageCapture {
 		// 注意：WindowShareManager 的"降级只降 quality 不降 scale"是 UI 大小底线，
 		// 与这里的 scale 阶梯并不冲突 —— captureFrameWithSizeProtection 传参时
 		// scale 被冻结为 effectiveScale，实际运行时不会走 scale 阶梯。
-		public static final long DEFAULT_MAX_JPEG_BYTES = 600_000L;
-		public static final int DEFAULT_MAX_DEGRADE_ROUNDS = 2;
-		public static final float[] DEFAULT_JPEG_QUALITY_LADDER = {1.0f, 0.85f, 0.7f};
+		// v0.2.32：maxJpegBytes 600KB → 1.8MB（对齐服务端 SharedWindowFrameRelay 1.9MB
+		// 协议上限留余量）。原 600KB 对高分屏窗口（1080p+ 满屏 UI 可达 1.1MB+）过严，
+		// 且含透明像素时走 PNG 无损路径 quality 无效 → 降级无效 → 全部帧被 DROP → 查看端卡死。
+		// 少部分人使用、带宽不敏感，优先保证画面可达；极端超大帧由强制 JPEG 降级兜底。
+		public static final long DEFAULT_MAX_JPEG_BYTES = 1_800_000L;
+		public static final int DEFAULT_MAX_DEGRADE_ROUNDS = 3;
+		// 阶梯加低档：1.0 → 0.85 → 0.7 → 0.55 → 0.4，极端情况仍有降级空间
+		public static final float[] DEFAULT_JPEG_QUALITY_LADDER = {1.0f, 0.85f, 0.7f, 0.55f, 0.4f};
 		public static final float[] DEFAULT_JPEG_SCALE_LADDER = {1.0f, 0.75f, 0.5f};
 		
 		public long maxJpegBytes;         // 单帧 JPEG 大小上限（超限自动降级重编码；0 表示不限制）

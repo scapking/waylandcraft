@@ -347,7 +347,11 @@ public class WindowShareManager {
 				}
 				quality = nextQuality;
 				
-				byte[] reencoded = ImageCapture.captureFromFramebuffer(
+				// v0.2.32：降级重编码强制 JPEG（透明像素混合黑背景）。
+				// 原实现走 captureFromFramebuffer：窗口含透明像素时走 PNG 无损路径，
+				// quality 参数无效 → 降级前后字节数相同（如 1139174 -> 1139174）→
+				// 降到阶梯底仍超限 → 全部帧被 DROP。强制 JPEG 后 quality 才真正生效。
+				byte[] reencoded = ImageCapture.captureFromFramebufferJpeg(
 					state.windowHandle,
 					toplevel.framebuffer,
 					scale,      // 保持不变：UI 大小是底线
