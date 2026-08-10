@@ -9,16 +9,24 @@
   <img src="https://img.shields.io/badge/Fabric%20Loader-0.19.2+-blue" />
   <img src="https://img.shields.io/badge/Fabric%20API-0.147.0%2B-blue" />
   <img src="https://img.shields.io/badge/Java-25-orange" />
-  <img src="https://img.shields.io/badge/Version-v0.2.30-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.2.32-brightgreen" />
 </p>
 
 ---
 
 ## Download
 
-👉 **[Latest Release (v0.2.30)](https://github.com/scapking/waylandcraft/releases/latest)** — Download `waylandcraft.jar` and drop it into your `mods/` folder.
+👉 **[Latest Release (v0.2.32)](https://github.com/scapking/waylandcraft/releases/latest)** — Download `waylandcraft.jar` and drop it into your `mods/` folder.
 
 > The upstream repository (almightydb) Releases page lags behind; grab the latest build from the link above.
+
+---
+
+## Highlights (v0.2.32)
+
+- **Server-side multi-thread frame relay** — frames are sharded across N threads by window handle (same window keeps order, different windows relay in parallel); register/unregister run on the server thread, so the netty thread is never blocked by list broadcasts.
+- **Reliable JPEG degrade** — windows with transparent pixels no longer get stuck in PNG (lossless, quality had no effect); oversize shared frames are force-encoded to JPEG with alpha blended on black, so quality degradation actually works.
+- **Higher frame limit** — single-frame JPEG/PNG limit raised from 600 KB to 1.8 MB (aligned with the server protocol cap), oversize frames are no longer dropped for ordinary high-res windows.
 
 ---
 
@@ -34,7 +42,7 @@
 | Permissions | 4 levels: NONE / VIEW / INTERACT / CONTROL |
 | Iris (shaders) compatible | Falls back to vanilla pipeline automatically when Iris is loaded; windows display correctly with shaders on |
 | Adaptive quality | Configurable scale, JPEG quality, framerate, bitrate; built-in presets |
-| Performance | PBO async readback, GPU scaling, diff-frame transfer, heartbeat frames, auto PNG/JPEG |
+| Performance | PBO async readback, GPU scaling, diff-frame transfer, heartbeat frames, auto PNG/JPEG, server multi-thread frame relay (off main thread) |
 
 ---
 
@@ -193,7 +201,7 @@
 - **Windows are always vertical**: windows are placed upright (cannot be tilted), the vertical axis (y) is locked while dragging (horizontal movement only), and the window bottom stays at least **0.4 blocks** above the ground at that spot; `Ctrl+Scroll` rotates the facing (staying vertical)
 - **Precise placement**: check the current position/angle with `/wl pos <handle>`, then set exact coordinates with `/wl move <handle> <x> <y> <z>` (supports `~` relative offsets) and exact facing with `/wl rotate <handle> <angle>` (degrees)
 - **The server must have the mod installed**: in multiplayer, server-side features (`give` / `permission` / `share`) depend on it, otherwise requests are silently dropped
-- Slight aliasing at rounded corners/shadows is normal for JPEG; windows with transparency automatically switch to PNG to preserve alpha
+- Slight aliasing at rounded corners/shadows is normal for JPEG; windows with transparency automatically switch to PNG to preserve alpha (when a shared frame exceeds the size limit, it is force-encoded to JPEG: alpha is blended onto a black background, only quality drops, UI size never changes)
 - Desktop capture (`/wl capture`) requires the system XDG Desktop Portal and a Wayland session
 - Full in-game help: `/wl help`
 
@@ -204,7 +212,7 @@
 The current version still has a few rough edges that will be improved in future releases:
 
 1. **Window movement is deliberately constrained** — windows are fixed vertical with the height axis locked while dragging (bottom stays ≥ 0.4 blocks above ground); this is an intentional simplification, and freer placement may be added later.
-2. **Sharing performance is relatively poor** — multi-player window sharing still has significant room for performance improvement.
+2. **Quality vs latency tradeoff in sharing** — to keep the UI size identical to the sharer, only JPEG quality is lowered (never resolution) when frames exceed the limit; high-resolution windows still put pressure on weak servers/phones during relay and decode.
 
 ---
 

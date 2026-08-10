@@ -9,16 +9,24 @@
   <img src="https://img.shields.io/badge/Fabric%20Loader-0.19.2+-blue" />
   <img src="https://img.shields.io/badge/Fabric%20API-0.147.0%2B-blue" />
   <img src="https://img.shields.io/badge/Java-25-orange" />
-  <img src="https://img.shields.io/badge/Version-v0.2.30-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.2.32-brightgreen" />
 </p>
 
 ---
 
 ## 下载
 
-👉 **[最新 Release(v0.2.30)](https://github.com/scapking/waylandcraft/releases/latest)** — 下载 `waylandcraft.jar`，放入 `mods/` 文件夹即可。
+👉 **[最新 Release(v0.2.32)](https://github.com/scapking/waylandcraft/releases/latest)** — 下载 `waylandcraft.jar`，放入 `mods/` 文件夹即可。
 
 > 上游仓库（almightydb）的 Releases 页面同步滞后，如需最新版本请从上述链接获取。
+
+---
+
+## 版本亮点（v0.2.32）
+
+- **服务端多线程帧转发** — 帧按窗口句柄分片到 N 个线程（同窗口保序、异窗口并行）；注册/注销切服务端主线程执行，netty 线程不再被窗口列表广播阻塞。
+- **降级真正生效** — 含透明像素的窗口不再因走 PNG 无损路径导致降级无效；共享帧超限时强制转 JPEG（透明混合黑背景），只降画质、不降 UI 尺寸。
+- **单帧上限放宽** — 600 KB → 1.8 MB（对齐服务端协议上限），普通高分屏窗口不再被丢帧。
 
 ---
 
@@ -34,7 +42,7 @@
 | 权限管理 | 四级：NONE / VIEW / INTERACT / CONTROL |
 | 光影（Iris）兼容 | 检测到 Iris 时自动降级用原版管线渲染，开光影也能正常显示窗口 |
 | 自适应画质 | 可配置缩放比例、JPEG 质量、帧率、码率，内置预设 |
-| 性能优化 | PBO 异步回读、GPU 缩放、差分帧传输、静止心跳帧、PNG/JPEG 自动切换 |
+| 性能优化 | PBO 异步回读、GPU 缩放、差分帧传输、静止心跳帧、PNG/JPEG 自动切换、服务端多线程帧转发（不占主线程） |
 
 ---
 
@@ -193,7 +201,7 @@
 - **窗口固定垂直**：窗口始终竖直放置（不可倾斜），拖动时垂直轴（y）锁定、只能水平移动，且窗口底部不低于该位置地面之上 **0.4 格**；`Ctrl+滚轮` 可旋转朝向（保持竖直）
 - **精确摆放**：`/wl pos <handle>` 查看当前位置/角度后，可用 `/wl move <handle> <x> <y> <z>` 精确设置坐标（支持 `~` 相对偏移），用 `/wl rotate <handle> <angle>` 精确设置朝向角（度）
 - **服务端必须装 mod**：多人模式下 `give` / `permission` / `share` 等服务端功能依赖服务端安装 mod，否则请求会被静默丢弃
-- 窗口圆角/阴影的轻微锯齿是 JPEG 编码的正常现象；含透明像素的窗口会自动改用 PNG 保留 alpha
+- 窗口圆角/阴影的轻微锯齿是 JPEG 编码的正常现象；含透明像素的窗口会自动改用 PNG 保留 alpha（共享帧超限时自动强制 JPEG 降级：透明像素混合黑背景，仅降画质、不降 UI 尺寸）
 - 桌面捕获（`/wl capture`）依赖系统 XDG Desktop Portal，需要 Wayland 会话
 - 完整命令帮助可在游戏内查看：`/wl help`
 
@@ -204,7 +212,7 @@
 当前版本仍有以下不完善之处，将在后续版本中持续改进：
 
 1. **窗口移动为受控模式** — 窗口固定垂直放置、拖动时锁定高度轴（保证底部高于地面 0.4 格），这是有意的简化设计；如需更自由的摆放方式可后续扩展。
-2. **共享性能相对差** — 多人窗口共享的性能仍有较大提升空间。
+2. **共享画质与延迟权衡** — 为保持与共享端一致的 UI 尺寸，超限时只降 JPEG 质量、不降分辨率；高分屏窗口在弱服务器/手机上仍有转发与解码压力。
 
 ---
 

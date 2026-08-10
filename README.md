@@ -10,7 +10,7 @@
     <img src="https://img.shields.io/badge/Fabric%20Loader-0.19.2+-blue" />
     <img src="https://img.shields.io/badge/Fabric%20API-0.147.0%2B-blue" />
     <img src="https://img.shields.io/badge/Java-25-orange" />
-    <img src="https://img.shields.io/badge/Version-v0.2.30-brightgreen" />
+    <img src="https://img.shields.io/badge/Version-v0.2.32-brightgreen" />
   </p>
 </p>
 
@@ -30,9 +30,15 @@
 
 ## Download
 
-👉 **[Latest Release (v0.2.30)](https://github.com/scapking/waylandcraft/releases/latest)** — Download `waylandcraft.jar` and drop it into your `mods/` folder.
+👉 **[Latest Release (v0.2.32)](https://github.com/scapking/waylandcraft/releases/latest)** — Download `waylandcraft.jar` and drop it into your `mods/` folder.
 
 > The upstream repository (almightydb) Releases page lags behind; grab the latest build from the link above.
+
+## Highlights (v0.2.32)
+
+- **Server-side multi-thread frame relay** — frames are sharded across N threads by window handle (same window keeps order, different windows relay in parallel); register/unregister run on the server thread, so the netty thread is never blocked by list broadcasts.
+- **Reliable JPEG degrade** — windows with transparent pixels no longer get stuck in PNG (lossless, quality had no effect); oversize shared frames are force-encoded to JPEG with alpha blended on black, so quality degradation actually works.
+- **Higher frame limit** — single-frame JPEG/PNG limit raised from 600 KB to 1.8 MB (aligned with the server protocol cap), oversize frames are no longer dropped for ordinary high-res windows.
 
 ## License
 
