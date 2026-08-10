@@ -312,40 +312,65 @@ jobs:
     strategy:
       matrix:
         variant:
-          - platform: linux-gnu
-            jar_platform: linux
-            arch: x86_64
-          - platform: linux-gnu
-            jar_platform: linux
-            arch: arm64
-          - platform: android
-            jar_platform: android
-            arch: x86_64
-          - platform: android
-            jar_platform: android
-            arch: arm64
+          - name: linux-x86_64
+            build_args: -PwlPlatform=linux-gnu -PwlArch=x86_64
+            verify_args: linux-gnu x86_64
+            jar_name: waylandcraft-linux-x86_64
+            native_pattern: libwaylandcraft-linux-gnu-x86_64
+          - name: linux-arm64
+            build_args: -PwlPlatform=linux-gnu -PwlArch=arm64
+            verify_args: linux-gnu arm64
+            jar_name: waylandcraft-linux-arm64
+            native_pattern: libwaylandcraft-linux-gnu-arm64
+          - name: android-x86_64
+            build_args: -PwlPlatform=android -PwlArch=x86_64
+            verify_args: android x86_64
+            jar_name: waylandcraft-android-x86_64
+            native_pattern: libwaylandcraft-android-x86_64
+          - name: android-arm64
+            build_args: -PwlPlatform=android -PwlArch=arm64
+            verify_args: android arm64
+            jar_name: waylandcraft-android-arm64
+            native_pattern: libwaylandcraft-android-arm64
           # Viewer-only platforms: no native capture backend, jar bundles
           # no native lib / satellite / deps (build.gradle skips them).
-          - platform: windows
-            jar_platform: windows
-            arch: x86_64
+          - name: windows-x86_64
+            build_args: -PwlPlatform=windows -PwlArch=x86_64
+            verify_args: windows x86_64
+            jar_name: waylandcraft-windows-x86_64
             viewer: true
-          - platform: windows
-            jar_platform: windows
-            arch: arm64
+          - name: windows-arm64
+            build_args: -PwlPlatform=windows -PwlArch=arm64
+            verify_args: windows arm64
+            jar_name: waylandcraft-windows-arm64
             viewer: true
-          - platform: macos
-            jar_platform: macos
-            arch: x86_64
+          - name: macos-x86_64
+            build_args: -PwlPlatform=macos -PwlArch=x86_64
+            verify_args: macos x86_64
+            jar_name: waylandcraft-macos-x86_64
             viewer: true
-          - platform: macos
-            jar_platform: macos
-            arch: arm64
+          - name: macos-arm64
+            build_args: -PwlPlatform=macos -PwlArch=arm64
+            verify_args: macos arm64
+            jar_name: waylandcraft-macos-arm64
             viewer: true
-          - platform: ios
-            jar_platform: ios
-            arch: arm64
+          - name: ios-arm64
+            build_args: -PwlPlatform=ios -PwlArch=arm64
+            verify_args: ios arm64
+            jar_name: waylandcraft-ios-arm64
             viewer: true
+          # Server: pure Java server-side logic, no native payload, arch-independent.
+          - name: server
+            build_args: -PwlServer=true
+            verify_args: server
+            jar_name: waylandcraft-server
+            viewer: true
+          # Universal: catch-all fallback bundling all native platforms.
+          - name: universal
+            build_args: -PwlUniversal=true
+            verify_args: universal
+            jar_name: waylandcraft-universal
+            native_pattern: libwaylandcraft-*
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v6
@@ -354,7 +379,7 @@ jobs:
       uses: actions/download-artifact@v8
       with:
         path: native-libs
-        pattern: libwaylandcraft-${{ matrix.variant.platform }}-${{ matrix.variant.arch }}
+        pattern: ${{ matrix.variant.native_pattern }}
         merge-multiple: true
     - name: Verify native lib
       if: ${{ !matrix.variant.viewer }}
@@ -369,15 +394,15 @@ jobs:
         distribution: 'temurin'
     - name: Setup gradle
       uses: gradle/actions/setup-gradle@v6
-    - name: Build java code (${{ matrix.variant.jar_platform }}-${{ matrix.variant.arch }})
-      run: ./gradlew build -PwlPlatform=${{ matrix.variant.platform }} -PwlArch=${{ matrix.variant.arch }}
+    - name: Build java code (${{ matrix.variant.name }})
+      run: ./gradlew build ${{ matrix.variant.build_args }}
     - name: Verify jar contents
-      run: python3 scripts/verify_jar.py ${{ matrix.variant.platform }} ${{ matrix.variant.arch }}
+      run: python3 scripts/verify_jar.py ${{ matrix.variant.verify_args }}
     - name: Upload jar artifact
       uses: actions/upload-artifact@v7
       with:
-        name: waylandcraft-jar-${{ matrix.variant.jar_platform }}-${{ matrix.variant.arch }}
-        path: build/libs/waylandcraft-${{ matrix.variant.jar_platform }}-${{ matrix.variant.arch }}.jar
+        name: waylandcraft-jar-${{ matrix.variant.name }}
+        path: build/libs/${{ matrix.variant.jar_name }}.jar
         if-no-files-found: error
 
   release:
@@ -406,12 +431,16 @@ jobs:
           gh release upload "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --clobber
         else
           echo "Creating release $TAG"
-          gh release create "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated per-platform release (native + viewer):
+          gh release create "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated per-platform release (native + viewer + server + universal):
         Native (full capture + share + view):
         - waylandcraft-linux-x86_64.jar / waylandcraft-linux-arm64.jar (desktop Linux)
         - waylandcraft-android-x86_64.jar / waylandcraft-android-arm64.jar (Android launchers like OnyxLauncher)
         Viewer-only (view shared windows, no local capture):
         - waylandcraft-windows-x86_64.jar / waylandcraft-windows-arm64.jar
         - waylandcraft-macos-x86_64.jar / waylandcraft-macos-arm64.jar
-        - waylandcraft-ios-arm64.jar (PojavLauncher/Amethyst)"
+        - waylandcraft-ios-arm64.jar (PojavLauncher/Amethyst)
+        Server (pure Java, install on the dedicated server):
+        - waylandcraft-server.jar
+        Universal (catch-all, bundles every native platform):
+        - waylandcraft-universal.jar"
         fi

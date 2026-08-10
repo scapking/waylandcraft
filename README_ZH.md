@@ -101,12 +101,16 @@
 | macOS x86_64（仅查看） | ❌ | ✅ | `waylandcraft-macos-x86_64.jar` |
 | macOS arm64（仅查看） | ❌ | ✅ | `waylandcraft-macos-arm64.jar` |
 | iOS arm64（仅查看，实验性） | ❌ | ✅ | `waylandcraft-ios-arm64.jar` |
+| 独立服务器（任意架构） | — | —（承载 give/共享/权限逻辑） | `waylandcraft-server.jar` |
+| 通用（任意平台，兜底） | ✅ | ✅ | `waylandcraft-universal.jar` |
 
-> **一个平台一个 jar。** 从 [Releases](https://github.com/scapking/waylandcraft/releases) 下载对应你设备的文件——每个 jar 只携带自己平台的 native 组件，因此 Windows/macOS/iOS 是精简的仅查看 jar（约 0.4 MB），自动检测平台并禁用本地捕获。
+> **一个平台一个 jar。** 从 [Releases](https://github.com/scapking/waylandcraft/releases) 下载对应你设备的文件——每个平台 jar 只携带自己平台的 native 组件，因此 Windows/macOS/iOS 是精简的仅查看 jar（约 0.4 MB），自动检测平台并禁用本地捕获。不确定选哪个？`waylandcraft-universal.jar` 打包了全部 native 平台作为兜底；独立服务器可用轻量的纯 Java `waylandcraft-server.jar`。
 
 - **完整模式（Linux）** — 可捕获、共享、查看。
 - **仅查看模式（Android / Windows / macOS）** — 安装对应平台的 jar；mod 自动检测平台、禁用本地捕获、继续接收共享窗口。
 - **iOS（仅查看，实验性）** — 通过 [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS)（或其继任者 [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)）在 iOS 上运行 Minecraft Java 版 + Fabric，安装 `waylandcraft-ios-arm64.jar` 即仅查看模式。尚未实机验证。
+- **服务器** — 独立服务器安装 `waylandcraft-server.jar`（纯 Java，无 native 负载）；服务端的 give/共享/权限逻辑也内置在每一个其他 jar 里，所以服务端装客户端 jar 同样可用。
+- **通用** — `waylandcraft-universal.jar` 打包全部 native 平台（linux-gnu + android × x86_64/arm64）。不确定自己平台时用它；体积比单平台 jar 大（约 6 MB）。
 
 ---
 

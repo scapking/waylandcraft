@@ -101,15 +101,22 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 | macOS x86_64 (viewer) | ❌ | ✅ | `waylandcraft-macos-x86_64.jar` |
 | macOS arm64 (viewer) | ❌ | ✅ | `waylandcraft-macos-arm64.jar` |
 | iOS arm64 (viewer, experimental) | ❌ | ✅ | `waylandcraft-ios-arm64.jar` |
+| Dedicated server (any arch) | — | — (hosts give/share/permission logic) | `waylandcraft-server.jar` |
+| Universal (any platform, catch-all) | ✅ | ✅ | `waylandcraft-universal.jar` |
 
 > **One jar per platform/arch.** Grab the exact file for your device from
-> [Releases](https://github.com/scapking/waylandcraft/releases) — each jar carries
-> only its own native payload, so Windows/macOS/iOS builds are slim viewer-only
-> jars (~0.4 MB) that auto-detect the platform and disable local capture.
+> [Releases](https://github.com/scapking/waylandcraft/releases) — each platform jar
+> carries only its own native payload, so Windows/macOS/iOS builds are slim
+> viewer-only jars (~0.4 MB) that auto-detect the platform and disable local
+> capture. Not sure which one? `waylandcraft-universal.jar` bundles every native
+> platform as a catch-all; dedicated servers can use the lean pure-Java
+> `waylandcraft-server.jar`.
 
 - **Full mode (Linux)** — capture, share and view.
 - **Viewer-only mode (Android / Windows / macOS)** — install the jar for your platform; the mod auto-detects the platform, disables local capture, and keeps receiving shared windows.
 - **iOS (viewer, experimental)** — run Minecraft Java Edition + Fabric via [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS) (or its successor [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)), then install `waylandcraft-ios-arm64.jar`. Not yet field-tested.
+- **Server** — install `waylandcraft-server.jar` (pure Java, no native payload) on a dedicated server; the server-side give/permission/sharing logic is also bundled in every other jar, so a client jar on the server works too.
+- **Universal** — `waylandcraft-universal.jar` bundles all native platforms (linux-gnu + android × x86_64/arm64). Use it when you don't know your exact platform; it is larger (~6 MB) than the single-platform jars.
 
 ---
 

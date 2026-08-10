@@ -8,19 +8,29 @@ group = project.maven_group
 
 // Optional -PwlArch=arm64|x86_64 selects a single-arch jar
 // Optional -PwlPlatform=linux-gnu|android|windows|macos|ios selects the platform
-// (used by the CI matrix). Without them the jar bundles both linux arches.
+// (used by the CI matrix). Without them the jar bundles all native platforms.
 //
 // Windows/macOS/iOS have no native capture backend (no Wayland compositor), so
 // their jars are viewer-only: no native lib, no satellite, no bionic deps. The
 // mod detects this at runtime and runs in viewer-only mode.
+//
+// -PwlServer=true  → waylandcraft-server.jar: server-side logic only, no native
+//                    payload (capture happens on clients). Pure Java, arch-independent.
+// -PwlUniversal=true or no platform flags → waylandcraft-universal.jar: bundles
+//                    all native platforms (linux-gnu + android × x86_64/arm64) as
+//                    a catch-all fallback.
 def wlArch = providers.gradleProperty('wlArch').getOrElse('')
 def wlPlatform = providers.gradleProperty('wlPlatform').getOrElse('')
+def wlServer = providers.gradleProperty('wlServer').getOrElse('') == 'true'
+def wlUniversal = providers.gradleProperty('wlUniversal').getOrElse('') == 'true'
 def viewerPlatforms = ['windows', 'macos', 'ios']
 def isViewer = wlPlatform in viewerPlatforms
+def isServer = wlServer
+def isUniversal = wlUniversal || (!wlArch && !isViewer && !isServer)
 def platformName = (wlPlatform == 'android') ? 'android' : (wlPlatform == 'linux-gnu' ? 'linux' : wlPlatform)
 
 base {
-	archivesName = wlArch ? "${project.archives_base_name}-${platformName}-${wlArch}" : project.archives_base_name
+	archivesName = isServer ? "${project.archives_base_name}-server" : (isUniversal ? "${project.archives_base_name}-universal" : (wlArch ? "${project.archives_base_name}-${platformName}-${wlArch}" : project.archives_base_name))
 }
 
 repositories {
@@ -96,8 +106,8 @@ jar {
 	// 不要使用无后缀的 /libwaylandcraft.so —— 否则 arm64 设备会优先加载到
 	// x86_64 的 host 库而崩溃（EM_X86_64 instead of EM_AARCH64）。
 	// 指定 -PwlArch 时跳过 host lib，只打包该架构的库。
-	// Viewer-only 平台（windows/macos/ios）也不打 host lib。
-	if(!wlArch && !isViewer) {
+	// Viewer-only 平台（windows/macos/ios）与 server jar 也不打 host lib。
+	if(!wlArch && !isViewer && !isServer) {
 		def nativeFile = file("native/target/release/libwaylandcraft.so")
 		if(!nativeFile.exists()) {
 			nativeFile = file("native/target/debug/libwaylandcraft.so")
@@ -114,11 +124,28 @@ jar {
 	}
 
 	// Packaging of libraries in directory `native-libs`
-	// Used by the actions runner for releases
-	def targets = (wlArch && !isViewer) ? ["${(wlPlatform ?: 'linux-gnu')}-${wlArch}"] : (!isViewer ? [
-		"linux-gnu-x86_64",
-		"linux-gnu-arm64"
-	] : []);
+	// Used by the actions runner for releases.
+	// - server jar: no native payload at all.
+	// - universal jar: all native platforms (linux-gnu + android × arch).
+	// - single platform: only that platform's lib.
+	def targets
+	if(isServer) {
+		targets = []
+	} else if(isUniversal) {
+		targets = [
+			"linux-gnu-x86_64",
+			"linux-gnu-arm64",
+			"android-x86_64",
+			"android-arm64"
+		]
+	} else if(wlArch) {
+		targets = ["${(wlPlatform ?: 'linux-gnu')}-${wlArch}"]
+	} else {
+		targets = [
+			"linux-gnu-x86_64",
+			"linux-gnu-arm64"
+		]
+	}
 
 	for(def target in targets) {
 		def f = file("native-libs/libwaylandcraft-${target}.so")
@@ -145,8 +172,8 @@ jar {
 	// Bundled xwayland-satellite binaries (built by native/build-satellite.sh)
 	// so X11 apps get a DISPLAY without the user installing satellite themselves.
 	// Desktop (linux) only: Android launchers have no X11/Xwayland, and
-	// viewer-only platforms (windows/macos/ios) have no X11 either.
-	def satelliteTargets = (wlPlatform == 'android' || isViewer) ? [] : (wlArch ? ["linux-gnu-${wlArch}"] : [
+	// viewer-only platforms (windows/macos/ios) and the server jar have no X11 either.
+	def satelliteTargets = (wlPlatform == 'android' || isViewer || isServer) ? [] : (wlArch ? ["linux-gnu-${wlArch}"] : [
 		"linux-gnu-x86_64",
 		"linux-gnu-arm64"
 	]);
@@ -159,8 +186,8 @@ jar {
 		})
 	}
 
-	// Viewer-only jars intentionally carry no native library.
-	if(natives.size() < 1 && !isViewer) {
+	// Viewer-only and server jars intentionally carry no native library.
+	if(natives.size() < 1 && !isViewer && !isServer) {
 		ant.fail("native library not built!")
 	}
 }

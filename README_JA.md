@@ -101,12 +101,16 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 | macOS x86_64（表示のみ） | ❌ | ✅ | `waylandcraft-macos-x86_64.jar` |
 | macOS arm64（表示のみ） | ❌ | ✅ | `waylandcraft-macos-arm64.jar` |
 | iOS arm64（表示のみ、実験的） | ❌ | ✅ | `waylandcraft-ios-arm64.jar` |
+| 専用サーバー（任意アーキテクチャ） | — | —（give/共有/権限ロジックをホスト） | `waylandcraft-server.jar` |
+| ユニバーサル（任意プラットフォーム、救済用） | ✅ | ✅ | `waylandcraft-universal.jar` |
 
-> **プラットフォームごとに専用 jar。** [Releases](https://github.com/scapking/waylandcraft/releases) からお使いのデバイスに合ったファイルを入手してください——各 jar は自分のプラットフォームの native だけを同梱するため、Windows/macOS/iOS は軽量な表示のみ jar（約 0.4 MB）で、プラットフォームを自動検出してローカルキャプチャを無効化します。
+> **プラットフォームごとに専用 jar。** [Releases](https://github.com/scapking/waylandcraft/releases) からお使いのデバイスに合ったファイルを入手してください——各プラットフォーム jar は自分のプラットフォームの native だけを同梱するため、Windows/macOS/iOS は軽量な表示のみ jar（約 0.4 MB）で、プラットフォームを自動検出してローカルキャプチャを無効化します。どれを選べばいいか分からない場合は、全 native プラットフォームを同梱する `waylandcraft-universal.jar` を。専用サーバーは軽量な純 Java の `waylandcraft-server.jar` が使えます。
 
 - **フルモード（Linux）** — キャプチャ・共有・表示が可能。
 - **表示のみモード（Android / Windows / macOS）** — 対応プラットフォームの jar をインストールするだけ。プラットフォームを自動検出してローカルキャプチャを無効化し、共有ウィンドウの受信を継続。
 - **iOS（表示のみ、実験的）** — [PojavLauncher](https://github.com/PojavLauncherTeam/PojavLauncher_iOS)（後継の [Amethyst](https://github.com/AngelAuraMC/Amethyst-iOS)）で iOS 上に Minecraft Java Edition + Fabric を導入し、`waylandcraft-ios-arm64.jar` をインストールするだけで表示のみモード。未実機検証。
+- **サーバー** — 専用サーバーには `waylandcraft-server.jar`（純 Java、native 同梱なし）をインストール。サーバー側の give/共有/権限ロジックは他のすべての jar にも同梱されているため、サーバーにクライアント jar を入れても動作します。
+- **ユニバーサル** — `waylandcraft-universal.jar` は全 native プラットフォーム（linux-gnu + android × x86_64/arm64）を同梱。プラットフォームが不明な場合に使います。単一プラットフォーム jar より大きめ（約 6 MB）。
 
 ---
 
