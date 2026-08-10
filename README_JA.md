@@ -17,10 +17,6 @@
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
-<p align="center">
-  <img src="assets/demo_1.jpg" width="49%" alt="WaylandCraft デモ" />
-  <img src="assets/demo_2.jpg" width="49%" alt="WaylandCraft デモ" />
-</p>
 
 > ⚠️ **免責事項** — 本プロジェクトはオリジナルの [WaylandCraft](https://github.com/EVV1E/waylandcraft.git) をベースにした二次開発です。マルチプレイヤー共有などの機能は AI によって実装されています。**機能と安全性は保証されません。** 利用は自己責任でお願いします。
 

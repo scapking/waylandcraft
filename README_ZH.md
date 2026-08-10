@@ -17,10 +17,6 @@
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
-<p align="center">
-  <img src="assets/demo_1.jpg" width="49%" alt="WaylandCraft 演示" />
-  <img src="assets/demo_2.jpg" width="49%" alt="WaylandCraft 演示" />
-</p>
 
 > ⚠️ **免责声明** — 本项目基于原版 [WaylandCraft](https://github.com/EVV1E/waylandcraft.git) 二次开发，多人共享等功能由 AI 实现。**功能与安全性不做任何保证**，请自行承担使用风险。
 
