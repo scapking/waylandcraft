@@ -62,13 +62,15 @@ public class WaylandCraftNetworking {
 		});
 		
 		// 处理客户端请求注册共享窗口
+		// v0.2.31：注册会触发窗口列表广播（遍历所有玩家 + send），切到服务端主线程执行，
+		// 避免占 netty 线程；主线程上读玩家列表也绝对安全（无 CME）。
 		ServerPlayNetworking.registerGlobalReceiver(SharedWindowRegisterPayload.TYPE, (payload, ctx) -> {
-			SharedWindowServerHandler.handleWindowRegister(payload, ctx.player());
+			ctx.server().execute(() -> SharedWindowServerHandler.handleWindowRegister(payload, ctx.player()));
 		});
 		
 		// 处理客户端请求注销共享窗口
 		ServerPlayNetworking.registerGlobalReceiver(SharedWindowUnregisterPayload.TYPE, (payload, ctx) -> {
-			SharedWindowServerHandler.handleWindowUnregister(payload.windowHandle(), ctx.player());
+			ctx.server().execute(() -> SharedWindowServerHandler.handleWindowUnregister(payload.windowHandle(), ctx.player()));
 		});
 		
 		// 处理权限管理命令
