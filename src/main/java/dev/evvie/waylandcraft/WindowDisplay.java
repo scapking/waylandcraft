@@ -137,20 +137,8 @@ public class WindowDisplay {
 		PoseStack poseStack = ctx.poseStack();
 		poseStack.pushPose();
 		poseStack.translate(originRel.x, originRel.y, originRel.z);
-		// 核心窗口高亮边框（青色描边，世界内直接可见哪个窗口是核心）
-		if(isCoreWindow()) {
-			RenderUtils.renderOutline(poseStack, ctx.submitNodeCollector(), tl, bl, br, tr, 0.08f, 0, 255, 255, 220);
-		}
 		RenderUtils.renderFramebuffer(window.framebuffer, poseStack, ctx.submitNodeCollector(), true, tl, bl, br, tr);
 		poseStack.popPose();
-	}
-	
-	/** 当前窗口是否为布局核心窗口（布局启用时） */
-	private boolean isCoreWindow() {
-		WaylandCraft w = WaylandCraft.instance;
-		if(w == null || w.layoutManager == null || !w.layoutManager.isEnabled()) return false;
-		if(!(window instanceof WLCToplevel t)) return false;
-		return t.getHandle() == w.layoutManager.getCoreHandle();
 	}
 	
 	/* Transform absolute world coordinates to surface-local pixel coordinates relative to toplevel (0, 0)
