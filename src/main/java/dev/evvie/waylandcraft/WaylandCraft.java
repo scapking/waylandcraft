@@ -234,6 +234,11 @@ public class WaylandCraft implements ClientModInitializer {
 	}
 	
 	public void updateWorld(LevelExtractionContext ctx) {
+		Camera camera = ctx.camera();
+		// 共享窗口 hover/交互检测：不依赖 bridge —— 手机端 viewer-only（bridge==null）
+		// 也要运行，否则 hoveredSharedDisplay 永远为 null，共享窗口交互全部失效。
+		processPointerMotion(camera);
+		
 		if(bridge == null) return; // native disabled (e.g. Android launcher): stay inert, never crash
 		for(WLCPopup popup : bridge.getMappedPopups()) {
 			WLCAbstractWindow root = popup;
@@ -292,9 +297,6 @@ public class WaylandCraft implements ClientModInitializer {
 			
 			bridge.focusSurface(focus);
 		}
-		
-		Camera camera = ctx.camera();
-		processPointerMotion(camera);
 		
 		if(Minecraft.getInstance().player == null || !Minecraft.getInstance().player.isUsingItem()) playerUsingWindowItem = false;
 		if(playerUsingWindowItem) {
