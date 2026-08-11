@@ -199,7 +199,7 @@ Windows can be arranged automatically around a fixed initialized origin (they no
 | `/wl layout add <handle>` / `remove <handle>` | Manually add / remove a window (when `layoutAutoJoin` is off) |
 | `/wl layout core <handle>` | Set the core window explicitly |
 
-* `Ctrl` + arrow keys switches the core window (left/right = neighbours in the same layer, up/down = previous/next layer). When auto layout is disabled, `Ctrl` + arrows still moves the hovered window manually.
+* `Ctrl` + arrow keys moves the **core marker** to the neighbour window in that direction — any window can become the core (left/right wrap around, up/down cross layers, unlimited). The core window is highlighted with a cyan outline in-world. When auto layout is disabled, `Ctrl` + arrows still moves the hovered window manually.
 * `G` captures the keyboard; the default key `H` toggles the cursor (both rebindable in the vanilla key settings).
 
 ### Sharing

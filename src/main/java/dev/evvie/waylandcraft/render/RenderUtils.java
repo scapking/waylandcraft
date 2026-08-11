@@ -209,6 +209,71 @@ public class RenderUtils {
 		renderWindowTexture(framebuffer.getTextureLocation(), poseStack, collector, cutout, false, tl, bl, br, tr);
 	}
 	
+	// === 核心窗口高亮边框 ===
+	
+	private static final Identifier WHITE_TEXTURE = Identifier.fromNamespaceAndPath("minecraft", "textures/misc/white.png");
+	
+	private static final RenderType WINDOW_BLIT_OUTLINE = RenderType.create("window_blit_outline",
+		RenderSetup.builder(WINDOW_BLIT)
+			.withTexture("Sampler0", WHITE_TEXTURE, WINDOW_SAMPLER)
+			.createRenderSetup());
+	
+	/**
+	 * 统一高亮边框几何实例 — POSITION_TEX_COLOR（WINDOW_BLIT 管线），
+	 * 用白色纹理 + 颜色调制渲染纯色四边形。
+	 */
+	public static final record OutlineRenderInstance(Vec3 tl, Vec3 bl, Vec3 br, Vec3 tr, int r, int g, int b, int a) implements CustomGeometryRenderer {
+		
+		@Override
+		public void render(Pose pose, VertexConsumer buffer) {
+			buffer.addVertex(pose, tl.toVector3f()).setUv(0.0f, 0.0f).setColor(r, g, b, a);
+			buffer.addVertex(pose, bl.toVector3f()).setUv(0.0f, 1.0f).setColor(r, g, b, a);
+			buffer.addVertex(pose, br.toVector3f()).setUv(1.0f, 1.0f).setColor(r, g, b, a);
+			buffer.addVertex(pose, tr.toVector3f()).setUv(1.0f, 0.0f).setColor(r, g, b, a);
+		}
+		
+	}
+	
+	/**
+	 * 渲染核心窗口高亮边框：在窗口四边形外扩 thickness 一圈渲染纯色面。
+	 * 边框面沿法线稍退后，中心被窗口内容盖住，只露出边缘一圈（描边效果）。
+	 * 非 Iris：WINDOW_BLIT + white 纹理 + 颜色；Iris：原版 entity 管线 + white 纹理 + 颜色。
+	 */
+	public static void renderOutline(PoseStack poseStack, SubmitNodeCollector collector, Vec3 tl, Vec3 bl, Vec3 br, Vec3 tr, float thickness, int r, int g, int b, int a) {
+		Vec3 u = tr.subtract(tl); // 横向（tl→tr）
+		Vec3 v = bl.subtract(tl); // 纵向（tl→bl，指向下）
+		double ulen = u.length();
+		double vlen = v.length();
+		if(ulen < 1e-9 || vlen < 1e-9) return;
+		Vec3 un = u.scale(1.0 / ulen);
+		Vec3 vn = v.scale(1.0 / vlen);
+		double th = thickness / 2.0;
+		
+		// 边框面沿法线退后一点，避免与窗口面 z-fighting（窗口面在前，中心部分覆盖边框）
+		Vec3 n = v.cross(u).normalize();
+		Vec3 off = n.scale(-0.02);
+		
+		Vec3[][] rects = {
+			// top：tl→tr，向外 -v
+			{ tl.add(un.scale(-th)).add(vn.scale(-th)), tr.add(un.scale(th)).add(vn.scale(-th)), tr.add(un.scale(th)).add(vn.scale(th)), tl.add(un.scale(-th)).add(vn.scale(th)) },
+			// bottom：bl→br，向外 +v
+			{ bl.add(un.scale(-th)).add(vn.scale(th)), br.add(un.scale(th)).add(vn.scale(th)), br.add(un.scale(th)).add(vn.scale(-th)), bl.add(un.scale(-th)).add(vn.scale(-th)) },
+			// left：tl→bl，向外 -u
+			{ tl.add(un.scale(-th)).add(vn.scale(-th)), tl.add(un.scale(-th)).add(vn.scale(th)), bl.add(un.scale(-th)).add(vn.scale(th)), bl.add(un.scale(-th)).add(vn.scale(-th)) },
+			// right：tr→br，向外 +u
+			{ tr.add(un.scale(th)).add(vn.scale(-th)), tr.add(un.scale(th)).add(vn.scale(th)), br.add(un.scale(th)).add(vn.scale(th)), br.add(un.scale(th)).add(vn.scale(-th)) },
+		};
+		
+		for(Vec3[] q : rects) {
+			Vec3 q0 = q[0].add(off), q1 = q[1].add(off), q2 = q[2].add(off), q3 = q[3].add(off);
+			if(IrisCompat.isIrisLoaded()) {
+				collector.submitCustomGeometry(poseStack, VANILLA_ENTITY_TRANSLUCENT.apply(WHITE_TEXTURE), new VanillaWindowRenderInstance(q0, q1, q2, q3, false, false, r, g, b, a));
+			} else {
+				collector.submitCustomGeometry(poseStack, WINDOW_BLIT_OUTLINE, new OutlineRenderInstance(q0, q1, q2, q3, r, g, b, a));
+			}
+		}
+	}
+	
 	/**
 	 * 统一窗口纹理渲染入口 — 本地帧缓冲与远程共享纹理共用同一套渲染逻辑
 	 * 

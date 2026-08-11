@@ -762,7 +762,7 @@ public class WaylandCraft implements ClientModInitializer {
 	 */
 	// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
 	public boolean onKeyPress(long windowHandle, int key, int scancode, int action, int modifiers) {
-		// Ctrl + 方向键：布局启用时核心窗口与该方向相邻窗口互换实际位置；未启用布局时调整面前的窗口
+		// Ctrl + 方向键：布局启用时核心标记移动到该方向相邻窗口；未启用布局时调整面前的窗口
 		if(action == GLFW.GLFW_PRESS && (modifiers & GLFW.GLFW_MOD_CONTROL) != 0) {
 			int dir = switch(key) {
 				case GLFW.GLFW_KEY_UP -> 0;
@@ -773,8 +773,16 @@ public class WaylandCraft implements ClientModInitializer {
 			};
 			if(dir >= 0) {
 				if(layoutManager.isEnabled() && layoutManager.isInitialized()) {
-					// Ctrl+方向键：核心窗口换位（无聊天输出，静默切换）
-					layoutManager.swapCore(dir);
+					boolean ok = layoutManager.moveCore(dir);
+					if(ok && settings != null) {
+						WindowDisplay core = findCoreDisplay();
+						if(core != null) {
+							// 核心窗口切换反馈（聊天）
+							String name = core.window instanceof WLCToplevel t ? getWindowName(t) : "窗口";
+							Minecraft.getInstance().getChatListener().handleSystemMessage(
+								Component.literal("§e➤ 核心窗口: §f" + name), false);
+						}
+					}
 					return true;
 				}
 				moveFrontWindow(dir);

@@ -1,7 +1,6 @@
 package dev.evvie.waylandcraft;
 
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 
@@ -29,7 +28,7 @@ import net.minecraft.world.phys.Vec3;
  *  - 窗口中心对齐眼睛高度（/wl layout init 存眼睛高度），站在中心平视正对，不斜。
  *  - 向上堆叠严格：下一层中心 Y = 上一层中心 Y + (上一层最大高 + 下一层最大高)/2
  *    + stackSpacing，层与层之间保证间距 stackSpacing，不重叠。
- *  - Ctrl+方向键 = 核心窗口与该方向相邻窗口互换实际位置（不是切换标记）。
+ *  - Ctrl+方向键 = 核心标记移动到该方向相邻窗口（核心身份转移，窗口位置不动）。
  *
  * 其他行为：
  *  - 默认关闭（layoutEnabled=false），开启前必须先 /wl layout init 初始化坐标。
@@ -48,7 +47,7 @@ public class WindowLayoutManager {
 	/** 核心窗口句柄（0 = 未设置，自动选第一个） */
 	private long coreHandle = 0;
 
-	/** 持久排布顺序（Ctrl+方向键交换位置；新窗口追加，消失移除，不按 handle 重排） */
+	/** 持久排布顺序（新窗口追加，消失移除，不按 handle 重排） */
 	private final List<WindowDisplay> ordered = new ArrayList<>();
 
 	/** 每层窗口数（cube: perFace×4；sphere: 每个纬度圈数量），用于上/下换层 */
@@ -182,12 +181,12 @@ public class WindowLayoutManager {
 	}
 
 	/**
-	 * 核心窗口与该方向相邻窗口互换实际位置（窗口真的移动）。
-	 * dir: 0=上 1=下 2=左 3=右。核心窗口跟随移动（coreHandle 不变）。
+	 * 核心标记移动到该方向相邻窗口（核心身份转移，窗口位置不动）。
+	 * dir: 0=上 1=下 2=左 3=右。
 	 * 无上限：左/右在 ordered 中全局环绕，上/下跨层，无上层/下层时环绕到对侧，可一直切换。
-	 * 返回是否交换成功。
+	 * 返回是否移动成功。
 	 */
-	public boolean swapCore(int dir) {
+	public boolean moveCore(int dir) {
 		if(ordered.isEmpty()) return false;
 		int n = ordered.size();
 		int idx = indexOfCore();
@@ -231,7 +230,7 @@ public class WindowLayoutManager {
 		}
 
 		if(next < 0 || next >= n || next == idx) return false;
-		Collections.swap(ordered, idx, next);
+		coreHandle = ((WLCToplevel) ordered.get(next).window).getHandle();
 		return true;
 	}
 
