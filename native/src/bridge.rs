@@ -400,6 +400,19 @@ bind_java_type! {
             sig = (instance: jlong) -> void,
             fn = portal_capture_stop,
         },
+
+        static extern fn audio_capture_start {
+            sig = (instance: jlong, pid: jint) -> void,
+            fn = audio_capture_start,
+        },
+        static extern fn audio_capture_poll {
+            sig = (instance: jlong) -> byte[],
+            fn = audio_capture_poll,
+        },
+        static extern fn audio_capture_stop {
+            sig = (instance: jlong) -> void,
+            fn = audio_capture_stop,
+        },
     },
 }
 
@@ -2049,6 +2062,49 @@ fn portal_capture_stop<'local>(
     _instance: jlong,
 ) -> Result<(), BridgeError> {
     // PipeWire mainloop runs in a thread, will exit when process exits
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════
+// 按进程音频捕获 (PipeWire: 共享窗口的声音)
+// ═══════════════════════════════════════════════════════
+
+fn audio_capture_start<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+    pid: jint,
+) -> Result<(), BridgeError> {
+    if pid <= 0 {
+        return Err(BridgeError::Null("audio_capture_invalid_pid"));
+    }
+    crate::audio_capture::start_audio_capture(pid as u32)
+        .map_err(|e| {
+            eprintln!("[audio] start failed: {}", e);
+            BridgeError::Null("audio_capture_failed")
+        })?;
+    Ok(())
+}
+
+fn audio_capture_poll<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    if let Some(data) = crate::audio_capture::poll_audio_capture() {
+        let byte_array = env.byte_array_from_slice(&data)?;
+        return Ok(byte_array);
+    }
+    let empty = env.byte_array_from_slice(&[])?;
+    Ok(empty)
+}
+
+fn audio_capture_stop<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<(), BridgeError> {
+    crate::audio_capture::stop_audio_capture();
     Ok(())
 }
 

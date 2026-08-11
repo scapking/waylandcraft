@@ -34,6 +34,8 @@ import dev.evvie.waylandcraft.render.WindowInItemFrameRenderer;
 import dev.evvie.waylandcraft.render.model.WindowItemModel;
 import dev.evvie.waylandcraft.render.SharedWindowDisplay;
 import dev.evvie.waylandcraft.shared.WindowShareManager;
+import dev.evvie.waylandcraft.shared.AudioCaptureManager;
+import dev.evvie.waylandcraft.shared.AudioPlaybackManager;
 import dev.evvie.waylandcraft.settings.WaylandCraftSettings;
 import dev.evvie.waylandcraft.settings.WaylandCraftSettingsManager;
 import dev.evvie.waylandcraft.network.SharedWindowClientHandler;
@@ -91,6 +93,10 @@ public class WaylandCraft implements ClientModInitializer {
 	public RemoteWindowRenderer remoteWindowRenderer = new RemoteWindowRenderer();
 	public ArrayList<SharedWindowDisplay> sharedDisplays = new ArrayList<SharedWindowDisplay>();
 	public WindowShareManager windowShareManager;
+	
+	// 共享窗口音频：发送端捕获（PipeWire 按进程）+ 接收端播放（OpenAL）
+	public AudioCaptureManager audioCaptureManager;
+	public AudioPlaybackManager audioPlaybackManager = new AudioPlaybackManager();
 	
 	public WindowItemManager itemManager = new WindowItemManager();
 	public XDGDesktopManager xdgManager;
@@ -152,6 +158,7 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		// 初始化窗口共享管理器
 		windowShareManager = new WindowShareManager(this);
+		audioCaptureManager = new AudioCaptureManager(this);
 		WaylandCraftCommand.register();
 	}
 	
@@ -185,6 +192,11 @@ public class WaylandCraft implements ClientModInitializer {
 		// 更新窗口共享（捕获+发送图像）
 		if(windowShareManager != null) {
 			windowShareManager.update();
+		}
+		
+		// 更新共享窗口音频（poll native PCM + 发送）
+		if(audioCaptureManager != null) {
+			audioCaptureManager.tick();
 		}
 		
 		// 更新 Portal 桌面捕获帧

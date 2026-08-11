@@ -18,6 +18,9 @@ public class WaylandCraftNetworking {
 	/** 最新帧缓存 + tick 批量转发器（与 receiver 在同一初始化流程中注册） */
 	private static final SharedWindowFrameRelay frameRelay = new SharedWindowFrameRelay();
 	
+	/** 共享窗口音频转发器（队列 + 尽力而为，积压丢旧保新） */
+	private static final AudioFrameRelay audioRelay = new AudioFrameRelay();
+	
 	public static void register() {
 		PayloadTypeRegistry.serverboundPlay().register(ServerboundGiveItemsPayload.TYPE, ServerboundGiveItemsPayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(ServerboundAliveWindowsPayload.TYPE, ServerboundAliveWindowsPayload.CODEC);
@@ -31,6 +34,8 @@ public class WaylandCraftNetworking {
 		PayloadTypeRegistry.serverboundPlay().register(SharedWindowInteractionPayload.TYPE, SharedWindowInteractionPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(SharedWindowPermissionPayload.TYPE, SharedWindowPermissionPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(SharedWindowListPayload.TYPE, SharedWindowListPayload.CODEC);
+		PayloadTypeRegistry.serverboundPlay().register(SharedWindowAudioPayload.TYPE, SharedWindowAudioPayload.CODEC);
+		PayloadTypeRegistry.clientboundPlay().register(SharedWindowAudioPayload.TYPE, SharedWindowAudioPayload.CODEC);
 		
 		// 权限管理命令
 		PayloadTypeRegistry.serverboundPlay().register(PermissionCommandPayload.TYPE, PermissionCommandPayload.CODEC);
@@ -102,6 +107,21 @@ public class WaylandCraftNetworking {
 		
 		// tick 转发注册与 receiver 注册在同一初始化流程
 		frameRelay.register();
+		
+		// 共享窗口音频：netty 线程只入队，tick 批量转发
+		ServerPlayNetworking.registerGlobalReceiver(SharedWindowAudioPayload.TYPE, (payload, ctx) -> {
+			ServerPlayer sender = ctx.player();
+			UUID senderUUID = sender.getUUID();
+			
+			SharedWindowManager manager = WaylandCraftCommon.instance.sharedWindowManager;
+			SharedWindowEntry entry = manager.getWindow(payload.windowHandle());
+			if(entry == null || !entry.getOwnerUUID().equals(senderUUID)) {
+				return;
+			}
+			
+			audioRelay.acceptAudio(payload);
+		});
+		audioRelay.register();
 		
 		ServerPlayNetworking.registerGlobalReceiver(SharedWindowInteractionPayload.TYPE, (payload, ctx) -> {
 			ServerPlayer player = ctx.player();

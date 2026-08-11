@@ -1134,4 +1134,16 @@ public class WaylandCraftBridge {
 	/** 停止捕获 */
 	public void portalCaptureStop() { portalCaptureStop(this.instance); }
 	
+	// 按进程音频捕获 (PipeWire: 共享窗口的声音)
+	private static native void audioCaptureStart(long instance, int pid);
+	private static native byte[] audioCapturePoll(long instance);
+	private static native void audioCaptureStop(long instance);
+	
+	/** 启动音频捕获（捕获指定 PID 进程的 PipeWire 输出） */
+	public void audioCaptureStart(int pid) { audioCaptureStart(this.instance, pid); }
+	/** 获取累积音频: [sampleRate(4), channels(4), pcm...] */
+	public byte[] audioCapturePoll() { return audioCapturePoll(this.instance); }
+	/** 停止音频捕获 */
+	public void audioCaptureStop() { audioCaptureStop(this.instance); }
+	
 }

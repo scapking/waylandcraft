@@ -55,6 +55,18 @@ public class SharedWindowClientHandler {
 			});
 		});
 		
+		// 处理共享窗口音频（OpenAL 流式播放；netty 线程收到 → enqueue 内部转主线程）
+		ClientPlayNetworking.registerGlobalReceiver(SharedWindowAudioPayload.TYPE, (payload, ctx) -> {
+			WaylandCraft wlc = WaylandCraft.instance;
+			if(wlc != null && wlc.audioPlaybackManager != null) {
+				// 只播放已知窗口的声音（窗口列表里有才播放，避免脏包）
+				if(remoteWindows.containsKey(payload.windowHandle())) {
+					wlc.audioPlaybackManager.enqueue(
+						payload.windowHandle(), payload.sampleRate(), payload.channels(), payload.pcmData());
+				}
+			}
+		});
+		
 		// 处理权限更新
 		ClientPlayNetworking.registerGlobalReceiver(SharedWindowPermissionPayload.TYPE, (payload, ctx) -> {
 			ctx.client().execute(() -> {
@@ -75,8 +87,14 @@ public class SharedWindowClientHandler {
 		// 处理客户端断开：清空渲染器的待解码队列、解码线程池与纹理（避免资源泄漏）
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
 			WaylandCraft wlc = WaylandCraft.instance;
-			if(wlc != null && wlc.remoteWindowRenderer != null) {
-				wlc.remoteWindowRenderer.clear();
+			if(wlc != null) {
+				if(wlc.remoteWindowRenderer != null) {
+					wlc.remoteWindowRenderer.clear();
+				}
+				if(wlc.audioPlaybackManager != null) {
+					// OpenAL 必须在主线程释放
+					client.execute(() -> wlc.audioPlaybackManager.closeAll());
+				}
 			}
 		});
 		
@@ -104,6 +122,9 @@ public class SharedWindowClientHandler {
 				}
 				if(!stillListed) {
 					instance.remoteWindowRenderer.destroyTexture(handle);
+					if(instance.audioPlaybackManager != null) {
+						instance.audioPlaybackManager.close(handle);
+					}
 				}
 			}
 		}

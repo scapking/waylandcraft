@@ -102,6 +102,15 @@ public class WindowShareManager {
 		});
 	}
 	
+	/**
+	 * 共享窗口音频捕获（只捕获共享窗口所属进程的声音）。
+	 * 一次只跟一个窗口：最近 startSharing 的窗口。
+	 */
+	private AudioCaptureManager audioCapture;
+	
+	/** 当前音频跟随的窗口 handle（0 = 无音频） */
+	private long audioWindowHandle = 0;
+	
 	public boolean startSharing(long windowHandle, String windowTitle) {
 		if(clientMod == null) {
 			LOGGER.warn("Cannot start sharing on server side");
@@ -118,6 +127,19 @@ public class WindowShareManager {
 		
 		SharedWindowClientHandler.requestWindowRegister(windowHandle, windowTitle);
 		
+		// 音频捕获：跟随最近共享的窗口（native 单例，一次一个）
+		if(WaylandCraft.instance != null && WaylandCraft.instance.audioCaptureManager != null) {
+			audioCapture = WaylandCraft.instance.audioCaptureManager;
+			audioWindowHandle = windowHandle;
+			audioCapture.setActiveWindow(windowHandle);
+			WLCToplevel toplevel = getLocalWindow(windowHandle);
+			String appId = toplevel != null ? toplevel.appID : null;
+			boolean audioOk = audioCapture.start(windowHandle, windowTitle, appId);
+			if(audioOk) {
+				LOGGER.info("Audio sharing enabled for 0x{}", Long.toHexString(windowHandle));
+			}
+		}
+		
 		LOGGER.info("Started sharing window 0x{}: {}", Long.toHexString(windowHandle), windowTitle);
 		return true;
 	}
@@ -130,6 +152,14 @@ public class WindowShareManager {
 		}
 		
 		SharedWindowClientHandler.requestWindowUnregister(windowHandle);
+		
+		// 只停"音频跟随窗口"本身的音频；其他窗口共享不受影响
+		if(audioWindowHandle == windowHandle) {
+			if(audioCapture != null) {
+				audioCapture.stop();
+			}
+			audioWindowHandle = 0;
+		}
 		
 		diffUpdateManager.clearWindow(windowHandle);
 		frameRateController.reset(windowHandle);
@@ -449,6 +479,11 @@ public class WindowShareManager {
 		bytesSentThisSecond = 0;
 		ImageCapture.clearAllDiffCaches();
 		ImageCapture.cleanupAllWindowResources();
+		if(audioCapture != null) {
+			audioCapture.stop();
+			audioCapture = null;
+		}
+		audioWindowHandle = 0;
 		LOGGER.info("Cleared all share states due to disconnect");
 	}
 	
