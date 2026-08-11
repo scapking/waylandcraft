@@ -152,7 +152,7 @@ public class WindowLayoutManager {
 	/** 同步持久顺序 ordered 与当前参与窗口列表：保留既有顺序，新增追加，消失移除 */
 	private void syncOrdered(List<WindowDisplay> list) {
 		ordered.removeIf(d -> !list.contains(d));
-		// 新窗口：基于核心窗口左右交替扩散插入（第一个在核心右，第二个在核心左，以此类推）
+		// 新窗口：基于核心窗口左右交替扩散（第一个在核心右，第二个在核心左，以此类推）
 		List<WindowDisplay> fresh = new ArrayList<>();
 		for(WindowDisplay d : list) {
 			if(!ordered.contains(d)) fresh.add(d);
@@ -165,16 +165,18 @@ public class WindowLayoutManager {
 			ordered.addAll(fresh);
 			return;
 		}
-		int leftPos = ci;      // 核心左侧插入位置（插在核心前面）
-		int rightPos = ci + 1; // 核心右侧插入位置
+		// 核心左 = 核心前面（逆时针相邻）；核心在开头时前面没有位置，环绕到末尾
+		// （末尾 = 核心左侧区域，而不是插到核心前面 → 布局最前方，导致新窗口
+		//  永远堆在核心前方同一区域）。
 		boolean goRight = true;
 		for(WindowDisplay d : fresh) {
 			if(goRight) {
-				ordered.add(rightPos, d);
-				rightPos++;
+				ordered.add(ci + 1, d); // 核心右（紧贴核心后）
+			} else if(ci == 0) {
+				ordered.add(d);         // 核心在开头：左侧环绕到末尾
 			} else {
-				ordered.add(leftPos, d);
-				rightPos++; // 左侧插入使核心及右侧整体右移
+				ordered.add(ci, d);     // 核心左（插在核心前）
+				ci++;                   // 核心被挤到后一位
 			}
 			goRight = !goRight;
 		}
