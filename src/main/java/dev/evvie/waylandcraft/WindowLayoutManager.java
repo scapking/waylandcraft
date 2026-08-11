@@ -142,11 +142,7 @@ public class WindowLayoutManager {
 		} else {
 			arrangeCube(ordered);
 		}
-
-		// 高度钳制：窗口底部 ≥ 地面 + groundClearance
-		for(WindowDisplay d : ordered) {
-			clampToGround(d);
-		}
+		// 贴地钳制已并入 applyLayerHeights（逐层：下一层基于上一层实际最高点，含钳制抬升）
 
 		// 核心窗口保底：默认第一个
 		if(coreHandle == 0 || !containsHandleIn(ordered, coreHandle)) {
@@ -356,27 +352,32 @@ public class WindowLayoutManager {
 	}
 
 	/**
-	 * 按分层结果设置每层窗口渲染中心 Y：层 1 = 眼睛高度，之后严格按下层最高区域累加。
-	 * 层基准：上层窗口底部 = 下层窗口最高点 + stackSpacing（用户要求的"最高区域 + 0.4"）。
+	 * 逐层设置窗口渲染中心 Y，并逐层贴地钳制。
+	 * 层基准：上一层"实际渲染最高点"（含贴地钳制抬升） + stackSpacing，再 + 本层半高。
+	 * 即上层窗口底部 = 下层窗口最高区域 + 0.4（用户要求的语义），任何分辨率/scale/地面都永不重叠。
 	 * pivot 按 renderCenterOffset 补偿，保证渲染中心落在目标 Y。
 	 */
 	private void applyLayerHeights(List<WindowDisplay> list, List<Integer> sizes, List<Double> maxHeights, double firstCenterY, double stackSpacing) {
 		int pos = 0;
-		double layerCenterY = firstCenterY;
+		double prevMaxTop = Double.NaN; // 上一层实际渲染最高点
 		for(int l = 0; l < sizes.size(); l++) {
 			int count = sizes.get(l);
 			double thisMaxH = maxHeights.get(l);
+			double layerCenterY = (l == 0) ? firstCenterY : prevMaxTop + stackSpacing + thisMaxH / 2.0;
+			double layerMaxTop = Double.NEGATIVE_INFINITY;
 			for(int j = 0; j < count; j++) {
 				WindowDisplay d = list.get(pos + j);
 				Vec3 off = renderCenterOffset(d);
 				d.pivot = new Vec3(d.pivot.x - off.x, layerCenterY - off.y, d.pivot.z - off.z);
+				// 贴地钳制（只抬升）：第一层大窗口不会插地，且下一层基准会含抬升效果
+				clampToGround(d);
+				Vec3 off2 = renderCenterOffset(d);
+				double renderCenterY = d.pivot.y + off2.y;
+				double top = renderCenterY + worldHeight(d) / 2.0;
+				if(top > layerMaxTop) layerMaxTop = top;
 			}
+			prevMaxTop = layerMaxTop;
 			pos += count;
-			if(l + 1 < sizes.size()) {
-				double nextMaxH = maxHeights.get(l + 1);
-				// 下一层中心 = 本层最高点 + stackSpacing + 下一层半高
-				layerCenterY = (layerCenterY + thisMaxH / 2.0) + stackSpacing + nextMaxH / 2.0;
-			}
 		}
 	}
 

@@ -773,16 +773,8 @@ public class WaylandCraft implements ClientModInitializer {
 			};
 			if(dir >= 0) {
 				if(layoutManager.isEnabled() && layoutManager.isInitialized()) {
-					boolean ok = layoutManager.swapCore(dir);
-					if(ok && settings != null) {
-						WindowDisplay core = findCoreDisplay();
-						if(core != null) {
-							// 核心窗口位置交换反馈（聊天）
-							String name = core.window instanceof WLCToplevel t ? getWindowName(t) : "窗口";
-							Minecraft.getInstance().getChatListener().handleSystemMessage(
-								Component.literal("§e➤ 核心窗口已换位: §f" + name), false);
-						}
-					}
+					// Ctrl+方向键：核心窗口换位（无聊天输出，静默切换）
+					layoutManager.swapCore(dir);
 					return true;
 				}
 				moveFrontWindow(dir);
