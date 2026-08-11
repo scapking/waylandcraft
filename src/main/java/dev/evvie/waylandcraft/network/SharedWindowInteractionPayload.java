@@ -16,8 +16,7 @@ public record SharedWindowInteractionPayload(long windowHandle, InteractionType 
 		MOUSE_RELEASE(2),
 		KEY_PRESS(3),
 		KEY_RELEASE(4),
-		SCROLL(5),
-		WINDOW_MOVE(6);
+		SCROLL(5);
 		
 		private final int id;
 		

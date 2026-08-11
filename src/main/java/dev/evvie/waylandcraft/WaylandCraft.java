@@ -918,7 +918,7 @@ public class WaylandCraft implements ClientModInitializer {
 	// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
 	public boolean onKeyPress(long windowHandle, int key, int scancode, int action, int modifiers) {
 		// Ctrl + 方向键：布局启用时核心标记移动到该方向相邻窗口；未启用布局时调整面前的窗口。
-		// 共享窗口优先：hover 共享窗口（或共享键盘捕获中）→ 移动共享窗口（本地即时 + 回传发送端）
+		// 共享窗口坐标由发送端决定（每帧 payload 携带 pivot），接收端不移动共享窗口。
 		if(action == GLFW.GLFW_PRESS && (modifiers & GLFW.GLFW_MOD_CONTROL) != 0) {
 			int dir = switch(key) {
 				case GLFW.GLFW_KEY_UP -> 0;
@@ -928,11 +928,8 @@ public class WaylandCraft implements ClientModInitializer {
 				default -> -1;
 			};
 			if(dir >= 0) {
-				SharedWindowDisplay sharedTarget = hoveredSharedDisplay != null ? hoveredSharedDisplay : sharedKeyboardCapture;
-				if(sharedTarget != null) {
-					moveSharedWindow(sharedTarget, dir);
-					return true;
-				}
+				WaylandCraftCommon.LOGGER.info("[move] Ctrl+方向键 dir={} layoutEnabled={} layoutInit={} localDisplays={} sharedDisplays={}",
+					dir, layoutManager.isEnabled(), layoutManager.isInitialized(), displays.size(), sharedDisplays.size());
 				if(layoutManager.isEnabled() && layoutManager.isInitialized()) {
 					// Ctrl+方向键：核心标记移动（无聊天输出，静默切换）
 					layoutManager.moveCore(dir);
@@ -1117,42 +1114,6 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		target.pivot = target.pivot.add(move);
 		target.clampVertical();
-	}
-	
-	/**
-	 * 用 Ctrl+方向键移动共享窗口（接收端本地即时 + 回传发送端同步真实窗口）。
-	 * @param display 目标共享窗口
-	 * @param dir 0=上 1=下 2=左 3=右（以玩家视角为基准）
-	 */
-	private void moveSharedWindow(SharedWindowDisplay display, int dir) {
-		if(display == null || settings == null) return;
-		
-		double step = settings.getMoveStep();
-		if(step <= 0) step = 0.5;
-		
-		Vec3 look = new Vec3(Minecraft.getInstance().gameRenderer.getMainCamera().forwardVector());
-		look = new Vec3(look.x, 0, look.z);
-		if(look.lengthSqr() < 1e-6) look = new Vec3(0, 0, 1);
-		look = look.normalize();
-		Vec3 right = look.cross(new Vec3(0, 1, 0)); // 玩家右手方向（水平）
-		
-		Vec3 move = switch(dir) {
-			case 0 -> new Vec3(0, step, 0);   // 上
-			case 1 -> new Vec3(0, -step, 0);  // 下
-			case 2 -> right.scale(-step);     // 左
-			case 3 -> right.scale(step);      // 右
-			default -> Vec3.ZERO;
-		};
-		
-		// 本地即时移动（画面立即响应）
-		display.moveBy(move);
-		
-		// 回传发送端：wayland 移本地 WindowDisplay.pivot（下一帧抓帧自动携带）；
-		// X11 更新 x11Offset（下一帧 payload pivot = 0,0,0 + offset）。
-		// 编码：x/y = deltaX/deltaY（double），button = deltaZ*100（int）
-		SharedWindowClientHandler.sendInteraction(display.getWindowHandle(),
-				SharedWindowInteractionPayload.InteractionType.WINDOW_MOVE,
-				move.x, move.y, (int) Math.round(move.z * 100), 0);
 	}
 	
 	private void anchorToParent(WLCPopup popup) {

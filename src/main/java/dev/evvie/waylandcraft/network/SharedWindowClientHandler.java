@@ -347,9 +347,8 @@ public class SharedWindowClientHandler {
 			return; // 不是正在共享的窗口（可能已停止）
 		}
 
-		// 除 WINDOW_MOVE（两端都要处理）外，目前只注入 X11 窗口；wayland 窗口的 wl 指针注入待后续接入
-		if(state.source != WindowShareManager.ShareState.Source.X11
-				&& payload.interactionType() != SharedWindowInteractionPayload.InteractionType.WINDOW_MOVE) {
+		// 目前只注入 X11 窗口；wayland 窗口的 wl 指针注入待后续接入
+		if(state.source != WindowShareManager.ShareState.Source.X11) {
 			return;
 		}
 
@@ -382,28 +381,6 @@ public class SharedWindowClientHandler {
 				double scrollY = (short) ((data >> 16) & 0xFFFF) / 100.0;
 				dev.evvie.waylandcraft.utils.X11Interaction.injectPointerMotion(display, rootX, rootY);
 				dev.evvie.waylandcraft.utils.X11Interaction.injectScroll(display, scrollX, scrollY);
-			}
-			case WINDOW_MOVE -> {
-				// 接收端 Ctrl+方向键移动共享窗口 → 回传发送端同步真实窗口位置。
-				// 编码：x/y = deltaX/deltaY（double），button = deltaZ*100（int）。
-				double dx = payload.x();
-				double dy = payload.y();
-				double dz = payload.button() / 100.0;
-				if(state.source == WindowShareManager.ShareState.Source.X11) {
-					// X11 无本地 WindowDisplay：记录偏移，下一帧抓帧 payload 携带（pivot = 0,0,0 + offset）
-					state.x11OffsetX += dx;
-					state.x11OffsetY += dy;
-					state.x11OffsetZ += dz;
-				} else {
-					// wayland：移动本地 WindowDisplay 的 pivot，下一帧抓帧自动携带新位置
-					for(var wd : wlc.displays) {
-						if(wd.window.getHandle() == payload.windowHandle()) {
-							wd.pivot = wd.pivot.add(dx, dy, dz);
-							wd.clampVertical();
-							break;
-						}
-					}
-				}
 			}
 			default -> {}
 		}
