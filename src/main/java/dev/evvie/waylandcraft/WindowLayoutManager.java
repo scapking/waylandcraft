@@ -212,7 +212,9 @@ public class WindowLayoutManager {
 	/**
 	 * 核心标记移动到该方向相邻窗口（核心身份转移，窗口位置不动）。
 	 * dir: 0=上 1=下 2=左 3=右。
-	 * 无上限：左/右在 ordered 中全局环绕，上/下跨层，无上层/下层时环绕到对侧，可一直切换。
+	 * 左/右 = 同层内按世界角度几何相邻（右=顺时针/角度更大的窗口，左=逆时针/角度更小的窗口），
+	 * 不受"交替序号插入顺序"约束——向右移动就是向右移动；同层内环绕，可一直切换。
+	 * 上/下跨层（同槽位），无上层/下层时环绕到对侧。
 	 * 返回是否移动成功。
 	 */
 	public boolean moveCore(int dir) {
@@ -250,17 +252,47 @@ public class WindowLayoutManager {
 				}
 				break;
 			}
-			case 2: // 左：前一个，最左环绕到最右
-				next = (idx - 1 + n) % n;
+			case 2: // 左：同层内角度更小的窗口（逆时针相邻）；最左环绕到同层最右
+				next = findLayerNeighbor(idx, start, size, -1);
 				break;
-			default: // 右：后一个，最右环绕到最左
-				next = (idx + 1) % n;
+			default: // 右：同层内角度更大的窗口（顺时针相邻）；最右环绕到同层最左
+				next = findLayerNeighbor(idx, start, size, +1);
 				break;
 		}
 
 		if(next < 0 || next >= n || next == idx) return false;
 		coreHandle = ((WLCToplevel) ordered.get(next).window).getHandle();
 		return true;
+	}
+
+	/**
+	 * 同层内按世界方位角找左/右相邻窗口。
+	 * dir=+1：角度更大的最近窗口（顺时针/向右）；dir=-1：角度更小的最近窗口（逆时针/向左）。
+	 * 取"从核心沿该方向绕一圈的最小角差"，最右/最左自动环绕到对侧，可一直切换。
+	 */
+	private int findLayerNeighbor(int idx, int start, int size, int dir) {
+		if(size <= 1) return idx;
+		WindowDisplay core = ordered.get(idx);
+		double a = angleOf(core);
+		int best = -1;
+		double bestDiff = 0;
+		for(int i = start; i < start + size; i++) {
+			if(i == idx) continue;
+			double d = angleOf(ordered.get(i));
+			double diff = dir > 0 ? d - a : a - d;
+			if(diff < 0) diff += Math.PI * 2; // 绕一圈到另一侧
+			if(best < 0 || diff < bestDiff) {
+				best = i;
+				bestDiff = diff;
+			}
+		}
+		return best < 0 ? idx : best;
+	}
+
+	/** 窗口相对布局中心的方位角（与 arrange 的 x=center.x+r*sin(a), z=center.z+r*cos(a) 一致） */
+	private double angleOf(WindowDisplay d) {
+		Vec3 center = centerPos();
+		return Math.atan2(d.pivot.x - center.x, d.pivot.z - center.z);
 	}
 
 	/** 当前核心窗口在 ordered 中的索引；不在列表中返回 -1 */

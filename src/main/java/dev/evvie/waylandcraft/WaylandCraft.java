@@ -940,9 +940,11 @@ public class WaylandCraft implements ClientModInitializer {
 			}
 		}
 		
-		if(key == GLFW.GLFW_KEY_Q && modifiers == GLFW.GLFW_MOD_ALT) {
+		// J 键：一键绑定/解绑键盘捕获（锁定 hover 窗口的键盘+鼠标；原 Alt+Q，改为单键 J，不冲突）。
+		// 参考移动（Ctrl+方向键）的按键处理方式：action==PRESS 时切换，不依赖修饰键组合。
+		if(key == GLFW.GLFW_KEY_J) {
 			if(action == 0) return true;
-			
+
 			if(keyboardCaptureMode != KeyboardCaptureMode.HARD_CAPTURE) {
 				enableKeyboardCapture(true);
 			}
