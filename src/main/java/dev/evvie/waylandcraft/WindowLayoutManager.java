@@ -51,9 +51,6 @@ public class WindowLayoutManager {
 	/** 持久排布顺序（Ctrl+方向键交换位置；新窗口追加，消失移除，不按 handle 重排） */
 	private final List<WindowDisplay> ordered = new ArrayList<>();
 
-	/** 已自动 resize 过的窗口（避免每 tick 强制 resize） */
-	private final HashSet<Long> resizedHandles = new HashSet<>();
-
 	/** 每层窗口数（cube: perFace×4；sphere: 每个纬度圈数量），用于上/下换层 */
 	private final List<Integer> layerSizes = new ArrayList<>();
 
@@ -136,10 +133,7 @@ public class WindowLayoutManager {
 			return;
 		}
 
-		// 新窗口自动 resize 到默认分辨率
-		for(WindowDisplay d : ordered) {
-			resizeIfNeeded(d);
-		}
+		// 窗口保持用户自定义分辨率，布局按实际渲染尺寸自适应（不强制 resize）
 
 		// 按模板排布（用持久顺序 ordered，Ctrl+方向键交换过的位置在这里生效）
 		String template = wlc.settings.getLayoutTemplate();
@@ -290,40 +284,57 @@ public class WindowLayoutManager {
 		return false;
 	}
 
-	/** 新窗口自动 resize 到默认分辨率（仅一次） */
-	private void resizeIfNeeded(WindowDisplay d) {
-		if(wlc.bridge == null || wlc.settings == null) return;
-		if(!(d.window instanceof WLCToplevel t)) return;
-		long handle = t.getHandle();
-		if(resizedHandles.contains(handle)) return;
-		int w = wlc.settings.getLayoutDefaultWidth();
-		int h = wlc.settings.getLayoutDefaultHeight();
-		if(t.geometry.width() != w || t.geometry.height() != h) {
-			wlc.bridge.resizeToplevel(t, w, h);
-		}
-		resizedHandles.add(handle);
-	}
-
-	/** 窗口世界宽度（格） */
+	/** 窗口世界宽度（格）：按实际渲染像素（framebuffer 优先，兜底 geometry） */
 	public static double worldWidth(WindowDisplay d) {
-		return d.localX().length() * d.window.geometry.width();
+		return d.localX().length() * renderWidthPx(d);
 	}
 
-	/** 窗口世界高度（格） */
+	/** 窗口世界高度（格）：按实际渲染像素（framebuffer 优先，兜底 geometry） */
 	public static double worldHeight(WindowDisplay d) {
-		return d.localY().length() * d.window.geometry.height();
+		return d.localY().length() * renderHeightPx(d);
 	}
 
-	/** 窗口底部抬到地面 + groundClearance */
+	/** 实际渲染像素宽：framebuffer（物理像素，含 scale/子窗口）优先；未创建时兜底 geometry */
+	private static int renderWidthPx(WindowDisplay d) {
+		if(d.window.framebuffer != null && d.window.framebuffer.getWidth() > 0) return d.window.framebuffer.getWidth();
+		return d.window.geometry.width();
+	}
+
+	/** 实际渲染像素高：framebuffer（物理像素，含 scale/子窗口）优先；未创建时兜底 geometry */
+	private static int renderHeightPx(WindowDisplay d) {
+		if(d.window.framebuffer != null && d.window.framebuffer.getHeight() > 0) return d.window.framebuffer.getHeight();
+		return d.window.geometry.height();
+	}
+
+	/**
+	 * 渲染中心相对 pivot（几何中心）的世界偏移。
+	 * render() 用 geometry 半尺寸锚定 origin、用 framebuffer 尺寸绘制：
+	 * 当 framebuffer 与 geometry 不一致（HiDPI scale、子窗口偏移）时，
+	 * 渲染中心 ≠ pivot。布局用渲染中心排布，视觉才不重叠。
+	 */
+	private static Vec3 renderCenterOffset(WindowDisplay d) {
+		int gw = d.window.geometry.width();
+		int gh = d.window.geometry.height();
+		int bw = renderWidthPx(d);
+		int bh = renderHeightPx(d);
+		int xoff = (d.window.framebuffer != null) ? d.window.framebuffer.getXOff() : 0;
+		int yoff = (d.window.framebuffer != null) ? d.window.framebuffer.getYOff() : 0;
+		return d.localX().scale(bw / 2.0 - gw / 2.0 - xoff)
+			.add(d.localY().scale(bh / 2.0 - gh / 2.0 - yoff));
+	}
+
+	/** 窗口底部抬到地面 + groundClearance（基于实际渲染中心/高度） */
 	private void clampToGround(WindowDisplay d) {
 		Minecraft mc = Minecraft.getInstance();
 		if(mc.level == null || wlc.settings == null) return;
 		double clearance = wlc.settings.getGroundClearance();
 		int groundY = mc.level.getHeight(Heightmap.Types.MOTION_BLOCKING, (int) Math.floor(d.pivot.x), (int) Math.floor(d.pivot.z));
 		double halfHeight = worldHeight(d) / 2.0;
+		Vec3 off = renderCenterOffset(d);
+		double renderCenterY = d.pivot.y + off.y;
 		double minY = groundY + clearance + halfHeight;
-		if(d.pivot.y < minY) {
-			d.pivot = new Vec3(d.pivot.x, minY, d.pivot.z);
+		if(renderCenterY < minY) {
+			d.pivot = new Vec3(d.pivot.x, minY - off.y, d.pivot.z);
 		}
 	}
 
@@ -344,7 +355,11 @@ public class WindowLayoutManager {
 		d.rotate(toCenter.normalize(), new Vec3(0, -1, 0));
 	}
 
-	/** 按分层结果设置每层窗口中心 Y：层 1 = 眼睛高度，之后严格按下层高度累加 */
+	/**
+	 * 按分层结果设置每层窗口渲染中心 Y：层 1 = 眼睛高度，之后严格按下层最高区域累加。
+	 * 层基准：上层窗口底部 = 下层窗口最高点 + stackSpacing（用户要求的"最高区域 + 0.4"）。
+	 * pivot 按 renderCenterOffset 补偿，保证渲染中心落在目标 Y。
+	 */
 	private void applyLayerHeights(List<WindowDisplay> list, List<Integer> sizes, List<Double> maxHeights, double firstCenterY, double stackSpacing) {
 		int pos = 0;
 		double layerCenterY = firstCenterY;
@@ -353,13 +368,14 @@ public class WindowLayoutManager {
 			double thisMaxH = maxHeights.get(l);
 			for(int j = 0; j < count; j++) {
 				WindowDisplay d = list.get(pos + j);
-				d.pivot = new Vec3(d.pivot.x, layerCenterY, d.pivot.z);
+				Vec3 off = renderCenterOffset(d);
+				d.pivot = new Vec3(d.pivot.x - off.x, layerCenterY - off.y, d.pivot.z - off.z);
 			}
 			pos += count;
 			if(l + 1 < sizes.size()) {
 				double nextMaxH = maxHeights.get(l + 1);
-				// 下一层中心 = 本层中心 + (本层最大高 + 下一层最大高)/2 + stackSpacing
-				layerCenterY += (thisMaxH + nextMaxH) / 2.0 + stackSpacing;
+				// 下一层中心 = 本层最高点 + stackSpacing + 下一层半高
+				layerCenterY = (layerCenterY + thisMaxH / 2.0) + stackSpacing + nextMaxH / 2.0;
 			}
 		}
 	}
