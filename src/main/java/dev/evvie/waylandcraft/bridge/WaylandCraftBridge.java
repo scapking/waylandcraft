@@ -779,6 +779,11 @@ public class WaylandCraftBridge {
 		return socket(this.instance);
 	}
 	
+	/** 获取 xwayland-satellite 的 X display（如 ":2"）；未启动 satellite 时返回空串 */
+	public String getSatelliteDisplay() {
+		return getSatelliteDisplay(this.instance);
+	}
+	
 	public boolean inputRegionContains(WLCSurface surface, double x, double y) {
 		return checkInputRegion(surface.getHandle(), x, y);
 	}
@@ -987,6 +992,7 @@ public class WaylandCraftBridge {
 	private static native long init(long glfwGetProcAddress, long eglDisplay);
 	private static native void update(long instance);
 	private static native String socket(long instance);
+	private static native String getSatelliteDisplay(long instance);
 	private static native void sendFrame(long surfaceHandle);
 	
 	private static native void updateSurfaceData(long instance, WLCSurface surface);

@@ -143,11 +143,27 @@ public class AudioCaptureManager {
 	 * 用 X11 窗口枚举（_NET_WM_PID）匹配窗口所属进程 PID。
 	 * 匹配优先级：title+appId 精确 → title 精确 → appId 匹配。
 	 * 
+	 * 关键：共享窗口运行在 waylandcraft 自己的 xwayland-satellite X display 上
+	 * （由 native 启动，号是动态的，如 ":2"）。必须显式连 satellite display 枚举，
+	 * 用 Minecraft 进程自己的 DISPLAY 会枚举到空/宿主桌面 → PID 永远解析失败 → 无声。
+	 * 
 	 * @return PID；找不到返回 0
 	 */
 	private int findPidForWindow(String title, String appId) {
-		List<X11WindowLister.WindowInfo> windows = X11WindowLister.getDesktopWindows();
-		if(windows.isEmpty()) return 0;
+		String satelliteDisplay = null;
+		if(clientMod != null && clientMod.bridge != null) {
+			try {
+				String d = clientMod.bridge.getSatelliteDisplay();
+				if(d != null && !d.isEmpty()) satelliteDisplay = d;
+			} catch(Throwable t) {
+				LOGGER.debug("Failed to query satellite display", t);
+			}
+		}
+		List<X11WindowLister.WindowInfo> windows = X11WindowLister.getDesktopWindows(satelliteDisplay);
+		if(windows.isEmpty()) {
+			LOGGER.debug("No X11 windows on display '{}'", satelliteDisplay);
+			return 0;
+		}
 		
 		X11WindowLister.WindowInfo best = null;
 		int bestScore = 0;

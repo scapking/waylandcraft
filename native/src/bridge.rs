@@ -110,6 +110,10 @@ bind_java_type! {
             sig = (instance: jlong) -> JString,
             fn = socket,
         },
+        static extern fn get_satellite_display {
+            sig = (instance: jlong) -> JString,
+            fn = get_satellite_display,
+        },
         static extern fn send_frame {
             sig = (surface_handle: jlong),
             fn = send_frame,
@@ -521,6 +525,22 @@ fn socket<'local>(
         .ok_or(BridgeError::OsStringToUtf8)?;
 
     Ok(JString::new(env, socket)?)
+}
+
+fn get_satellite_display<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "getSatelliteDisplay")?;
+    // 返回 xwayland-satellite 的 X display（如 ":2"）；未启动 satellite 时返回空串
+    let display = instance
+        .state
+        .satellite
+        .as_ref()
+        .map(|s| s.get_display())
+        .unwrap_or_default();
+    Ok(JString::new(env, &display)?)
 }
 
 fn send_frame<'local>(

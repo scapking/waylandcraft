@@ -62,14 +62,25 @@ public class X11WindowLister {
 	private X11WindowLister() {}
 
 	/**
-	 * 列出当前 X11 显示的所有顶层窗口。
+	 * 列出当前 X11 显示的所有顶层窗口（使用环境变量 DISPLAY）。
 	 * 无 X11 显示时返回空列表（不抛异常）。
 	 */
 	public static List<WindowInfo> getDesktopWindows() {
+		return getDesktopWindows(null);
+	}
+
+	/**
+	 * 列出指定 X11 显示的所有顶层窗口。
+	 * displayName 为 null 时使用环境变量 DISPLAY（XOpenDisplay(null) 语义）。
+	 * 无 X11 显示时返回空列表（不抛异常）。
+	 *
+	 * @param displayName X display 名（如 ":2"），null = 默认
+	 */
+	public static List<WindowInfo> getDesktopWindows(String displayName) {
 		List<WindowInfo> result = new ArrayList<>();
-		Pointer display = X11.INSTANCE.XOpenDisplay(null);
+		Pointer display = X11.INSTANCE.XOpenDisplay(displayName);
 		if(display == null) {
-			LOGGER.debug("No X11 display available");
+			LOGGER.debug("No X11 display available (requested '{}')", displayName);
 			return result;
 		}
 
