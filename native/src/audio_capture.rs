@@ -86,9 +86,14 @@ fn enumerate_topology(collect_ms: u64) -> Result<PwTopology, String> {
             match global.type_ {
                 pw::types::ObjectType::Node => {
                     if let Some(media_class) = global.props.and_then(|p| p.get("media.class")) {
+                        // 注意：PipeWire 的属性 key 是 "application.process.id" /
+                        // "application.process.binary"（见 pipewire 源码 keys.h / context.c：
+                        // PW_KEY_APP_PROCESS_ID = "application.process.id"）。
+                        // 曾误用 "app.process.id"/"app.process.name" → PID 恒为 0，
+                        // 匹配永远失败 → 这就是 v0.7 起音频一直无声的最深根因。
                         let app_pid = global
                             .props
-                            .and_then(|p| p.get("app.process.id"))
+                            .and_then(|p| p.get("application.process.id"))
                             .and_then(|s| s.parse::<u32>().ok())
                             .unwrap_or(0);
                         let name = global
@@ -98,7 +103,8 @@ fn enumerate_topology(collect_ms: u64) -> Result<PwTopology, String> {
                             .to_string();
                         let proc_name = global
                             .props
-                            .and_then(|p| p.get("app.process.name"))
+                            .and_then(|p| p.get("application.process.binary"))
+                            .or_else(|| global.props.and_then(|p| p.get("application.name")))
                             .unwrap_or("")
                             .to_string();
                         t.nodes.insert(
@@ -223,9 +229,20 @@ fn find_process_audio(pid: u32, topo: &PwTopology) -> Result<(u32, u32), String>
     }
 
     let node_id = best_node.ok_or_else(|| {
+        // 失败时列出所有候选节点，方便直接看 key 是否又对不上
+        let mut candidates = Vec::new();
+        for (node_id, (media_class, app_pid, _name, proc_name)) in &topo.nodes {
+            candidates.push(format!(
+                "  node {}: class={} pid={} proc={}",
+                node_id, media_class, app_pid, proc_name
+            ));
+        }
         format!(
-            "no PipeWire audio node found for pid={} (tree={} nodes, exe={:?}) — app may be silent or audio not on PipeWire",
-            pid, tree.len(), exe_name
+            "no PipeWire audio node found for pid={} (tree={} nodes, exe={:?}) — app may be silent or audio not on PipeWire\ncandidates:\n{}",
+            pid,
+            tree.len(),
+            exe_name,
+            candidates.join("\n")
         )
     })?;
 
