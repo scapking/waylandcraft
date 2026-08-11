@@ -130,8 +130,12 @@ public class WaylandCraft implements ClientModInitializer {
 	// hover 共享窗口时的窗口内像素坐标（相对窗口左上角，含 xoff/yoff）
 	public double hoveredSharedX = 0;
 	public double hoveredSharedY = 0;
-	// 键盘捕获绑定的共享窗口（G/Alt+Q 后按键走网络转发；与 pointerCapture 对应）
+	// 键盘捕获绑定的共享窗口（G/J 后按键走网络转发；与 pointerCapture 对应）
 	public SharedWindowDisplay sharedKeyboardCapture = null;
+	// 共享窗口键盘转发配对跟踪：press 记入、release 移除；hover/绑定窗口切换或退出绑定时
+	// 向旧窗口补发 release——防止远端窗口一直维持 Shift/CapsLock 等按键状态（"卡住大小写"）
+	private long lastKeyForwardHandle = -1;
+	private final java.util.HashSet<Integer> pressedForwardKeys = new java.util.HashSet<>();
 	// MOUSE_MOVE 转发节流：上次发送的窗口/像素/时间
 	private long lastSharedMouseHandle = -1;
 	private double lastSharedMouseX = Double.NaN;
@@ -361,6 +365,11 @@ public class WaylandCraft implements ClientModInitializer {
 	 */
 	public void disableKeyboardCapture() {
 		if(keyboardCaptureMode == KeyboardCaptureMode.NONE) return;
+		
+		// 第零步：补发所有仍按住的共享键 release（防止退出绑定后远端窗口卡 Shift/CapsLock）
+		long fwd = sharedKeyboardCapture != null ? sharedKeyboardCapture.getWindowHandle() : -1;
+		if(fwd < 0 && hoveredSharedDisplay != null) fwd = hoveredSharedDisplay.getWindowHandle();
+		releaseAllForwardedKeys(fwd);
 		
 		// 第一步：解除键盘绑定（恢复 Minecraft 角色控制）
 		keyboardCaptureMode = KeyboardCaptureMode.NONE;
@@ -917,8 +926,32 @@ public class WaylandCraft implements ClientModInitializer {
 	 */
 	// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
 	public boolean onKeyPress(long windowHandle, int key, int scancode, int action, int modifiers) {
-		// Ctrl + 方向键：布局启用时核心标记移动到该方向相邻窗口；未启用布局时调整面前的窗口。
-		// 共享窗口坐标由发送端决定（每帧 payload 携带 pivot），接收端不移动共享窗口。
+		// J 键：一键绑定/解绑键盘捕获（锁定 hover 窗口的键盘+鼠标）。
+		// 按下 = 绑定（键盘+鼠标一步到位，鼠标事件全部到该窗口）；再按 = 全部解绑退出。
+		if(key == GLFW.GLFW_KEY_J) {
+			if(action == 0) return true;
+
+			if(keyboardCaptureMode == KeyboardCaptureMode.NONE) {
+				enableKeyboardCapture(true);
+			}
+			else {
+				disableKeyboardCapture();
+			}
+			return true;
+		}
+
+		// ESC：任何捕获模式下都退出绑定（键盘+鼠标全部解绑），
+		// 不再把 ESC 转发给窗口——避免"按 ESC 想退出却作用到浏览器"。
+		// 未捕获时 ESC 照常转发给 hover 的共享窗口或漏给游戏（打开游戏菜单）。
+		if(keyboardCaptureMode != KeyboardCaptureMode.NONE && key == GLFW.GLFW_KEY_ESCAPE) {
+			if(action == 0) return true;
+			disableKeyboardCapture();
+			return true;
+		}
+
+		// Ctrl + 方向键：键盘捕获中或 hover 共享窗口时优先给窗口
+		//（浏览器切标签/滚动/光标跳词等快捷键），不移动核心；
+		// 否则布局启用时移动核心标记，未启用时调整面前的窗口。
 		if(action == GLFW.GLFW_PRESS && (modifiers & GLFW.GLFW_MOD_CONTROL) != 0) {
 			int dir = switch(key) {
 				case GLFW.GLFW_KEY_UP -> 0;
@@ -927,7 +960,7 @@ public class WaylandCraft implements ClientModInitializer {
 				case GLFW.GLFW_KEY_RIGHT -> 3;
 				default -> -1;
 			};
-			if(dir >= 0) {
+			if(dir >= 0 && keyboardCaptureMode == KeyboardCaptureMode.NONE && hoveredSharedDisplay == null) {
 				WaylandCraftCommon.LOGGER.info("[move] Ctrl+方向键 dir={} layoutEnabled={} layoutInit={} localDisplays={} sharedDisplays={}",
 					dir, layoutManager.isEnabled(), layoutManager.isInitialized(), displays.size(), sharedDisplays.size());
 				if(layoutManager.isEnabled() && layoutManager.isInitialized()) {
@@ -939,52 +972,66 @@ public class WaylandCraft implements ClientModInitializer {
 				return true;
 			}
 		}
-		
-		// J 键：一键绑定/解绑键盘捕获（锁定 hover 窗口的键盘+鼠标；原 Alt+Q，改为单键 J，不冲突）。
-		// 参考移动（Ctrl+方向键）的按键处理方式：action==PRESS 时切换，不依赖修饰键组合。
-		if(key == GLFW.GLFW_KEY_J) {
-			if(action == 0) return true;
 
-			if(keyboardCaptureMode != KeyboardCaptureMode.HARD_CAPTURE) {
-				enableKeyboardCapture(true);
+		if(keyboardCaptureMode == KeyboardCaptureMode.NONE) {
+			// 未捕获：hover 共享窗口时按键直接转发（对准窗口即操作窗口，无需先绑定）
+			if(hoveredSharedDisplay != null) {
+				forwardSharedKey(hoveredSharedDisplay.getWindowHandle(), key, action);
+				return true;
 			}
-			else {
-				disableKeyboardCapture();
+			// hover 已丢失：补发旧窗口仍按住的键 release（防止远端窗口卡 Shift/CapsLock）
+			if(!pressedForwardKeys.isEmpty() && lastKeyForwardHandle >= 0) {
+				releaseAllForwardedKeys(lastKeyForwardHandle);
 			}
-			return true;
+			return false;
 		}
-		
-		if(keyboardCaptureMode == KeyboardCaptureMode.NONE) return false;
-		
-		if(keyboardCaptureMode == KeyboardCaptureMode.CAPTURE && key == GLFW.GLFW_KEY_ESCAPE) {
-			disableKeyboardCapture();
-			return true;
-		}
-		
+
 		// 共享键盘捕获：按键走网络转发到发送端注入真实窗口
 		if(sharedKeyboardCapture != null) {
-			long handle = sharedKeyboardCapture.getWindowHandle();
-			if(action == GLFW.GLFW_PRESS) {
-				SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_PRESS,
-						0, 0, 0, glfwKeyToKeysym(key));
-			}
-			else if(action == GLFW.GLFW_RELEASE) {
-				SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_RELEASE,
-						0, 0, 0, glfwKeyToKeysym(key));
-			}
+			forwardSharedKey(sharedKeyboardCapture.getWindowHandle(), key, action);
 			return true;
 		}
-		
+
 		if(bridge == null) return true;
-		
+
 		if(action == GLFW.GLFW_PRESS) {
 			bridge.pressKey(scancode);
 		}
 		else if(action == GLFW.GLFW_RELEASE) {
 			bridge.releaseKey(scancode);
 		}
-		
+
 		return true;
+	}
+
+	/** 转发单个按键到共享窗口（配对跟踪：press 记入、release 移除；目标窗口切换时先补发旧窗口 release，防卡键） */
+	private void forwardSharedKey(long handle, int key, int action) {
+		int keysym = glfwKeyToKeysym(key);
+		if(handle != lastKeyForwardHandle) {
+			releaseAllForwardedKeys(lastKeyForwardHandle);
+			lastKeyForwardHandle = handle;
+		}
+		if(action == GLFW.GLFW_PRESS) {
+			pressedForwardKeys.add(keysym);
+			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_PRESS,
+					0, 0, 0, keysym);
+		}
+		else if(action == GLFW.GLFW_RELEASE) {
+			pressedForwardKeys.remove(keysym);
+			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_RELEASE,
+					0, 0, 0, keysym);
+		}
+	}
+
+	/** 向窗口补发所有仍按住的键的 release（窗口切换/退出绑定时调用，防止远端窗口卡 Shift/CapsLock） */
+	private void releaseAllForwardedKeys(long handle) {
+		if(handle < 0 || pressedForwardKeys.isEmpty()) return;
+		for(int keysym : pressedForwardKeys) {
+			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_RELEASE,
+					0, 0, 0, keysym);
+		}
+		pressedForwardKeys.clear();
+		lastKeyForwardHandle = -1;
 	}
 	
 	/**
