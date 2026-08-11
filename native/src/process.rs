@@ -107,9 +107,19 @@ fn build_env_list(app_type: &str, wayland_display: &str, display: &str) -> Vec<(
 ///    所以额外暴露 /tmp/.X11-unix 目录。
 /// 4. 找不到 app_id 时 insert_pos 保持 0，会把选项插到最前面（甚至插到 `run` 之前），
 ///    导致 flatpak 报错。现在找不到就追加到末尾。
+/// 5. 有些 flatpak 应用只支持 X11/xcb（manifest 明确 QT_QPA_PLATFORM=xcb，
+///    如 com.tencent.WeChat）。对它们绝不能注入 QT_QPA_PLATFORM=wayland / 
+///    GDK_BACKEND=wayland——应用会找不到 wayland platform plugin 直接退出。
+///    这类应用保持 xcb 后端，仅通过 --filesystem 暴露 xwayland-satellite 的
+///    X socket 并把 DISPLAY 指向它，窗口就会出现在 Minecraft 世界里。
+const X11_ONLY_FLATPAKS: &[&str] = &[
+    "com.tencent.WeChat", // manifest: "Only supports xcb" → QT_QPA_PLATFORM=xcb
+];
+
 fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &str, runtime_dir: &str) {
-    // 找到 app_id 的位置（run 之后第一个非选项参数）
+    // 找到 app_id 的位置（run 之后第一个非选项参数），同时拿到 app_id 本身
     let mut insert_pos = None;
+    let mut app_id: Option<String> = None;
     let mut found_run = false;
     for (i, arg) in args.iter().enumerate() {
         if arg == "run" {
@@ -118,10 +128,13 @@ fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &s
         }
         if found_run && !arg.starts_with('-') {
             insert_pos = Some(i);
+            app_id = Some(arg.clone());
             break;
         }
     }
     let insert_pos = insert_pos.unwrap_or(args.len());
+    let app_id = app_id.unwrap_or_default();
+    let x11_only = X11_ONLY_FLATPAKS.contains(&app_id.as_str());
 
     // flatpak run 的选项必须放在 run 之后、app_id 之前
     let mut opts = vec![
@@ -132,12 +145,20 @@ fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &s
         "--socket=wayland".to_string(),
         // 禁用 manifest 的 --socket=x11：它会把宿主桌面的 X socket（/tmp/.X11-unix/X0/X1 等）
         // 整个 bind 进沙箱并设 DISPLAY=宿主值，导致 Chrome 等应用窗口出现在宿主桌面而不是 Minecraft。
+        // x11-only 应用走下面 --filesystem 单独暴露 satellite 的 X socket，不受影响。
         "--nosocket=x11".to_string(),
         format!("--env=WAYLAND_DISPLAY={}", wayland_display),
-        "--env=GDK_BACKEND=wayland".to_string(),
-        "--env=QT_QPA_PLATFORM=wayland".to_string(),
-        "--env=ELECTRON_OZONE_PLATFORM_HINT=auto".to_string(),
     ];
+
+    if x11_only {
+        // X11-only（微信等）：保留 xcb 后端，不注入 wayland 强制变量。
+        // 显式设 xcb 以覆盖 manifest 缺失/冲突的情况；Qt 会连 DISPLAY 指向的 satellite。
+        opts.push("--env=QT_QPA_PLATFORM=xcb".to_string());
+    } else {
+        opts.push("--env=GDK_BACKEND=wayland".to_string());
+        opts.push("--env=QT_QPA_PLATFORM=wayland".to_string());
+        opts.push("--env=ELECTRON_OZONE_PLATFORM_HINT=auto".to_string());
+    }
     // X11-only flatpak apps need DISPLAY from xwayland-satellite；
     // 只 bind satellite 的单个 X socket（/tmp/.X11-unix/X<dpy>），不暴露宿主桌面的 X socket，
     // 这样沙箱内唯一可用的 X server 就是 satellite → 窗口必然回到 Minecraft。
