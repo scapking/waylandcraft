@@ -24,6 +24,79 @@ fn app_log_file(cmd: &str) -> std::fs::File {
         .unwrap_or_else(|_| panic!("cannot open {} nor /dev/null", path))
 }
 
+/// flatpak 应用的 manifest 能力（解析 `flatpak info --show-metadata` 的 [Context]/[Environment]）
+#[derive(Debug, Default)]
+struct FlatpakCaps {
+    /// manifest 是否成功读到（false = flatpak 不可用/未安装/解析失败 → 走保守路径）
+    detected: bool,
+    has_wayland: bool,
+    has_x11: bool,
+    has_pulse: bool,
+    has_pipewire: bool,
+    /// manifest 自带的 QT_QPA_PLATFORM（如微信 =xcb），尊重它，不覆盖
+    manifest_qpa: Option<String>,
+    /// manifest 自带的 GDK_BACKEND
+    manifest_gdk: Option<String>,
+}
+
+/// 读取 flatpak 应用的 manifest，检测它声明支持哪些协议（wayland/x11/pulseaudio/pipewire）。
+/// 这是通用方案：不再硬编码应用列表，任何 flatpak 应用都按它自己的 manifest 注入。
+/// 检测失败时 detected=false（调用方走保守路径：只给 socket+DISPLAY，不强制后端变量）。
+fn detect_flatpak_caps(app_id: &str) -> FlatpakCaps {
+    let mut caps = FlatpakCaps::default();
+    if app_id.is_empty() {
+        return caps;
+    }
+    let out = std::process::Command::new("flatpak")
+        .args(["info", "--show-metadata", app_id])
+        .output();
+    let text = match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        _ => {
+            log(&format!("[flatpak] detect manifest failed for {}", app_id));
+            return caps;
+        }
+    };
+    let mut in_context = false;
+    let mut in_env = false;
+    let mut saw_sockets = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            in_context = line == "[Context]";
+            in_env = line == "[Environment]";
+            continue;
+        }
+        if in_context {
+            if let Some(v) = line.strip_prefix("sockets=") {
+                saw_sockets = true;
+                let sockets: Vec<&str> = v.split(';').collect();
+                caps.has_wayland = sockets.contains(&"wayland");
+                caps.has_x11 = sockets.contains(&"x11");
+                caps.has_pulse = sockets.contains(&"pulseaudio");
+                caps.has_pipewire = sockets.contains(&"pipewire");
+            }
+        }
+        if in_env {
+            if let Some(v) = line.strip_prefix("QT_QPA_PLATFORM=") {
+                caps.manifest_qpa = Some(v.trim().to_string());
+            }
+            if let Some(v) = line.strip_prefix("GDK_BACKEND=") {
+                caps.manifest_gdk = Some(v.trim().to_string());
+            }
+        }
+    }
+    // 只要读到了 [Context] sockets 行就算检测成功；老 manifest 没有 sockets 行时
+    // 保持 detected=false 走保守路径（应用自己选后端，两个 socket 都给）。
+    caps.detected = saw_sockets || caps.manifest_qpa.is_some() || caps.manifest_gdk.is_some();
+    log(&format!(
+        "[flatpak] {} caps: detected={} wayland={} x11={} pulse={} pipewire={} qpa={:?} gdk={:?}",
+        app_id, caps.detected, caps.has_wayland, caps.has_x11, caps.has_pulse, caps.has_pipewire,
+        caps.manifest_qpa, caps.manifest_gdk
+    ));
+    caps
+}
+
 /// 检测应用类型
 fn detect_app_type(cmd: &str, args: &[String]) -> &'static str {
     let cmd_lower = cmd.to_lowercase();
@@ -92,30 +165,21 @@ fn build_env_list(app_type: &str, wayland_display: &str, display: &str) -> Vec<(
 
 /// 为 flatpak 注入 --env= / --socket= / --filesystem= 参数
 ///
-/// 修复说明：
-/// 1. v0.2.15 用 `--filesystem=/run/user/1000/wayland-1`（绝对路径）暴露宿主 wayland socket，
-///    但实测 QQ/WeChat 仍报 "Failed to connect to Wayland display: 没有那个文件或目录"——
-///    flatpak 对 runtime 目录（/run/user/<uid>）内路径有预订保护，--filesystem 静默不生效。
-///    **正确做法是 `--socket=wayland`**：flatpak 会读 flatpak 进程自身的 WAYLAND_DISPLAY
-///    （我们在 spawn 时已设为 wayland-1 = WaylandCraft compositor），把宿主
-///    /run/user/<uid>/wayland-1 bind 进沙箱同名路径。这是 flatpak 暴露 wayland socket 的
-///    官方机制，能正确处理 runtime 目录绑定。
-/// 2. 注意：之前 `--nosocket=wayland` 是为了阻止 manifest 默认把 WAYLAND_DISPLAY 指向宿主桌面
-///    （GNOME wayland-0）。现在改为 `--socket=wayland` 后，因为宿主 env WAYLAND_DISPLAY=wayland-1
-///    （而非 wayland-0），flatpak 暴露的正是我们的 compositor socket，应用不会跑到真实桌面。
-/// 3. X11 应用还需要能看到 xwayland-satellite 的 X socket（/tmp/.X11-unix/X<dpy>），
-///    所以额外暴露 /tmp/.X11-unix 目录。
-/// 4. 找不到 app_id 时 insert_pos 保持 0，会把选项插到最前面（甚至插到 `run` 之前），
-///    导致 flatpak 报错。现在找不到就追加到末尾。
-/// 5. 有些 flatpak 应用只支持 X11/xcb（manifest 明确 QT_QPA_PLATFORM=xcb，
-///    如 com.tencent.WeChat）。对它们绝不能注入 QT_QPA_PLATFORM=wayland / 
-///    GDK_BACKEND=wayland——应用会找不到 wayland platform plugin 直接退出。
-///    这类应用保持 xcb 后端，仅通过 --filesystem 暴露 xwayland-satellite 的
-///    X socket 并把 DISPLAY 指向它，窗口就会出现在 Minecraft 世界里。
-const X11_ONLY_FLATPAKS: &[&str] = &[
-    "com.tencent.WeChat", // manifest: "Only supports xcb" → QT_QPA_PLATFORM=xcb
-];
-
+/// 设计原则（v0.8.2 起）：**通用协议检测，不硬编码任何应用**。
+/// 1. 每个 flatpak 应用启动时读它自己的 manifest（flatpak info --show-metadata），
+///    检测它声明支持哪些协议（wayland / x11 / pulseaudio / pipewire）。
+/// 2. **wayland + x11 都完整暴露**（--socket=wayland 和 --socket=x11 都不省略）：
+///    - wayland：flatpak 读宿主 WAYLAND_DISPLAY=wayland-1（我们的 compositor）→ bind 进沙箱；
+///    - x11：flatpak 把整个 /tmp/.X11-unix bind 进沙箱并默认设 DISPLAY=宿主值，
+///      我们用 --env=DISPLAY=:N 显式覆盖指向 xwayland-satellite → 任何走 X11 的窗口都回 Minecraft。
+///    - 之前 v0.2.18~v0.8 对 wayland 应用 --nosocket=x11、对 x11-only 应用只 bind 单个
+///      X socket 文件，导致微信等 x11-only 应用 X11 环境不完整、极早期崩溃。现在不再省略。
+/// 3. 后端变量按 manifest 检测注入：支持 wayland → 强制 wayland 后端；只支持 x11 → xcb/x11；
+///    manifest 自带 QT_QPA_PLATFORM/GDK_BACKEND（如微信 =xcb）→ 尊重它，不覆盖。
+/// 4. 检测失败（flatpak 不可用/未安装）→ 保守：只给 socket+DISPLAY，不强制后端变量，
+///    让应用用自己默认（Qt→xcb 连 :N，GTK→wayland，Electron→auto），依然回 Minecraft。
+/// 5. 音频：manifest 声明 pulseaudio/pipewire 时，确保宿主音频 socket 可见
+///    （--socket=pulseaudio / --socket=pipewire，flatpak 1.12+ 支持）。
 fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &str, runtime_dir: &str) {
     // 找到 app_id 的位置（run 之后第一个非选项参数），同时拿到 app_id 本身
     let mut insert_pos = None;
@@ -134,7 +198,7 @@ fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &s
     }
     let insert_pos = insert_pos.unwrap_or(args.len());
     let app_id = app_id.unwrap_or_default();
-    let x11_only = X11_ONLY_FLATPAKS.contains(&app_id.as_str());
+    let caps = detect_flatpak_caps(&app_id);
 
     // flatpak run 的选项必须放在 run 之后、app_id 之前
     let mut opts = vec![
@@ -146,34 +210,56 @@ fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &s
         format!("--env=WAYLAND_DISPLAY={}", wayland_display),
     ];
 
-    if x11_only {
-        // X11-only（微信等）：保留 xcb 后端，不注入 wayland 强制变量。
-        // 显式设 xcb 以覆盖 manifest 缺失/冲突的情况；Qt 会连 DISPLAY 指向的 satellite。
-        opts.push("--env=QT_QPA_PLATFORM=xcb".to_string());
-        // 关键修复（v0.8.1）：不能再 --nosocket=x11！
-        // 微信 manifest 声明 --socket=x11，之前用 --nosocket=x11 + 只 bind 单个
-        // /tmp/.X11-unix/X<dpy> 文件，导致微信 Qt xcb 极早期崩溃
-        // （Breakpad tgkill 刷屏，连自身日志都没打出来）。
-        // 保留完整 X11 socket（flatpak 会 bind 整个 /tmp/.X11-unix 并设 DISPLAY=宿主值），
-        // 但下方 --env=DISPLAY=:2 显式覆盖指向 xwayland-satellite → 窗口必然回 Minecraft。
-    } else {
-        opts.push("--nosocket=x11".to_string());
-        opts.push("--env=GDK_BACKEND=wayland".to_string());
-        opts.push("--env=QT_QPA_PLATFORM=wayland".to_string());
-        opts.push("--env=ELECTRON_OZONE_PLATFORM_HINT=auto".to_string());
+    // X11 策略（v0.8.2，依据 flatpak 官方文档）：
+    // - 支持 wayland 的应用：--socket=fallback-x11（wayland 可用时 flatpak 不 bind X11 目录，
+    //   不把宿主桌面 X socket 暴露进沙箱；应用 wayland 失败想 fallback x11 时，
+    //   我们单独 bind 的 /tmp/.X11-unix/X<N> 文件保证 X 可用）→ 窗口回 Minecraft。
+    // - 只支持 x11 的应用（微信等）：--socket=x11 完整 bind 整个 /tmp/.X11-unix，
+    //   DISPLAY 显式指向 satellite → 完整 X11 环境，不崩溃。
+    // - 检测失败：--socket=x11 保守完整给（避免 x11-only 应用没 X 可用）。
+    if caps.detected && caps.has_wayland && caps.has_x11 {
+        opts.push("--socket=fallback-x11".to_string());
+    } else if !caps.detected || caps.has_x11 {
+        opts.push("--socket=x11".to_string());
     }
-    // X11-only flatpak apps need DISPLAY from xwayland-satellite；
-    // 对 x11-only（微信）：--socket=x11 已 bind 整个 /tmp/.X11-unix，DISPLAY 指向 satellite 即可；
-    // 对 wayland 应用：只 bind satellite 的单个 X socket（/tmp/.X11-unix/X<dpy>），
-    // 不暴露宿主桌面的 X socket，这样沙箱内唯一可用的 X server 就是 satellite → 窗口必然回到 Minecraft。
+    // DISPLAY 永远指向 xwayland-satellite（窗口回 Minecraft 的保证）；
+    // 同时 bind satellite 的单个 X socket 文件，让 fallback-x11 场景下 X 也可见。
     if !display.is_empty() {
         let dpy = display.trim_start_matches(':');
         if !dpy.is_empty() {
-            if !x11_only {
-                opts.push(format!("--filesystem=/tmp/.X11-unix/X{}", dpy));
-            }
+            opts.push(format!("--filesystem=/tmp/.X11-unix/X{}", dpy));
             opts.push(format!("--env=DISPLAY={}", display));
         }
+    }
+
+    // 音频：flatpak 合法 socket 只有 pulseaudio（无 pipewire 选项）。
+    // 显式 --socket=pulseaudio：即使应用 manifest 没声明（如部分微信/QQ 版本），
+    // 沙箱内也有音频能力——flatpak 会 bind 宿主 pulse socket（pipewire-pulse 兼容）。
+    // 宿主没有音频服务时 flatpak 跳过，不影响启动。宿主侧 waylandcraft 按 PID 捕获。
+    // 若应用 manifest 已声明 pulseaudio，重复声明无害（flatpak 去重）。
+    opts.push("--socket=pulseaudio".to_string());
+
+    // 后端变量：只在成功检测到 manifest 时注入；检测失败让应用用自己默认
+    // （Qt→xcb 连 :N，GTK→wayland，Electron→auto，都能回 Minecraft）。
+    if caps.detected {
+        // 尊重 manifest 自带的 QPA/GDK（如微信 QT_QPA_PLATFORM=xcb），否则按支持情况注入
+        match &caps.manifest_qpa {
+            Some(v) => log(&format!("[flatpak] {} manifest QT_QPA_PLATFORM={} (respect)", app_id, v)),
+            None => {
+                let v = if caps.has_wayland { "wayland" } else { "xcb" };
+                opts.push(format!("--env=QT_QPA_PLATFORM={}", v));
+            }
+        }
+        match &caps.manifest_gdk {
+            Some(v) => log(&format!("[flatpak] {} manifest GDK_BACKEND={} (respect)", app_id, v)),
+            None => {
+                let v = if caps.has_wayland { "wayland" } else { "x11" };
+                opts.push(format!("--env=GDK_BACKEND={}", v));
+            }
+        }
+        // Electron 类应用（manifest 一般不带 ozone 变量）：wayland 支持时 auto，否则 x11
+        let ozone = if caps.has_wayland { "auto" } else { "x11" };
+        opts.push(format!("--env=ELECTRON_OZONE_PLATFORM_HINT={}", ozone));
     }
 
     for (offset, opt) in opts.iter().enumerate() {
