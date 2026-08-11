@@ -953,7 +953,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §ewindowAntialiasing§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.WINDOW_ANTIALIASING) + "§r  §8(bool)§r"));
 		source.sendFeedback(Component.literal(" §efocusOnHover§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.FOCUS_ON_HOVER) + "§r  §8(bool)§r"));
 		source.sendFeedback(Component.literal(" §ehideCursor§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.HIDE_CURSOR) + "§r  §8(bool, 控制窗口时隐藏虚拟鼠标，默认 H 键切换)§r"));
-		source.sendFeedback(Component.literal(" §elayoutEnabled§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.LAYOUT_ENABLED) + "§r  §8(bool, 自动布局开关，默认关闭)§r"));
+		source.sendFeedback(Component.literal(" §elayoutEnabled§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.LAYOUT_ENABLED) + "§r  §8(bool, 自动布局开关，默认开启；未 init 时自动用玩家位置初始化)§r"));
 		source.sendFeedback(Component.literal(" §elayoutTemplate§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.LAYOUT_TEMPLATE) + "§r  §8(string, cube=方块 / sphere=圆球)§r"));
 		source.sendFeedback(Component.literal(" §elayoutInitialized§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.LAYOUT_INITIALIZED) + "§r  §8(bool, 已通过 /wl layout init 初始化)§r"));
 		source.sendFeedback(Component.literal(" §elayoutInitX/Y/Z/Yaw§7 §8(double, 布局中心坐标与朝向)§r"));

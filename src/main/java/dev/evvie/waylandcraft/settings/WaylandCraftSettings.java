@@ -25,8 +25,8 @@ public class WaylandCraftSettings {
 	/* ---- 控制距离 / 游戏优化 / 布局 ---- */
 	/** 控制窗口时隐藏虚拟鼠标光标（默认不自动隐藏，按键切换） */
 	boolean hideCursor = false;
-	/** 布局默认关闭（不启动时保持手动摆放） */
-	boolean layoutEnabled = false;
+	/** 布局默认开启（回到 v0.2.37 行为；未初始化坐标时自动用玩家位置初始化） */
+	boolean layoutEnabled = true;
 	/** 新窗口自动加入布局（false 时只排 /wl layout add 手动指定的窗口） */
 	boolean layoutAutoJoin = true;
 	/** 布局模板：cube（方块）或 sphere（圆球） */

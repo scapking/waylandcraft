@@ -50,6 +50,9 @@ public class WindowLayoutManager {
 	/** 持久排布顺序（新窗口追加，消失移除，不按 handle 重排） */
 	private final List<WindowDisplay> ordered = new ArrayList<>();
 
+	/** 下一个新窗口的交替序号（0=核心锚已预留给首个窗口；1=右1, 2=左1, 3=右2, 4=左2…，奇右偶左） */
+	private int nextAltIndex = 1;
+
 	/** 每层窗口数（cube: perFace×4；sphere: 每个纬度圈数量），用于上/下换层 */
 	private final List<Integer> layerSizes = new ArrayList<>();
 
@@ -119,9 +122,14 @@ public class WindowLayoutManager {
 	public void tick() {
 		if(!enabled) return;
 		if(wlc == null || wlc.settings == null) return;
-		if(!wlc.settings.getLayoutInitialized()) return;
 		Minecraft mc = Minecraft.getInstance();
 		if(mc.level == null) return;
+
+		// 未初始化坐标：自动用玩家当前脚部位置+眼睛高度+朝向初始化（开箱即用，
+		// 与 /wl layout init 无参行为一致；之后中心固定，不再跟随玩家）
+		if(!wlc.settings.getLayoutInitialized()) {
+			autoInit(mc);
+		}
 
 		List<WindowDisplay> list = participatingDisplays();
 		// 同步持久顺序：移除消失/退出的窗口，新窗口追加到末尾（保留用户交换过的顺序）
@@ -149,36 +157,55 @@ public class WindowLayoutManager {
 		}
 	}
 
-	/** 同步持久顺序 ordered 与当前参与窗口列表：保留既有顺序，新增追加，消失移除 */
+	/** 用玩家当前脚部位置 + 眼睛高度 + 朝向初始化布局中心（与 /wl layout init 无参行为一致） */
+	private void autoInit(Minecraft mc) {
+		var player = mc.player;
+		if(player == null || wlc.settingsManager == null) return;
+		var pos = player.position();
+		double yaw = -player.getYRot(); // MC yaw 逆时针 → 布局约定顺时针（0=朝+Z, 90=朝+X）
+		wlc.settingsManager.setDoubleSetting(WaylandCraftSettings.LAYOUT_INIT_X, pos.x);
+		wlc.settingsManager.setDoubleSetting(WaylandCraftSettings.LAYOUT_INIT_Y, pos.y + 1.62);
+		wlc.settingsManager.setDoubleSetting(WaylandCraftSettings.LAYOUT_INIT_Z, pos.z);
+		wlc.settingsManager.setDoubleSetting(WaylandCraftSettings.LAYOUT_INIT_YAW, yaw);
+		wlc.settingsManager.setBooleanSetting(WaylandCraftSettings.LAYOUT_INITIALIZED, true);
+		WaylandCraftCommon.LOGGER.info("[layout] auto-init center=({}, {}, {}) yaw={}° (player position + eye height)",
+			String.format("%.2f", pos.x), String.format("%.2f", pos.y + 1.62), String.format("%.2f", pos.z), String.format("%.1f", yaw));
+	}
+
+	/** 同步持久顺序 ordered 与当前参与窗口列表：保留既有顺序，新窗口分配交替序号，消失移除 */
 	private void syncOrdered(List<WindowDisplay> list) {
 		ordered.removeIf(d -> !list.contains(d));
-		// 新窗口：基于核心窗口左右交替扩散（第一个在核心右，第二个在核心左，以此类推）
+		// 新窗口
 		List<WindowDisplay> fresh = new ArrayList<>();
 		for(WindowDisplay d : list) {
 			if(!ordered.contains(d)) fresh.add(d);
 		}
+
+		// 核心始终作为布局锚点：身份变更（moveCore 转移）后，新窗口加入时把核心提到最前，
+		// 全量紧凑重排交替序号，布局以当前核心为中心重新扩散（核心固定前中，左右交替）。
+		// 注：moveCore 本身不改窗口位置（v0.6 身份转移语义），只在有新窗口加入时以新核心重排。
+		int ci = indexOfCore();
+		if(ci > 0) {
+			WindowDisplay core = ordered.remove(ci);
+			ordered.add(0, core);
+			for(int i = 0; i < ordered.size(); i++) {
+				ordered.get(i).layoutAltIndex = i; // 0=核心，1,2,3…=右1,左1,右2…（奇右偶左）
+			}
+			nextAltIndex = ordered.size();
+		}
+
 		if(fresh.isEmpty()) return;
 
-		int ci = indexOfCore();
-		if(ci < 0) {
-			// 尚无核心（或核心不在列表）：新窗口追加末尾，首个窗口随后会被设为核心
-			ordered.addAll(fresh);
-			return;
-		}
-		// 核心左 = 核心前面（逆时针相邻）；核心在开头时前面没有位置，环绕到末尾
-		// （末尾 = 核心左侧区域，而不是插到核心前面 → 布局最前方，导致新窗口
-		//  永远堆在核心前方同一区域）。
-		boolean goRight = true;
+		// 交替序号分配：首窗=0（核心锚），之后递增（1=右1, 2=左1, 3=右2, 4=左2…）。
+		// 序号即左右交替位置，与 arrangeCube 的交替角度 [0°, +1, -1, +2, -2, …] 严格对应，
+		// 保证每次只开一个窗口也左右交替；窗口关闭后序号保留，已有窗口位置不动，新窗口继续扩散。
 		for(WindowDisplay d : fresh) {
-			if(goRight) {
-				ordered.add(ci + 1, d); // 核心右（紧贴核心后）
-			} else if(ci == 0) {
-				ordered.add(d);         // 核心在开头：左侧环绕到末尾
+			if(ordered.isEmpty() && coreHandle == 0) {
+				d.layoutAltIndex = 0; // 首个窗口 = 核心锚
 			} else {
-				ordered.add(ci, d);     // 核心左（插在核心前）
-				ci++;                   // 核心被挤到后一位
+				d.layoutAltIndex = nextAltIndex++;
 			}
-			goRight = !goRight;
+			ordered.add(d);
 		}
 	}
 
@@ -401,35 +428,59 @@ public class WindowLayoutManager {
 		int layerSize = perFace * 4;
 		double slotAngle = (Math.PI / 2.0) / perFace; // 每面内槽位角宽（面 = 90°）
 
-		// 半径自适应：最宽窗口的角宽 ≤ 槽位角宽 → 均匀排布永不重叠
+		// 层内交替槽位角（以核心为锚左右扩散，与 syncOrdered 的交替插入顺序严格对应）：
+		//   0°(前中=核心) → +slotAngle(右1) → -slotAngle(左1) → +2*slotAngle(右2) → -2*slotAngle(左2) → … → 180°(后中)
+		// 最小相邻角差 = slotAngle（核心-右1、右1-右2、核心-左1、左1-左2、…），radius 自适应公式不变。
+		double[] alt = new double[layerSize];
+		alt[0] = 0;
+		int p = 1;
+		for(int k = 1; k <= perFace * 2 - 1 && p < layerSize; k++) {
+			if(p < layerSize) alt[p++] = k * slotAngle;   // 右 k
+			if(p < layerSize) alt[p++] = -k * slotAngle;  // 左 k
+		}
+		if(p < layerSize) alt[p] = Math.PI; // 后中心
+
+		// 半径自适应：最宽窗口的角宽 ≤ 槽位角宽 → 均匀排布永不重叠（只看首层，序号 < layerSize）
 		double maxW = 0;
-		for(int j = 0; j < Math.min(layerSize, list.size()); j++) {
-			maxW = Math.max(maxW, worldWidth(list.get(j)));
+		for(WindowDisplay d : list) {
+			int si = d.layoutAltIndex;
+			if(si < 0) si = 0;
+			if(si >= layerSize) continue;
+			maxW = Math.max(maxW, worldWidth(d));
 		}
 		double need = (maxW + spacing) / (2.0 * Math.sin(slotAngle / 2.0));
 		double radius = Math.max(s.getLayoutRadius(), need);
 
+		// 按交替序号分组到层：层 = 序号 / layerSize，层内槽位 = 序号 % layerSize。
+		// 窗口关闭后序号保留（空洞），已有窗口角度不变，新窗口继续按序号扩散。
 		List<Integer> sizes = new ArrayList<>();
 		List<Double> maxHeights = new ArrayList<>();
-		int idx = 0;
-		while(idx < list.size()) {
-			int count = Math.min(layerSize, list.size() - idx);
-			sizes.add(count);
+		int maxLayer = 0;
+		for(WindowDisplay d : list) {
+			int si = d.layoutAltIndex;
+			if(si < 0) si = 0;
+			maxLayer = Math.max(maxLayer, si / layerSize);
+		}
+		for(int l = 0; l <= maxLayer; l++) {
+			int count = 0;
 			double layerMaxH = 0;
-			for(int j = 0; j < count; j++) {
-				WindowDisplay d = list.get(idx + j);
+			for(WindowDisplay d : list) {
+				int si = d.layoutAltIndex;
+				if(si < 0) si = 0;
+				if(si / layerSize != l) continue;
+				count++;
 				double h = worldHeight(d);
-				int face = j / perFace;            // 0前 1右 2后 3左
-				int slot = j % perFace;            // 面内第几个
-				double angle = baseYaw + face * Math.PI / 2.0 + (slot - (perFace - 1) / 2.0) * slotAngle;
+				double angle = baseYaw + alt[si % layerSize]; // 交替角度（核心→0° 前中，右1→+，左1→-）
 				double x = center.x + radius * Math.sin(angle);
 				double z = center.z + radius * Math.cos(angle);
 				d.pivot = new Vec3(x, center.y, z); // Y 由 applyLayerHeights 统一设置
 				orientToCenter(d, center);
 				layerMaxH = Math.max(layerMaxH, h);
 			}
-			maxHeights.add(layerMaxH);
-			idx += count;
+			if(count > 0) {
+				sizes.add(count);
+				maxHeights.add(layerMaxH);
+			}
 		}
 
 		layerSizes.addAll(sizes);

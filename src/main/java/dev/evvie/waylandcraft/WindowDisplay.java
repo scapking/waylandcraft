@@ -52,6 +52,10 @@ public class WindowDisplay {
 	// 窗口底部距地面的最小净空（方块）
 	public static final double GROUND_CLEARANCE = 0.4;
 	
+	// 布局交替序号（核心锚=0，右1=1，左1=2，右2=3，左2=4…，奇右偶左，序号即左右交替位置）。
+	// 持久分配：窗口关闭/重开不影响其它窗口序号，新窗口继续按序号递增扩散。
+	public int layoutAltIndex = -1;
+	
 	public WindowDisplay(WLCAbstractWindow window) {
 		this.window = window;
 		this.updateGeometry();
