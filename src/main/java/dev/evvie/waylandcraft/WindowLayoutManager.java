@@ -163,14 +163,38 @@ public class WindowLayoutManager {
 	/** 同步持久顺序 ordered 与当前参与窗口列表：保留既有顺序，新增追加，消失移除 */
 	private void syncOrdered(List<WindowDisplay> list) {
 		ordered.removeIf(d -> !list.contains(d));
+		// 新窗口：基于核心窗口左右交替扩散插入（第一个在核心右，第二个在核心左，以此类推）
+		List<WindowDisplay> fresh = new ArrayList<>();
 		for(WindowDisplay d : list) {
-			if(!ordered.contains(d)) ordered.add(d);
+			if(!ordered.contains(d)) fresh.add(d);
+		}
+		if(fresh.isEmpty()) return;
+
+		int ci = indexOfCore();
+		if(ci < 0) {
+			// 尚无核心（或核心不在列表）：新窗口追加末尾，首个窗口随后会被设为核心
+			ordered.addAll(fresh);
+			return;
+		}
+		int leftPos = ci;      // 核心左侧插入位置（插在核心前面）
+		int rightPos = ci + 1; // 核心右侧插入位置
+		boolean goRight = true;
+		for(WindowDisplay d : fresh) {
+			if(goRight) {
+				ordered.add(rightPos, d);
+				rightPos++;
+			} else {
+				ordered.add(leftPos, d);
+				rightPos++; // 左侧插入使核心及右侧整体右移
+			}
+			goRight = !goRight;
 		}
 	}
 
 	/**
 	 * 核心窗口与该方向相邻窗口互换实际位置（窗口真的移动）。
 	 * dir: 0=上 1=下 2=左 3=右。核心窗口跟随移动（coreHandle 不变）。
+	 * 无上限：左/右在 ordered 中全局环绕，上/下跨层，无上层/下层时环绕到对侧，可一直切换。
 	 * 返回是否交换成功。
 	 */
 	public boolean swapCore(int dir) {
@@ -185,27 +209,34 @@ public class WindowLayoutManager {
 		int next;
 
 		switch(dir) {
-			case 0: { // 上：上一层同槽位
-				if(start == 0) return false;
-				int prevStart = prevLayerStart(start);
-				int prevSize = start - prevStart;
-				next = prevStart + Math.min(slot, prevSize - 1);
+			case 0: { // 上：上一层同槽位；无上层则环绕到最底层同槽位
+				if(start == 0) {
+					int lastSize = layerSizes.isEmpty() ? n : layerSizes.get(layerSizes.size() - 1);
+					int lastStart = n - lastSize;
+					next = lastStart + Math.min(slot, lastSize - 1);
+				} else {
+					int prevStart = prevLayerStart(start);
+					int prevSize = start - prevStart;
+					next = prevStart + Math.min(slot, prevSize - 1);
+				}
 				break;
 			}
-			case 1: { // 下：下一层同槽位
+			case 1: { // 下：下一层同槽位；无下层则环绕到最上层同槽位
 				int nextStart = start + size;
-				if(nextStart >= n) return false;
-				int nextSize = layerSizeAt(nextStart);
-				next = nextStart + Math.min(slot, nextSize - 1);
+				if(nextStart >= n) {
+					int firstSize = layerSizes.isEmpty() ? 1 : layerSizes.get(0);
+					next = Math.min(slot, firstSize - 1);
+				} else {
+					int nextSize = layerSizeAt(nextStart);
+					next = nextStart + Math.min(slot, nextSize - 1);
+				}
 				break;
 			}
-			case 2: // 左：同层前一个
-				if(idx == start) return false;
-				next = idx - 1;
+			case 2: // 左：前一个，最左环绕到最右
+				next = (idx - 1 + n) % n;
 				break;
-			default: // 右：同层后一个
-				if(idx == start + size - 1) return false;
-				next = idx + 1;
+			default: // 右：后一个，最右环绕到最左
+				next = (idx + 1) % n;
 				break;
 		}
 
