@@ -143,6 +143,63 @@ public class WindowShareManager {
 		LOGGER.info("Started sharing window 0x{}: {}", Long.toHexString(windowHandle), windowTitle);
 		return true;
 	}
+
+	/**
+	 * 开始共享一个 X11 窗口（XGetImage 抓帧）。
+	 * 用于微信等 X11-only 应用：它们不在 xdg toplevel 列表里，
+	 * 没有 wayland framebuffer，必须直接从 X server 抓像素。
+	 *
+	 * @param xid X window id（也作为共享 handle 使用）
+	 * @param title 窗口标题
+	 * @param displayName X display（如 ":2"，null = 默认 DISPLAY）
+	 * @param appId 应用 ID（WM_CLASS 实例名），用于音频 PID 匹配
+	 * @param pid 窗口进程 PID（_NET_WM_PID）
+	 */
+	public boolean startX11Sharing(long xid, String title, String displayName, String appId, int pid) {
+		if(clientMod == null) {
+			LOGGER.warn("Cannot start sharing on server side");
+			return false;
+		}
+
+		if(shareStates.containsKey(xid)) {
+			LOGGER.warn("X11 window 0x{} is already being shared", Long.toHexString(xid));
+			return false;
+		}
+
+		// 校验窗口可访问
+		dev.evvie.waylandcraft.utils.X11Capture.Geometry geo =
+			dev.evvie.waylandcraft.utils.X11Capture.getGeometry(displayName, xid);
+		if(geo == null) {
+			LOGGER.warn("Cannot access X11 window 0x{} on display '{}'", Long.toHexString(xid), displayName);
+			return false;
+		}
+
+		ShareState state = new ShareState(xid, title, ShareState.Source.X11, displayName, xid);
+		state.x11Width = geo.width();
+		state.x11Height = geo.height();
+		state.x11RootX = geo.rootX();
+		state.x11RootY = geo.rootY();
+		state.x11AppId = appId;
+		state.x11Pid = pid;
+		shareStates.put(xid, state);
+
+		SharedWindowClientHandler.requestWindowRegister(xid, title);
+
+		// 音频捕获：X11 窗口有 _NET_WM_PID，直接复用按 PID 捕获的链路
+		if(WaylandCraft.instance != null && WaylandCraft.instance.audioCaptureManager != null) {
+			audioCapture = WaylandCraft.instance.audioCaptureManager;
+			audioWindowHandle = xid;
+			audioCapture.setActiveWindow(xid);
+			boolean audioOk = audioCapture.start(xid, title, appId);
+			if(audioOk) {
+				LOGGER.info("Audio sharing enabled for X11 0x{}", Long.toHexString(xid));
+			}
+		}
+
+		LOGGER.info("Started sharing X11 window 0x{}: {} ({}x{} on {})",
+			Long.toHexString(xid), title, geo.width(), geo.height(), displayName);
+		return true;
+	}
 	
 	public boolean stopSharing(long windowHandle) {
 		ShareState state = shareStates.remove(windowHandle);
@@ -190,6 +247,12 @@ public class WindowShareManager {
 	 * 更新单个共享窗口（带全部优化）
 	 */
 	private void updateSharedWindow(ShareState state) {
+		// X11 窗口走独立抓帧路径（XGetImage，无 framebuffer/toplevel）
+		if(state.source == ShareState.Source.X11) {
+			updateSharedWindowX11(state);
+			return;
+		}
+
 		ImageCapture.CaptureConfig effectiveConfig = state.getEffectiveConfig(captureConfig);
 		
 		// 帧率限制
@@ -325,6 +388,178 @@ public class WindowShareManager {
 		state.currentBitrate = bytesSentThisSecond * 8 / 1000; // kbps
 	}
 	
+	/**
+	 * 更新单个 X11 共享窗口：XGetImage 抓帧 → 缩放 → JPEG → 发送。
+	 *
+	 * 与 wayland 路径的区别：
+	 * - 没有 toplevel/framebuffer，直接问 X server 要像素；
+	 * - 没有本地 WindowDisplay，用默认变换（原点正对）；
+	 * - 不做 diff 检测（X11 抓帧已经是整帧开销，diff 收益低，先全帧发送）。
+	 */
+	private void updateSharedWindowX11(ShareState state) {
+		ImageCapture.CaptureConfig effectiveConfig = state.getEffectiveConfig(captureConfig);
+
+		// 帧率限制
+		if(!frameRateController.shouldUpdate(state.windowHandle, effectiveConfig.maxFps)) {
+			return;
+		}
+
+		// 抓帧（同时拿到窗口尺寸与根坐标，供交互注入定位）
+		dev.evvie.waylandcraft.utils.X11Capture.Frame frame =
+			dev.evvie.waylandcraft.utils.X11Capture.captureRgba(state.x11Display, state.x11Xid);
+		if(frame == null) {
+			return; // 窗口最小化/销毁/抓取失败：跳过本帧
+		}
+
+		// 刷新几何信息（窗口移动/缩放后交互坐标要跟着更新）
+		state.x11Width = frame.width();
+		state.x11Height = frame.height();
+		state.x11RootX = frame.rootX();
+		state.x11RootY = frame.rootY();
+
+		int srcW = frame.width();
+		int srcH = frame.height();
+		if(srcW <= 0 || srcH <= 0) {
+			return;
+		}
+
+		// 计算实际使用的scale（自适应 × 配置）
+		float effectiveScale = effectiveConfig.scale * adaptiveScaleMultiplier;
+		effectiveScale = Math.max(0.1f, Math.min(1.0f, effectiveScale));
+
+		int targetW = Math.max(1, Math.round(srcW * effectiveScale));
+		int targetH = Math.max(1, Math.round(srcH * effectiveScale));
+
+		// 缩放（scale<1 时；最近邻足够，X11 内容缩放本来就糊）
+		java.nio.ByteBuffer rgba = frame.rgba();
+		if(targetW != srcW || targetH != srcH) {
+			rgba = scaleRgbaNearest(rgba, srcW, srcH, targetW, targetH);
+		}
+
+		// JPEG 编码 + 大小保护（只降 quality，scale 冻结 —— 与 wayland 路径一致）
+		byte[] imageData = encodeJpegWithSizeProtection(state, rgba, targetW, targetH, effectiveConfig);
+		if(imageData == null) {
+			return;
+		}
+
+		// === 码率限速 ===
+		if(effectiveConfig.maxBitrate > 0) {
+			long maxBytesPerSecond = (long)effectiveConfig.maxBitrate * 1000 / 8;
+			if(bytesSentThisSecond + imageData.length > maxBytesPerSecond) {
+				state.rateLimitedFrames++;
+				lastFrameOverLimit = true;
+				adaptiveOverLimitCount++;
+				adaptiveUnderUtilCount = 0;
+				return;
+			}
+			lastFrameOverLimit = false;
+		}
+
+		// === 自适应质量评估 ===
+		adaptiveEvalCounter++;
+		adaptiveFrameBytes += imageData.length;
+		if(adaptiveEvalCounter >= ADAPTIVE_EVAL_INTERVAL) {
+			evaluateAdaptiveQuality(effectiveConfig);
+			adaptiveEvalCounter = 0;
+			adaptiveFrameBytes = 0;
+		}
+
+		// X11 无本地 display：默认变换（原点、正对、竖直）
+		// 接收端用原始窗口尺寸（srcW/srcH）算世界四边形大小，
+		// 图像是缩放后的（targetW/targetH），纹理拉伸到原始尺寸。
+		SharedWindowImagePayload imagePayload = new SharedWindowImagePayload(
+			state.windowHandle, 0, 0, 0,
+			targetW, targetH,
+			imageData,
+			0, 0, 0,
+			0, 0, 1,
+			0, -1, 0,
+			1.0, srcW, srcH,
+			senderPixelsPerBlock()
+		);
+		ClientPlayNetworking.send(imagePayload);
+
+		// 更新统计
+		bytesSentThisSecond += imageData.length;
+		state.lastUpdateTime = System.currentTimeMillis();
+		state.lastFrameSentTime = state.lastUpdateTime;
+		state.frameCount++;
+		state.totalBytes += imageData.length;
+		state.currentFps = frameRateController.getCurrentFps(state.windowHandle);
+		state.currentBitrate = bytesSentThisSecond * 8 / 1000;
+	}
+
+	/** 发送端自己的 pixelsPerBlock（与 wayland 路径一致） */
+	private int senderPixelsPerBlock() {
+		if(WaylandCraft.instance != null && WaylandCraft.instance.settings != null) {
+			return WaylandCraft.instance.settings.getPixelsPerBlock();
+		}
+		return 500;
+	}
+
+	/** 最近邻 RGBA 缩放（top-down） */
+	private static java.nio.ByteBuffer scaleRgbaNearest(java.nio.ByteBuffer src, int srcW, int srcH, int dstW, int dstH) {
+		java.nio.ByteBuffer dst = java.nio.ByteBuffer.allocateDirect(dstW * dstH * 4).order(java.nio.ByteOrder.nativeOrder());
+		for(int y = 0; y < dstH; y++) {
+			int srcY = y * srcH / dstH;
+			for(int x = 0; x < dstW; x++) {
+				int srcX = x * srcW / dstW;
+				int si = (srcY * srcW + srcX) * 4;
+				int di = (y * dstW + x) * 4;
+				dst.put(di, src.get(si));
+				dst.put(di + 1, src.get(si + 1));
+				dst.put(di + 2, src.get(si + 2));
+				dst.put(di + 3, src.get(si + 3));
+			}
+		}
+		return dst;
+	}
+
+	/** X11 帧 JPEG 编码 + 大小保护（只降 quality，scale 冻结） */
+	@Nullable
+	private byte[] encodeJpegWithSizeProtection(ShareState state, java.nio.ByteBuffer rgba,
+			int width, int height, ImageCapture.CaptureConfig config) {
+		float quality = config.quality;
+		byte[] imageData = ImageCapture.compressToJpegDirect(rgba, width, height, quality, false);
+		if(imageData == null) {
+			return null;
+		}
+
+		int degradeRounds = 0;
+		if(config.maxJpegBytes > 0) {
+			while(imageData.length > config.maxJpegBytes && degradeRounds < config.maxDegradeRounds) {
+				float nextQuality = nextLadderValue(config.jpegQualityLadder, quality);
+				if(nextQuality < 0) {
+					break;
+				}
+				quality = nextQuality;
+				rgba.rewind();
+				byte[] reencoded = ImageCapture.compressToJpegDirect(rgba, width, height, quality, false);
+				if(reencoded == null) {
+					return null;
+				}
+				degradeRounds++;
+				LOGGER.warn("X11 window 0x{} JPEG over size limit ({} bytes): {} -> {} bytes, degrade round {}: quality={}",
+					Long.toHexString(state.windowHandle), config.maxJpegBytes,
+					imageData.length, reencoded.length, degradeRounds, String.format("%.2f", quality));
+				imageData = reencoded;
+			}
+
+			if(imageData.length > config.maxJpegBytes) {
+				state.sizeDroppedFrames++;
+				LOGGER.error("X11 window 0x{} JPEG still over size limit after {} degrade round(s): {} bytes > {} bytes, DROPPING frame",
+					Long.toHexString(state.windowHandle), degradeRounds,
+					imageData.length, config.maxJpegBytes);
+				return null;
+			}
+
+			if(degradeRounds > 0) {
+				state.degradedFrames++;
+			}
+		}
+		return imageData;
+	}
+
 	/**
 	 * 捕获并编码一帧 JPEG，带发送端大小保护（自动降级）。
 	 *
@@ -561,10 +796,25 @@ public class WindowShareManager {
 	 * 共享状态
 	 */
 	public static class ShareState {
+		/** 窗口像素来源：wayland 窗口（framebuffer 抓帧）还是 X11 窗口（XGetImage 抓帧） */
+		public enum Source { WAYLAND, X11 }
+
 		public final long windowHandle;
 		public final String windowTitle;
 		public final long startTime;
-		
+
+		public final Source source;
+
+		// === X11 共享专用 ===
+		public final String x11Display;   // X display（如 ":2"），仅 X11 源
+		public final long x11Xid;         // X window id（== windowHandle），仅 X11 源
+		public volatile int x11Width = 0;      // 最近一次抓帧的原始窗口宽
+		public volatile int x11Height = 0;     // 最近一次抓帧的原始窗口高
+		public volatile int x11RootX = 0;      // 窗口原点在根窗口的 X（交互注入用）
+		public volatile int x11RootY = 0;      // 窗口原点在根窗口的 Y（交互注入用）
+		public volatile String x11AppId = null;
+		public volatile int x11Pid = 0;
+
 		public long lastUpdateTime = 0;
 		public long lastFrameSentTime = 0;   // 最近一次实际发送帧的时间（心跳帧用）
 		public long frameCount = 0;
@@ -575,15 +825,22 @@ public class WindowShareManager {
 		public long sizeDroppedFrames = 0;   // 降级后仍超限被丢弃的帧数
 		public int currentFps = 0;           // 当前实际帧率
 		public long currentBitrate = 0;      // 当前码率 (kbps)
-		
+
 		public ImageCapture.CaptureConfig perWindowConfig = null;
-		
+
 		public ShareState(long windowHandle, String windowTitle) {
+			this(windowHandle, windowTitle, Source.WAYLAND, null, windowHandle);
+		}
+
+		public ShareState(long windowHandle, String windowTitle, Source source, String x11Display, long x11Xid) {
 			this.windowHandle = windowHandle;
 			this.windowTitle = windowTitle;
+			this.source = source;
+			this.x11Display = x11Display;
+			this.x11Xid = x11Xid;
 			this.startTime = System.currentTimeMillis();
 		}
-		
+
 		public ImageCapture.CaptureConfig getEffectiveConfig(ImageCapture.CaptureConfig globalConfig) {
 			return perWindowConfig != null ? perWindowConfig : globalConfig;
 		}

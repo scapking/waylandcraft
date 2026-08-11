@@ -204,6 +204,25 @@ public class WaylandCraftCommand {
 						)
 					)
 				)
+				// X11 窗口共享（微信等 X11-only 应用）
+				.then(ClientCommands.literal("x11")
+					.then(ClientCommands.literal("list")
+						.executes(WaylandCraftCommand::x11List)
+						.then(ClientCommands.argument("display", StringArgumentType.word())
+							.executes(WaylandCraftCommand::x11List)
+						)
+					)
+					.then(ClientCommands.literal("share")
+						.then(ClientCommands.argument("index", IntegerArgumentType.integer(1))
+							.executes(WaylandCraftCommand::x11Share)
+						)
+					)
+					.then(ClientCommands.literal("stop")
+						.then(ClientCommands.argument("handle", StringArgumentType.word())
+							.executes(WaylandCraftCommand::x11Stop)
+						)
+					)
+				)
 				// 权限管理 - 任意玩家可用
 				.then(ClientCommands.literal("permission")
 					.then(ClientCommands.literal("list")
@@ -2112,6 +2131,130 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §7Adaptive Scale: §e" + String.format("%.2f", wlc.windowShareManager.getAdaptiveScaleMultiplier()) + "§r"));
 		source.sendFeedback(Component.literal(" §7Bandwidth Util: §e" + String.format("%.1f%%", wlc.windowShareManager.getBitrateUtilization() * 100) + "§r"));
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		return 1;
+	}
+
+	// ===== X11 窗口共享命令（微信等 X11-only 应用） =====
+
+	/** 默认使用 satellite X display（微信跑在上面）；获取不到时用 null（进程默认 DISPLAY） */
+	private static String getSatelliteDisplayOrDefault() {
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc != null && wlc.bridge != null) {
+			try {
+				String d = wlc.bridge.getSatelliteDisplay();
+				if(d != null && !d.isEmpty()) return d;
+			} catch(Throwable ignored) {}
+		}
+		return null;
+	}
+
+	private static String getX11DisplayArg(CommandContext<FabricClientCommandSource> context, String fallback) {
+		try {
+			String d = StringArgumentType.getString(context, "display");
+			if(d != null && !d.isEmpty()) return d;
+		} catch(IllegalArgumentException ignored) {}
+		return fallback;
+	}
+
+	/**
+	 * /wl x11 list [display]
+	 * 列出 X11 显示上的顶层窗口（satellite display 默认）
+	 */
+	private static int x11List(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		String display = getX11DisplayArg(context, getSatelliteDisplayOrDefault());
+
+		java.util.List<dev.evvie.waylandcraft.utils.X11WindowLister.WindowInfo> windows =
+			dev.evvie.waylandcraft.utils.X11WindowLister.getDesktopWindows(display);
+
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal("§6 §lX11 Windows §r§7(display: §e" + (display != null ? display : "default") + "§7)§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+
+		if(windows.isEmpty()) {
+			source.sendFeedback(Component.literal(" §7No X11 windows found (is satellite running?)§r"));
+			source.sendFeedback(Component.literal(" §7Use §e/wl x11 list <display>§7 to check another display§r"));
+			return 0;
+		}
+
+		int i = 1;
+		for(dev.evvie.waylandcraft.utils.X11WindowLister.WindowInfo w : windows) {
+			source.sendFeedback(Component.literal(" §e" + i + "§7. §f" + w.title + "§r §7[§e0x" + w.hash + "§7] pid=§e" + w.pid + "§7 app=§e" + (w.appId != null ? w.appId : "?") + "§r"));
+			i++;
+		}
+		source.sendFeedback(Component.literal(" §7Use §e/wl x11 share <index>§7 to share§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		return 1;
+	}
+
+	/**
+	 * /wl x11 share <index> [display]
+	 * 共享列表中的第 index 个 X11 窗口
+	 */
+	private static int x11Share(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.windowShareManager == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		int index = IntegerArgumentType.getInteger(context, "index");
+		String display = getX11DisplayArg(context, getSatelliteDisplayOrDefault());
+
+		java.util.List<dev.evvie.waylandcraft.utils.X11WindowLister.WindowInfo> windows =
+			dev.evvie.waylandcraft.utils.X11WindowLister.getDesktopWindows(display);
+		if(index < 1 || index > windows.size()) {
+			source.sendError(Component.literal("§c✘ Index out of range (1-" + windows.size() + ")§r"));
+			return 0;
+		}
+
+		dev.evvie.waylandcraft.utils.X11WindowLister.WindowInfo info = windows.get(index - 1);
+		long xid;
+		try {
+			xid = Long.parseUnsignedLong(info.hash, 16);
+		} catch(NumberFormatException e) {
+			source.sendError(Component.literal("§c✘ Invalid window id: " + info.hash + "§r"));
+			return 0;
+		}
+
+		boolean ok = wlc.windowShareManager.startX11Sharing(xid, info.title, display, info.appId, info.pid);
+		if(ok) {
+			source.sendFeedback(Component.literal("§a✔ Sharing X11 window §f" + info.title + "§a (§e0x" + info.hash + "§a)§r"));
+			source.sendFeedback(Component.literal(" §7Remote players can see it in world (origin). Audio follows window PID §e" + info.pid + "§7 if available§r"));
+		} else {
+			source.sendError(Component.literal("§c✘ Failed to share X11 window (already shared or inaccessible?)§r"));
+		}
+		return ok ? 1 : 0;
+	}
+
+	/**
+	 * /wl x11 stop <handle>
+	 * 停止共享 X11 窗口
+	 */
+	private static int x11Stop(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.windowShareManager == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		String handleStr = StringArgumentType.getString(context, "handle");
+		long xid = parseWindowHandle(handleStr);
+		if(xid < 0) {
+			source.sendError(Component.literal("§c✘ Invalid handle: " + handleStr + "§r"));
+			return 0;
+		}
+
+		WindowShareManager.ShareState state = wlc.windowShareManager.getShareState(xid);
+		if(state == null || state.source != WindowShareManager.ShareState.Source.X11) {
+			source.sendError(Component.literal("§c✘ 0x" + Long.toHexString(xid) + " is not an actively shared X11 window§r"));
+			return 0;
+		}
+
+		wlc.windowShareManager.stopSharing(xid);
+		source.sendFeedback(Component.literal("§a✔ Stopped sharing X11 window §f" + state.windowTitle + "§r"));
 		return 1;
 	}
 

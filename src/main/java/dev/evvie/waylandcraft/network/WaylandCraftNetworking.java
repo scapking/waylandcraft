@@ -32,6 +32,7 @@ public class WaylandCraftNetworking {
 		PayloadTypeRegistry.clientboundPlay().register(SharedWindowImagePayload.TYPE, SharedWindowImagePayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(SharedWindowImagePayload.TYPE, SharedWindowImagePayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(SharedWindowInteractionPayload.TYPE, SharedWindowInteractionPayload.CODEC);
+		PayloadTypeRegistry.clientboundPlay().register(SharedWindowInteractionPayload.TYPE, SharedWindowInteractionPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(SharedWindowPermissionPayload.TYPE, SharedWindowPermissionPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(SharedWindowListPayload.TYPE, SharedWindowListPayload.CODEC);
 		PayloadTypeRegistry.serverboundPlay().register(SharedWindowAudioPayload.TYPE, SharedWindowAudioPayload.CODEC);

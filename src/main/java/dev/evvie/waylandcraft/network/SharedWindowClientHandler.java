@@ -13,6 +13,7 @@ import dev.evvie.waylandcraft.WaylandCraft;
 import dev.evvie.waylandcraft.render.SharedWindowDisplay;
 import dev.evvie.waylandcraft.shared.RemoteWindowRenderer;
 import dev.evvie.waylandcraft.shared.WindowPermission;
+import dev.evvie.waylandcraft.shared.WindowShareManager;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import dev.evvie.waylandcraft.network.PermissionResponsePayload;
@@ -81,6 +82,14 @@ public class SharedWindowClientHandler {
 				if (mc.player != null) {
 					mc.player.sendSystemMessage(net.minecraft.network.chat.Component.literal(payload.message()));
 				}
+			});
+		});
+
+		// 处理交互事件（窗口所有者侧）：服务器把玩家对共享窗口的操作转发给 owner，
+		// owner 把事件注入到真实窗口。X11 窗口走 XTest 注入（wayland 注入后续接入）。
+		ClientPlayNetworking.registerGlobalReceiver(SharedWindowInteractionPayload.TYPE, (payload, ctx) -> {
+			ctx.client().execute(() -> {
+				handleInteraction(payload);
 			});
 		});
 		
@@ -318,6 +327,63 @@ public class SharedWindowClientHandler {
 			windowHandle, type, x, y, button, key, senderUUID
 		);
 		ClientPlayNetworking.send(payload);
+	}
+
+	/**
+	 * 窗口所有者侧：把远程玩家对共享窗口的操作注入到真实窗口。
+	 * 当前只支持 X11 窗口（XTest 注入）；wayland 窗口注入后续接入。
+	 *
+	 * 坐标约定：payload.x/y 是窗口内像素坐标（0..geometryW/H，原始尺寸），
+	 * 注入时换算到屏幕根坐标（窗口根坐标 + 偏移）。
+	 */
+	private static void handleInteraction(SharedWindowInteractionPayload payload) {
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.windowShareManager == null) {
+			return;
+		}
+
+		WindowShareManager.ShareState state = wlc.windowShareManager.getShareState(payload.windowHandle());
+		if(state == null) {
+			return; // 不是正在共享的窗口（可能已停止）
+		}
+
+		// 目前只注入 X11 窗口；wayland 窗口的 wl 指针注入待后续接入
+		if(state.source != WindowShareManager.ShareState.Source.X11) {
+			return;
+		}
+
+		String display = state.x11Display;
+		long xid = state.x11Xid;
+		int rootX = state.x11RootX + (int) Math.round(payload.x());
+		int rootY = state.x11RootY + (int) Math.round(payload.y());
+
+		switch(payload.interactionType()) {
+			case MOUSE_MOVE -> {
+				dev.evvie.waylandcraft.utils.X11Interaction.injectPointerMotion(display, rootX, rootY);
+			}
+			case MOUSE_CLICK -> {
+				dev.evvie.waylandcraft.utils.X11Interaction.injectPointerMotion(display, rootX, rootY);
+				dev.evvie.waylandcraft.utils.X11Interaction.injectButton(display, payload.button(), true);
+			}
+			case MOUSE_RELEASE -> {
+				dev.evvie.waylandcraft.utils.X11Interaction.injectButton(display, payload.button(), false);
+			}
+			case KEY_PRESS -> {
+				dev.evvie.waylandcraft.utils.X11Interaction.injectKey(display, payload.key(), true);
+			}
+			case KEY_RELEASE -> {
+				dev.evvie.waylandcraft.utils.X11Interaction.injectKey(display, payload.key(), false);
+			}
+			case SCROLL -> {
+				// 编码：低16位 = scrollX*100（符号位保留），高16位 = scrollY*100
+				int data = payload.button();
+				double scrollX = (short) (data & 0xFFFF) / 100.0;
+				double scrollY = (short) ((data >> 16) & 0xFFFF) / 100.0;
+				dev.evvie.waylandcraft.utils.X11Interaction.injectPointerMotion(display, rootX, rootY);
+				dev.evvie.waylandcraft.utils.X11Interaction.injectScroll(display, scrollX, scrollY);
+			}
+			default -> {}
+		}
 	}
 	
 	/**
