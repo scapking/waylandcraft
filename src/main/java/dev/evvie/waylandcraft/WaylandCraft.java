@@ -100,11 +100,13 @@ public class WaylandCraft implements ClientModInitializer {
 	public WindowAliasRegistry windowAliases = new WindowAliasRegistry();
 	// 窗口模板（临时 + 永久）
 	public WindowTemplateManager templateManager = new WindowTemplateManager();
-	// 圆形自动布局（环形排列 + 向上堆叠，默认开启）
-	public WindowCircleLayout circleLayout = new WindowCircleLayout(this);
+	// 窗口自动布局（方块/圆球模板，围绕初始化坐标，默认关闭）
+	public WindowLayoutManager layoutManager = new WindowLayoutManager(this);
 	
 	public KeyMapping keyOpenScreen;
 	public KeyMapping keyCaptureKeyboard;
+	// 切换鼠标隐藏（沉浸游玩；默认 H，可在按键设置改）
+	public KeyMapping keyToggleCursor;
 	
 	public WindowInHandRenderer windowInHandRenderer = new WindowInHandRenderer();
 	public WindowInItemFrameRenderer windowInItemFrameRenderer = new WindowInItemFrameRenderer();
@@ -133,6 +135,7 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		keyOpenScreen = KeyMappingHelper.registerKeyMapping(new KeyMapping("waylandcraft.key.windowManager", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_B, KEYBIND_CATEGORY));
 		keyCaptureKeyboard = KeyMappingHelper.registerKeyMapping(new KeyMapping("waylandcraft.key.captureKeyboard", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_G, KEYBIND_CATEGORY));
+		keyToggleCursor = KeyMappingHelper.registerKeyMapping(new KeyMapping("waylandcraft.key.toggleCursor", InputConstants.Type.KEYSYM, GLFW.GLFW_KEY_H, KEYBIND_CATEGORY));
 		
 		LevelRenderEvents.COLLECT_SUBMITS.register(this::renderWorld);
 		LevelRenderEvents.END_EXTRACTION.register(this::updateWorld);
@@ -163,7 +166,7 @@ public class WaylandCraft implements ClientModInitializer {
 				xdgManager = new XDGDesktopManager(this);
 				settingsManager = new WaylandCraftSettingsManager(this);
 				templateManager.init(Minecraft.getInstance().gameDirectory);
-				circleLayout.setEnabled(settings != null && settings.getLayoutEnabled());
+				layoutManager.setEnabled(settings != null && settings.getLayoutEnabled());
 				
 				WaylandCraftCommon.LOGGER.info("Server started on " + waylandSocket);
 			} catch (Throwable t) {
@@ -238,8 +241,8 @@ public class WaylandCraft implements ClientModInitializer {
 		// 处理等待窗口出现的永久模板应用
 		templateManager.tick(this);
 		
-		// 圆形自动布局：每 tick 重排（跟随玩家、新窗口自动加入、尺寸变化自适应）
-		circleLayout.tick();
+		// 窗口自动布局：每 tick 围绕初始化坐标重排（默认关闭，需先 /wl layout init）
+		layoutManager.tick();
 		
 		for(WLCPopup popup : bridge.getMappedPopups()) {
 			anchorToParent(popup);
@@ -329,6 +332,14 @@ public class WaylandCraft implements ClientModInitializer {
 		if(keyCaptureKeyboard.consumeClick()) {
 			if(bridge == null) return;
 			enableKeyboardCapture(false);
+			return;
+		}
+		
+		if(keyToggleCursor.consumeClick()) {
+			if(settingsManager == null) return;
+			boolean hide = !settings.getHideCursor();
+			settingsManager.setBooleanSetting(WaylandCraftSettings.HIDE_CURSOR, hide);
+			minecraft.getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 鼠标隐藏已" + (hide ? "开启" : "关闭")), false);
 			return;
 		}
 	}
@@ -480,6 +491,19 @@ public class WaylandCraft implements ClientModInitializer {
 		displays.add(display);
 		
 		return display;
+	}
+	
+	public @Nullable WindowDisplay findCoreDisplay() {
+		if(layoutManager == null) return null;
+		long handle = layoutManager.getCoreHandle();
+		for(WindowDisplay d : displays) {
+			if(d.window instanceof WLCToplevel t && t.getHandle() == handle) return d;
+		}
+		return null;
+	}
+	
+	public static String getWindowName(WLCToplevel toplevel) {
+		return toplevel.title != null && !toplevel.title.isBlank() ? toplevel.title : "Unknown";
 	}
 	
 	public boolean hasDisplayFor(WLCAbstractWindow window) {
@@ -736,8 +760,9 @@ public class WaylandCraft implements ClientModInitializer {
 	 * is also the correct matching Wayland scancode for the default XKBConfig.
 	 * For X11 and Wayland hosts, this is a huge hack but should mostly work for now
 	 */
+	// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
 	public boolean onKeyPress(long windowHandle, int key, int scancode, int action, int modifiers) {
-		// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
+		// Ctrl + 方向键：布局启用时切换核心窗口；未启用布局时调整面前的窗口
 		if(action == GLFW.GLFW_PRESS && (modifiers & GLFW.GLFW_MOD_CONTROL) != 0) {
 			int dir = switch(key) {
 				case GLFW.GLFW_KEY_UP -> 0;
@@ -747,6 +772,19 @@ public class WaylandCraft implements ClientModInitializer {
 				default -> -1;
 			};
 			if(dir >= 0) {
+				if(layoutManager.isEnabled() && layoutManager.isInitialized()) {
+					boolean ok = layoutManager.cycleCore(dir);
+					if(ok && settings != null) {
+						WindowDisplay core = findCoreDisplay();
+						if(core != null) {
+							// 核心窗口切换反馈（聊天）
+							String name = core.window instanceof WLCToplevel t ? getWindowName(t) : "窗口";
+							Minecraft.getInstance().getChatListener().handleSystemMessage(
+								Component.literal("§e➤ 核心窗口: §f" + name), false);
+						}
+					}
+					return true;
+				}
 				moveFrontWindow(dir);
 				return true;
 			}

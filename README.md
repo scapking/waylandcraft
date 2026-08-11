@@ -184,6 +184,24 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 | `/wl template list` | List all templates |
 | `/wl template remove <name>` / `removep <name>` | Delete temporary / permanent template |
 
+### Auto Layout (cube / sphere)
+
+Windows can be arranged automatically around a fixed initialized origin (they no longer follow the player). Disabled by default.
+
+| Command | Purpose |
+|---------|---------|
+| `/wl layout init [<x> <y> <z> [<yaw>]]` | Initialize layout center + yaw (no args = player position) |
+| `/wl layout cube` | Switch to cube template (4 faces × N windows per face) and enable |
+| `/wl layout sphere` | Switch to sphere template (VR screen-wall ring, stack upward) and enable |
+| `/wl layout on` / `off` / `toggle` | Enable / disable / toggle auto layout |
+| `/wl layout status` | Show template, center, radius, spacing, core window |
+| `/wl layout list` | List windows in the layout (`➤` marks the core window) |
+| `/wl layout add <handle>` / `remove <handle>` | Manually add / remove a window (when `layoutAutoJoin` is off) |
+| `/wl layout core <handle>` | Set the core window explicitly |
+
+* `Ctrl` + arrow keys switches the core window (left/right = neighbours in the same layer, up/down = previous/next layer). When auto layout is disabled, `Ctrl` + arrows still moves the hovered window manually.
+* `G` captures the keyboard; the default key `H` toggles the cursor (both rebindable in the vanilla key settings).
+
 ### Sharing
 
 | Command | Purpose |

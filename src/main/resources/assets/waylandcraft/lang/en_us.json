@@ -1,5 +1,6 @@
 {
 	"key.category.waylandcraft.keys": "Waylandcraft",
 	"waylandcraft.key.windowManager": "Window Manager",
-	"waylandcraft.key.captureKeyboard": "Capture Keyboard"
+	"waylandcraft.key.captureKeyboard": "Capture Keyboard",
+	"waylandcraft.key.toggleCursor": "Toggle Cursor"
 }
