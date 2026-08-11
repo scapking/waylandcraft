@@ -142,6 +142,12 @@ public class WaylandCraftSettingsManager {
 		writeSettings();
 	}
 	
+	// Set a double setting and write it to file
+	public void setDoubleSetting(String name, double value) {
+		wlc.settings.setDoubleSetting(name, value);
+		writeSettings();
+	}
+	
 	// Get an int setting
 	public int getIntSetting(String name) {
 		return wlc.settings.getIntSetting(name);
@@ -150,6 +156,11 @@ public class WaylandCraftSettingsManager {
 	// Set a boolean setting
 	public boolean getBooleanSetting(String name) {
 		return wlc.settings.getBooleanSetting(name);
+	}
+	
+	// Get a double setting
+	public double getDoubleSetting(String name) {
+		return wlc.settings.getDoubleSetting(name);
 	}
 	
 }

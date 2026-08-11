@@ -100,6 +100,8 @@ public class WaylandCraft implements ClientModInitializer {
 	public WindowAliasRegistry windowAliases = new WindowAliasRegistry();
 	// 窗口模板（临时 + 永久）
 	public WindowTemplateManager templateManager = new WindowTemplateManager();
+	// 圆形自动布局（环形排列 + 向上堆叠，默认开启）
+	public WindowCircleLayout circleLayout = new WindowCircleLayout(this);
 	
 	public KeyMapping keyOpenScreen;
 	public KeyMapping keyCaptureKeyboard;
@@ -161,6 +163,7 @@ public class WaylandCraft implements ClientModInitializer {
 				xdgManager = new XDGDesktopManager(this);
 				settingsManager = new WaylandCraftSettingsManager(this);
 				templateManager.init(Minecraft.getInstance().gameDirectory);
+				circleLayout.setEnabled(settings != null && settings.getLayoutEnabled());
 				
 				WaylandCraftCommon.LOGGER.info("Server started on " + waylandSocket);
 			} catch (Throwable t) {
@@ -234,6 +237,9 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		// 处理等待窗口出现的永久模板应用
 		templateManager.tick(this);
+		
+		// 圆形自动布局：每 tick 重排（跟随玩家、新窗口自动加入、尺寸变化自适应）
+		circleLayout.tick();
 		
 		for(WLCPopup popup : bridge.getMappedPopups()) {
 			anchorToParent(popup);
@@ -486,6 +492,15 @@ public class WaylandCraft implements ClientModInitializer {
 		pointerCapture = null;
 	}
 	
+	/**
+	 * 控制窗口时显示的光标。hideCursor 开启时隐藏虚拟鼠标光标（沉浸游玩，
+	 * 被控应用自身渲染的光标在窗口画面里仍可见），关闭时显示窗口真实光标。
+	 */
+	private CursorShape controlCursor() {
+		if(settings != null && settings.getHideCursor()) return CursorShape.HIDE;
+		return bridge.getCursorShape();
+	}
+	
 	private void processPointerMotion(Camera camera) {
 		this.cursorShape = null;
 		
@@ -495,7 +510,7 @@ public class WaylandCraft implements ClientModInitializer {
 				return;
 			}
 			
-			this.cursorShape = bridge.getCursorShape();
+			this.cursorShape = controlCursor();
 			
 			if(!bridge.maybeLockPointer(pointerCapture.surface)) {
 				disablePointerCapture();
@@ -540,15 +555,15 @@ public class WaylandCraft implements ClientModInitializer {
 		double gameHitDistance = (gameHitResult == null || gameHitResult.getType() == HitResult.Type.MISS) ? Double.POSITIVE_INFINITY : gameHitResult.getLocation().distanceToSqr(pos);
 		if(gameHitDistance < finalDistance) finalHitResult = null;
 		
-		// Check for player reach
-		if(finalHitResult != null && !finalHitResult.position.closerThan(pos, Minecraft.getInstance().player.blockInteractionRange())) finalHitResult = null;
+		// 窗口控制距离无上限：不限制玩家与窗口的交互距离（原版 blockInteractionRange 仅作用于挖矿/放方块，不作用于窗口）
+		// 只要窗口正面在视线内（dist >= 0），多远都能 hover/点击/滚轮控制窗口。
 		
 		if(!pointerGrabs.isExclusiveGrabActive()) hoveredDisplay = finalHitResult;
 		
 		// Check for pointer grab and short-circuit if any
 		if(pointerGrabs.isGrabActive()) {
 			this.overridePickBlock = true;
-			this.cursorShape = bridge.getCursorShape();
+			this.cursorShape = controlCursor();
 			
 			pointerGrabs.moveWorld(pos, look, up, camera.yRot(), camera.xRot());
 			if(finalHitResult != null) {
@@ -573,7 +588,7 @@ public class WaylandCraft implements ClientModInitializer {
 			WLCSurface surface = hoveredDisplay.surface;
 			Vec3 rel = hoveredDisplay.surfaceLocalRelative;
 			
-			this.cursorShape = bridge.getCursorShape();
+			this.cursorShape = controlCursor();
 			bridge.sendMotionRefocus(surface, rel.x, rel.y);
 			
 			if(keyboardCaptureMode != KeyboardCaptureMode.NONE && bridge.maybeLockPointer(surface)) {
@@ -722,6 +737,21 @@ public class WaylandCraft implements ClientModInitializer {
 	 * For X11 and Wayland hosts, this is a huge hack but should mostly work for now
 	 */
 	public boolean onKeyPress(long windowHandle, int key, int scancode, int action, int modifiers) {
+		// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
+		if(action == GLFW.GLFW_PRESS && (modifiers & GLFW.GLFW_MOD_CONTROL) != 0) {
+			int dir = switch(key) {
+				case GLFW.GLFW_KEY_UP -> 0;
+				case GLFW.GLFW_KEY_DOWN -> 1;
+				case GLFW.GLFW_KEY_LEFT -> 2;
+				case GLFW.GLFW_KEY_RIGHT -> 3;
+				default -> -1;
+			};
+			if(dir >= 0) {
+				moveFrontWindow(dir);
+				return true;
+			}
+		}
+		
 		if(key == GLFW.GLFW_KEY_Q && modifiers == GLFW.GLFW_MOD_ALT) {
 			if(action == 0) return true;
 			
@@ -756,6 +786,55 @@ public class WaylandCraft implements ClientModInitializer {
 			scancode += 8;
 		}
 		return scancode;
+	}
+	
+	/**
+	 * 用 Ctrl+方向键调整"面前的窗口"位置。
+	 * @param dir 0=上 1=下 2=左 3=右（以玩家视角为基准）
+	 */
+	private void moveFrontWindow(int dir) {
+		if(settings == null) return;
+		
+		WindowDisplay target = null;
+		if(hoveredDisplay != null && hoveredDisplay.dist >= 0) {
+			target = hoveredDisplay.target;
+		}
+		else {
+			Camera cam = Minecraft.getInstance().gameRenderer.getMainCamera();
+			Vec3 pos = cam.position();
+			Vec3 look = new Vec3(cam.forwardVector());
+			double best = Double.POSITIVE_INFINITY;
+			for(WindowDisplay d : displays) {
+				DisplayHitResult hit = d.intersect(pos, look);
+				if(hit == null || hit.isMiss()) continue;
+				double dist = hit.position.distanceToSqr(pos);
+				if(dist < best) {
+					best = dist;
+					target = d;
+				}
+			}
+		}
+		if(target == null) return;
+		
+		double step = settings.getMoveStep();
+		if(step <= 0) step = 0.5;
+		
+		Vec3 look = new Vec3(Minecraft.getInstance().gameRenderer.getMainCamera().forwardVector());
+		look = new Vec3(look.x, 0, look.z);
+		if(look.lengthSqr() < 1e-6) look = new Vec3(0, 0, 1);
+		look = look.normalize();
+		Vec3 right = look.cross(new Vec3(0, 1, 0)); // 玩家右手方向（水平）
+		
+		Vec3 move = switch(dir) {
+			case 0 -> new Vec3(0, step, 0);   // 上
+			case 1 -> new Vec3(0, -step, 0);  // 下
+			case 2 -> right.scale(-step);     // 左
+			case 3 -> right.scale(step);      // 右
+			default -> Vec3.ZERO;
+		};
+		
+		target.pivot = target.pivot.add(move);
+		target.clampVertical();
 	}
 	
 	private void anchorToParent(WLCPopup popup) {

@@ -297,6 +297,33 @@ public class WaylandCraftCommand {
 						)
 					)
 				)
+				.then(ClientCommands.literal("layout")
+					.then(ClientCommands.literal("on")
+						.executes(WaylandCraftCommand::layoutOn)
+					)
+					.then(ClientCommands.literal("off")
+						.executes(WaylandCraftCommand::layoutOff)
+					)
+					.then(ClientCommands.literal("toggle")
+						.executes(WaylandCraftCommand::layoutToggle)
+					)
+					.then(ClientCommands.literal("status")
+						.executes(WaylandCraftCommand::layoutStatus)
+					)
+					.then(ClientCommands.literal("list")
+						.executes(WaylandCraftCommand::layoutList)
+					)
+					.then(ClientCommands.literal("add")
+						.then(ClientCommands.argument("handle", StringArgumentType.word())
+							.executes(WaylandCraftCommand::layoutAdd)
+						)
+					)
+					.then(ClientCommands.literal("remove")
+						.then(ClientCommands.argument("handle", StringArgumentType.word())
+							.executes(WaylandCraftCommand::layoutRemove)
+						)
+					)
+				)
 		);
 	}
 
@@ -334,6 +361,8 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §e/wl template save|savep <name>§7 — 保存当前区块窗口布局（临时/永久）§r"));
 		source.sendFeedback(Component.literal(" §e/wl template apply|applyp <name>§7 — 恢复/复现布局§r"));
 		source.sendFeedback(Component.literal(" §e/wl template list|remove|removep§7 — 管理模板§r"));
+		source.sendFeedback(Component.literal(" §e/wl layout on|off|toggle|status§7 — 圆形自动布局开关/状态（默认开启）§r"));
+		source.sendFeedback(Component.literal(" §e/wl layout list|add <handle>|remove <handle>§7 — 查看/手动指定布局内窗口§r"));
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
 		source.sendFeedback(Component.literal(" §7<handle> 支持 0x短句柄 / 完整句柄 / 实例别名（4位随机，wl list windows 显示）/ 应用别名（如 firefox_esr）§r"));
 		return 1;
@@ -876,6 +905,13 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §epixelsPerBlock§7 = §e" + wlc.settingsManager.getIntSetting(WaylandCraftSettings.PIXELS_PER_BLOCK) + "§r  §8(int, 窗口世界显示像素密度)§r"));
 		source.sendFeedback(Component.literal(" §ewindowAntialiasing§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.WINDOW_ANTIALIASING) + "§r  §8(bool)§r"));
 		source.sendFeedback(Component.literal(" §efocusOnHover§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.FOCUS_ON_HOVER) + "§r  §8(bool)§r"));
+		source.sendFeedback(Component.literal(" §ehideCursor§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.HIDE_CURSOR) + "§r  §8(bool, 控制窗口时隐藏虚拟鼠标)§r"));
+		source.sendFeedback(Component.literal(" §elayoutEnabled§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.LAYOUT_ENABLED) + "§r  §8(bool, 圆形自动布局开关)§r"));
+		source.sendFeedback(Component.literal(" §elayoutAutoJoin§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.LAYOUT_AUTO_JOIN) + "§r  §8(bool, 新窗口自动加入布局)§r"));
+		source.sendFeedback(Component.literal(" §elayoutRadius§7 = §e" + wlc.settingsManager.getDoubleSetting(WaylandCraftSettings.LAYOUT_RADIUS) + "§r  §8(double, 环形半径格)§r"));
+		source.sendFeedback(Component.literal(" §elayoutSpacing§7 = §e" + wlc.settingsManager.getDoubleSetting(WaylandCraftSettings.LAYOUT_SPACING) + "§r  §8(double, 同层窗口间距格)§r"));
+		source.sendFeedback(Component.literal(" §elayoutStackSpacing§7 = §e" + wlc.settingsManager.getDoubleSetting(WaylandCraftSettings.LAYOUT_STACK_SPACING) + "§r  §8(double, 层间垂直间距格)§r"));
+		source.sendFeedback(Component.literal(" §emoveStep§7 = §e" + wlc.settingsManager.getDoubleSetting(WaylandCraftSettings.MOVE_STEP) + "§r  §8(double, Ctrl+方向键平移步长格)§r"));
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
 		source.sendFeedback(Component.literal(" §7Use §e/wl settings set <key> <value>§7 to set§r"));
 		return 1;
@@ -913,9 +949,46 @@ public class WaylandCraftCommand {
 					source.sendFeedback(Component.literal("§a✔ §efocusOnHover§r = §e" + value + "§r"));
 					return 1;
 				}
+				case "hideCursor" -> {
+					wlc.settingsManager.setBooleanSetting(WaylandCraftSettings.HIDE_CURSOR, Boolean.parseBoolean(value));
+					source.sendFeedback(Component.literal("§a✔ §ehideCursor§r = §e" + value + "§r"));
+					return 1;
+				}
+				case "layoutEnabled" -> {
+					boolean b = Boolean.parseBoolean(value);
+					wlc.settingsManager.setBooleanSetting(WaylandCraftSettings.LAYOUT_ENABLED, b);
+					wlc.circleLayout.setEnabled(b);
+					source.sendFeedback(Component.literal("§a✔ §elayoutEnabled§r = §e" + b + "§r"));
+					return 1;
+				}
+				case "layoutAutoJoin" -> {
+					wlc.settingsManager.setBooleanSetting(WaylandCraftSettings.LAYOUT_AUTO_JOIN, Boolean.parseBoolean(value));
+					source.sendFeedback(Component.literal("§a✔ §elayoutAutoJoin§r = §e" + value + "§r"));
+					return 1;
+				}
+				case "layoutRadius" -> {
+					wlc.settingsManager.setDoubleSetting(WaylandCraftSettings.LAYOUT_RADIUS, Double.parseDouble(value));
+					source.sendFeedback(Component.literal("§a✔ §elayoutRadius§r = §e" + value + "§r"));
+					return 1;
+				}
+				case "layoutSpacing" -> {
+					wlc.settingsManager.setDoubleSetting(WaylandCraftSettings.LAYOUT_SPACING, Double.parseDouble(value));
+					source.sendFeedback(Component.literal("§a✔ §elayoutSpacing§r = §e" + value + "§r"));
+					return 1;
+				}
+				case "layoutStackSpacing" -> {
+					wlc.settingsManager.setDoubleSetting(WaylandCraftSettings.LAYOUT_STACK_SPACING, Double.parseDouble(value));
+					source.sendFeedback(Component.literal("§a✔ §elayoutStackSpacing§r = §e" + value + "§r"));
+					return 1;
+				}
+				case "moveStep" -> {
+					wlc.settingsManager.setDoubleSetting(WaylandCraftSettings.MOVE_STEP, Double.parseDouble(value));
+					source.sendFeedback(Component.literal("§a✔ §emoveStep§r = §e" + value + "§r"));
+					return 1;
+				}
 				default -> {
 					source.sendError(Component.literal("§c✘ Unknown setting: §f" + key + "§r"));
-					source.sendFeedback(Component.literal(" §7Available: pixelsPerBlock, windowAntialiasing, focusOnHover§r"));
+					source.sendFeedback(Component.literal(" §7Available: pixelsPerBlock, windowAntialiasing, focusOnHover, hideCursor, layoutEnabled, layoutAutoJoin, layoutRadius, layoutSpacing, layoutStackSpacing, moveStep§r"));
 					return 0;
 				}
 			}
@@ -1422,6 +1495,117 @@ public class WaylandCraftCommand {
 		}
 		source.sendError(Component.literal("§c✘ 永久模板不存在: " + name + "§r"));
 		return 0;
+	}
+
+	// ===== 圆形自动布局命令 =====
+
+	private static int layoutOn(CommandContext<FabricClientCommandSource> context) {
+		return setLayoutEnabled(context, true);
+	}
+
+	private static int layoutOff(CommandContext<FabricClientCommandSource> context) {
+		return setLayoutEnabled(context, false);
+	}
+
+	private static int layoutToggle(CommandContext<FabricClientCommandSource> context) {
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.settingsManager == null) {
+			context.getSource().sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+		return setLayoutEnabled(context, !wlc.circleLayout.isEnabled());
+	}
+
+	private static int setLayoutEnabled(CommandContext<FabricClientCommandSource> context, boolean enabled) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.settingsManager == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		wlc.circleLayout.setEnabled(enabled);
+		wlc.settingsManager.setBooleanSetting(WaylandCraftSettings.LAYOUT_ENABLED, enabled);
+		source.sendFeedback(Component.literal("§a✔ 圆形自动布局已" + (enabled ? "§a开启§r" : "§c关闭§r") + "§r"));
+		source.sendFeedback(Component.literal(" §7窗口将以你为圆心环形排列（半径 " + wlc.settings.getLayoutRadius() + " 格），一圈排满后向上堆叠§r"));
+		return 1;
+	}
+
+	private static int layoutStatus(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal("§6 §lWaylandCraft §r§7 圆形布局状态§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal(" 布局: §e" + (wlc.circleLayout.isEnabled() ? "§a开启" : "§c关闭") + "§r"));
+		source.sendFeedback(Component.literal(" 自动加入: §e" + wlc.settings.getLayoutAutoJoin() + "§r  §8(新窗口自动进入圆形排列)§r"));
+		source.sendFeedback(Component.literal(" 半径: §e" + wlc.settings.getLayoutRadius() + "§7 格 · 间距: §e" + wlc.settings.getLayoutSpacing() + "§7 格 · 层距: §e" + wlc.settings.getLayoutStackSpacing() + "§7 格§r"));
+		source.sendFeedback(Component.literal(" 参与窗口: §e" + wlc.circleLayout.participatingDisplays().size() + "§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		return 1;
+	}
+
+	private static int layoutList(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal("§6 §lWaylandCraft §r§7 布局内窗口§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		int count = 0;
+		for(WindowDisplay d : wlc.circleLayout.participatingDisplays()) {
+			if(!(d.window instanceof WLCToplevel t)) continue;
+			count++;
+			source.sendFeedback(Component.literal(" §7- §f" + getWindowDisplayName(t) + "§r §e" + shortHex(t.getHandle()) + "§r"));
+		}
+		if(count == 0) {
+			source.sendFeedback(Component.literal(" §7无参与窗口§r"));
+		}
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		return count;
+	}
+
+	private static int layoutAdd(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		String handleStr = StringArgumentType.getString(context, "handle");
+		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
+		if(toplevel == null) return 0;
+
+		wlc.circleLayout.addHandle(toplevel.getHandle());
+		source.sendFeedback(Component.literal("§a✔ §f" + getWindowDisplayName(toplevel) + "§a 已加入圆形布局§r"));
+		return 1;
+	}
+
+	private static int layoutRemove(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		String handleStr = StringArgumentType.getString(context, "handle");
+		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
+		if(toplevel == null) return 0;
+
+		wlc.circleLayout.removeHandle(toplevel.getHandle());
+		source.sendFeedback(Component.literal("§a✔ §f" + getWindowDisplayName(toplevel) + "§a 已移出圆形布局§r"));
+		return 1;
 	}
 
 	private static int shareWindow(CommandContext<FabricClientCommandSource> context) {
