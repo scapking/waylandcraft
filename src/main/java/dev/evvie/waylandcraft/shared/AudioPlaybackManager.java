@@ -1,9 +1,11 @@
 package dev.evvie.waylandcraft.shared;
 
 import java.nio.ByteBuffer;
+import java.nio.IntBuffer;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 
+import org.lwjgl.BufferUtils;
 import org.lwjgl.openal.AL10;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -68,7 +70,9 @@ public class AudioPlaybackManager {
 			int processed = AL10.alGetSourcei(stream.source, AL10.AL_BUFFERS_PROCESSED);
 			while(processed > 0 && !stream.buffers.isEmpty()) {
 				int buf = stream.buffers.removeFirst();
-				AL10.alSourceUnqueueBuffers(stream.source, buf);
+				IntBuffer one = BufferUtils.createIntBuffer(1).put(buf);
+				one.flip();
+				AL10.alSourceUnqueueBuffers(stream.source, one);
 				AL10.alDeleteBuffers(buf);
 				processed--;
 			}
@@ -83,7 +87,9 @@ public class AudioPlaybackManager {
 			ByteBuffer bb = ByteBuffer.allocateDirect(pcm.length).put(pcm);
 			bb.flip();
 			AL10.alBufferData(buffer, format, bb, sampleRate);
-			AL10.alSourceQueueBuffers(stream.source, buffer);
+			IntBuffer one = BufferUtils.createIntBuffer(1).put(buffer);
+			one.flip();
+			AL10.alSourceQueueBuffers(stream.source, one);
 			stream.buffers.addLast(buffer);
 			
 			// 若 source 停了但还有排队数据 → 继续播放
