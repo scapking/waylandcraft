@@ -39,6 +39,7 @@ import dev.evvie.waylandcraft.shared.AudioPlaybackManager;
 import dev.evvie.waylandcraft.settings.WaylandCraftSettings;
 import dev.evvie.waylandcraft.settings.WaylandCraftSettingsManager;
 import dev.evvie.waylandcraft.network.SharedWindowClientHandler;
+import dev.evvie.waylandcraft.network.SharedWindowInteractionPayload;
 import dev.evvie.waylandcraft.command.WaylandCraftCommand;
 import dev.evvie.waylandcraft.utils.CursorShape;
 import dev.evvie.waylandcraft.capture.PipeWireCaptureManager;
@@ -123,6 +124,19 @@ public class WaylandCraft implements ClientModInitializer {
 	// HitResult of currently hovered WindowDisplay
 	// Only non-null, when no exclusive pointer grabs are currently active
 	public DisplayHitResult hoveredDisplay = null;
+	
+	// 当前 hover 的共享窗口（手机端 viewer-only 无本地窗口时也可用；与 hoveredDisplay 互斥）
+	public SharedWindowDisplay hoveredSharedDisplay = null;
+	// hover 共享窗口时的窗口内像素坐标（相对窗口左上角，含 xoff/yoff）
+	public double hoveredSharedX = 0;
+	public double hoveredSharedY = 0;
+	// 键盘捕获绑定的共享窗口（G/Alt+Q 后按键走网络转发；与 pointerCapture 对应）
+	public SharedWindowDisplay sharedKeyboardCapture = null;
+	// MOUSE_MOVE 转发节流：上次发送的窗口/像素/时间
+	private long lastSharedMouseHandle = -1;
+	private double lastSharedMouseX = Double.NaN;
+	private double lastSharedMouseY = Double.NaN;
+	private long lastSharedMouseSend = 0;
 	
 	public KeyboardCaptureMode keyboardCaptureMode = KeyboardCaptureMode.NONE;
 	
@@ -311,8 +325,17 @@ public class WaylandCraft implements ClientModInitializer {
 	}
 	
 	public void enableKeyboardCapture(boolean hardCapture) {
-		if(bridge == null) return; // native disabled: no bridge to activate
 		if(keyboardCaptureMode != KeyboardCaptureMode.NONE) return;
+		
+		// 共享窗口优先：hover 共享窗口时绑定到共享窗口。
+		// 手机端 viewer-only（bridge==null）本地窗口不可用，共享窗口是唯一可捕获对象。
+		if(hoveredSharedDisplay != null) {
+			keyboardCaptureMode = hardCapture ? KeyboardCaptureMode.HARD_CAPTURE : KeyboardCaptureMode.CAPTURE;
+			sharedKeyboardCapture = hoveredSharedDisplay;
+			return;
+		}
+		
+		if(bridge == null) return; // native disabled: no bridge to activate
 		
 		keyboardCaptureMode = hardCapture ? KeyboardCaptureMode.HARD_CAPTURE : KeyboardCaptureMode.CAPTURE;
 		bridge.activateKeyboard();
@@ -335,14 +358,16 @@ public class WaylandCraft implements ClientModInitializer {
 	 * 避免鼠标先解锁时玩家还按着键导致视角乱转（用户要求的游戏优化）。
 	 */
 	public void disableKeyboardCapture() {
-		if(bridge == null) return;
 		if(keyboardCaptureMode == KeyboardCaptureMode.NONE) return;
 		
 		// 第一步：解除键盘绑定（恢复 Minecraft 角色控制）
 		keyboardCaptureMode = KeyboardCaptureMode.NONE;
-		bridge.deactivateKeyboard();
+		sharedKeyboardCapture = null;
 		// 第二步：解除鼠标绑定（恢复视角控制）
-		disablePointerCapture();
+		if(bridge != null) {
+			bridge.deactivateKeyboard();
+			disablePointerCapture();
+		}
 	}
 	
 	public void onClientTick(Minecraft minecraft) {
@@ -360,7 +385,11 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 		
 		if(keyCaptureKeyboard.consumeClick()) {
-			if(bridge == null) return;
+			// 共享窗口 hover 时（含手机端 viewer-only）也能进入键盘捕获；无窗口可绑定时提示
+			if(bridge == null && hoveredSharedDisplay == null) {
+				minecraft.getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 没有可捕获的共享窗口（对准一个共享窗口再按）"), false);
+				return;
+			}
 			enableKeyboardCapture(false);
 			return;
 		}
@@ -579,6 +608,7 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		// Reset hovered display and pick block override
 		this.hoveredDisplay = null;
+		this.hoveredSharedDisplay = null;
 		this.overridePickBlock = false;
 		
 		if(Minecraft.getInstance().screen instanceof WindowManagerScreen) {
@@ -586,7 +616,7 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 		else if(Minecraft.getInstance().screen != null) {
 			pointerGrabs.releaseAll();
-			bridge.sendMotionOutside();
+			if(bridge != null) bridge.sendMotionOutside();
 			return;
 		}
 		
@@ -607,21 +637,59 @@ public class WaylandCraft implements ClientModInitializer {
 			}
 		}
 		
+		// 共享窗口射线检测（viewer-only 无本地窗口时也能 hover/交互）
+		SharedWindowDisplay.SharedHit finalSharedHit = null;
+		double finalSharedDistance = Double.POSITIVE_INFINITY;
+		for(SharedWindowDisplay sharedDisplay : sharedDisplays) {
+			if(!sharedDisplay.isValid()) continue;
+			SharedWindowDisplay.SharedHit hit = sharedDisplay.intersect(pos, look);
+			if(hit == null || hit.dist() < 0) continue; // 只命中正面
+			
+			if(finalSharedHit == null || hit.dist() < finalSharedDistance) {
+				finalSharedHit = hit;
+				finalSharedDistance = hit.dist();
+			}
+		}
+		
 		// Check if game hit result closer
 		// Must use trueGameHitResult because the game hit result is overridden by overridePickBlock
 		HitResult gameHitResult = trueGameHitResult;
 		double gameHitDistance = (gameHitResult == null || gameHitResult.getType() == HitResult.Type.MISS) ? Double.POSITIVE_INFINITY : gameHitResult.getLocation().distanceToSqr(pos);
-		if(gameHitDistance < finalDistance) finalHitResult = null;
+		
+		// 统一比较（直线距离：本地/共享命中点的 distanceToSqr == dist^2，量纲一致）：
+		// 最近者胜出；共享窗口比本地窗口/方块近时，共享窗口接管 hover。
+		double localDist = finalHitResult != null ? Math.sqrt(finalDistance) : Double.POSITIVE_INFINITY;
+		double sharedDist = finalSharedHit != null ? finalSharedDistance : Double.POSITIVE_INFINITY;
+		double gameDist = gameHitDistance == Double.POSITIVE_INFINITY ? Double.POSITIVE_INFINITY : Math.sqrt(gameHitDistance);
+		
+		if(sharedDist < localDist && sharedDist < gameDist) {
+			// 共享窗口优先（比本地窗口和方块都近）
+			finalHitResult = null;
+		}
+		else if(localDist < gameDist) {
+			finalSharedHit = null;
+		}
+		else {
+			finalHitResult = null;
+			finalSharedHit = null;
+		}
 		
 		// 窗口控制距离无上限：不限制玩家与窗口的交互距离（原版 blockInteractionRange 仅作用于挖矿/放方块，不作用于窗口）
 		// 只要窗口正面在视线内（dist >= 0），多远都能 hover/点击/滚轮控制窗口。
 		
-		if(!pointerGrabs.isExclusiveGrabActive()) hoveredDisplay = finalHitResult;
+		if(!pointerGrabs.isExclusiveGrabActive()) {
+			hoveredDisplay = finalHitResult;
+			hoveredSharedDisplay = finalSharedHit != null ? finalSharedHit.display() : null;
+			if(hoveredSharedDisplay != null) {
+				hoveredSharedX = finalSharedHit.x();
+				hoveredSharedY = finalSharedHit.y();
+			}
+		}
 		
 		// Check for pointer grab and short-circuit if any
 		if(pointerGrabs.isGrabActive()) {
 			this.overridePickBlock = true;
-			this.cursorShape = controlCursor();
+			if(bridge != null) this.cursorShape = controlCursor();
 			
 			pointerGrabs.moveWorld(pos, look, up, camera.yRot(), camera.xRot());
 			if(finalHitResult != null) {
@@ -636,6 +704,28 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		/* All of the following code will only be executed when there aren't any active pointer grabs */
 		
+		if(hoveredSharedDisplay != null) {
+			// 共享窗口 hover：拦截拾取，鼠标移动转发（节流，避免每帧发包）
+			this.overridePickBlock = true;
+			if(bridge != null) this.cursorShape = controlCursor();
+			
+			long now = System.currentTimeMillis();
+			long handle = hoveredSharedDisplay.getWindowHandle();
+			if(handle != lastSharedMouseHandle
+					|| Math.abs(hoveredSharedX - lastSharedMouseX) > 0.5
+					|| Math.abs(hoveredSharedY - lastSharedMouseY) > 0.5) {
+				if(now - lastSharedMouseSend >= 30) {
+					lastSharedMouseSend = now;
+					lastSharedMouseHandle = handle;
+					lastSharedMouseX = hoveredSharedX;
+					lastSharedMouseY = hoveredSharedY;
+					SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.MOUSE_MOVE,
+							hoveredSharedX, hoveredSharedY, 0, 0);
+				}
+			}
+			return;
+		}
+		
 		if(hoveredDisplay != null && !canStartInteracting()) hoveredDisplay = null;
 		
 		if(hoveredDisplay != null) {
@@ -646,7 +736,7 @@ public class WaylandCraft implements ClientModInitializer {
 			WLCSurface surface = hoveredDisplay.surface;
 			Vec3 rel = hoveredDisplay.surfaceLocalRelative;
 			
-			this.cursorShape = controlCursor();
+			if(bridge != null) this.cursorShape = controlCursor();
 			bridge.sendMotionRefocus(surface, rel.x, rel.y);
 			
 			if(keyboardCaptureMode != KeyboardCaptureMode.NONE && bridge.maybeLockPointer(surface)) {
@@ -658,7 +748,7 @@ public class WaylandCraft implements ClientModInitializer {
 				bridge.focusSurface(toplevel);
 			}
 		}
-		else {
+		else if(bridge != null) {
 			bridge.sendMotionOutside();
 		}
 	}
@@ -689,6 +779,21 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 		
 		if(pointerGrabs.isExclusiveGrabActive()) return true;
+		
+		// 共享窗口点击：转发到发送端注入真实窗口（X11 XTest；wayland 注入待接入）。
+		// 手机端 viewer-only（bridge==null）本地窗口不可交互，共享窗口是唯一交互对象。
+		if(hoveredSharedDisplay != null && canStartInteracting()) {
+			long handle = hoveredSharedDisplay.getWindowHandle();
+			if(action == 1) {
+				SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.MOUSE_CLICK,
+						hoveredSharedX, hoveredSharedY, glfwButtonToX11(button), 0);
+			}
+			else if(action == 0) {
+				SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.MOUSE_RELEASE,
+						hoveredSharedX, hoveredSharedY, glfwButtonToX11(button), 0);
+			}
+			return true;
+		}
 		
 		// Handle implicit pointer grab button presses
 		if(action == 1) {
@@ -749,6 +854,20 @@ public class WaylandCraft implements ClientModInitializer {
 			return true;
 		}
 		
+		// 共享窗口滚轮：转发到发送端（无修饰键时滚动内容；修饰键组合暂不支持共享窗口变换）
+		if(hoveredSharedDisplay != null) {
+			boolean ctrl = InputConstants.isKeyDown(Minecraft.getInstance().getWindow(), GLFW.GLFW_KEY_LEFT_CONTROL);
+			boolean alt = InputConstants.isKeyDown(Minecraft.getInstance().getWindow(), GLFW.GLFW_KEY_LEFT_ALT);
+			if(!ctrl && !alt) {
+				// 编码：低16位 = scrollX*100，高16位 = scrollY*100（与 handleInteraction SCROLL 解码一致）
+				int data = ((int) Math.round(scrollX * 100) & 0xFFFF) | (((int) Math.round(scrollY * 100) & 0xFFFF) << 16);
+				SharedWindowClientHandler.sendInteraction(hoveredSharedDisplay.getWindowHandle(),
+						SharedWindowInteractionPayload.InteractionType.SCROLL,
+						hoveredSharedX, hoveredSharedY, data, 0);
+			}
+			return true;
+		}
+		
 		// 悬停在窗口上时，修饰键+滚轮控制窗口变换
 		if(hoveredDisplay != null && hoveredDisplay.dist >= 0) {
 			boolean ctrl = InputConstants.isKeyDown(Minecraft.getInstance().getWindow(), GLFW.GLFW_KEY_LEFT_CONTROL);
@@ -796,7 +915,8 @@ public class WaylandCraft implements ClientModInitializer {
 	 */
 	// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
 	public boolean onKeyPress(long windowHandle, int key, int scancode, int action, int modifiers) {
-		// Ctrl + 方向键：布局启用时核心标记移动到该方向相邻窗口；未启用布局时调整面前的窗口
+		// Ctrl + 方向键：布局启用时核心标记移动到该方向相邻窗口；未启用布局时调整面前的窗口。
+		// 共享窗口优先：hover 共享窗口（或共享键盘捕获中）→ 移动共享窗口（本地即时 + 回传发送端）
 		if(action == GLFW.GLFW_PRESS && (modifiers & GLFW.GLFW_MOD_CONTROL) != 0) {
 			int dir = switch(key) {
 				case GLFW.GLFW_KEY_UP -> 0;
@@ -806,16 +926,17 @@ public class WaylandCraft implements ClientModInitializer {
 				default -> -1;
 			};
 			if(dir >= 0) {
-				WaylandCraftCommon.LOGGER.info("[move] Ctrl+方向键 dir={} layoutEnabled={} layoutInit={} localDisplays={} sharedDisplays={}",
-					dir, layoutManager.isEnabled(), layoutManager.isInitialized(), displays.size(), sharedDisplays.size());
+				SharedWindowDisplay sharedTarget = hoveredSharedDisplay != null ? hoveredSharedDisplay : sharedKeyboardCapture;
+				if(sharedTarget != null) {
+					moveSharedWindow(sharedTarget, dir);
+					return true;
+				}
 				if(layoutManager.isEnabled() && layoutManager.isInitialized()) {
 					// Ctrl+方向键：核心标记移动（无聊天输出，静默切换）
-					boolean moved = layoutManager.moveCore(dir);
-					WaylandCraftCommon.LOGGER.info("[move] moveCore dir={} moved={}", dir, moved);
+					layoutManager.moveCore(dir);
 					return true;
 				}
 				moveFrontWindow(dir);
-				WaylandCraftCommon.LOGGER.info("[move] moveFrontWindow dir={} done", dir);
 				return true;
 			}
 		}
@@ -839,6 +960,22 @@ public class WaylandCraft implements ClientModInitializer {
 			return true;
 		}
 		
+		// 共享键盘捕获：按键走网络转发到发送端注入真实窗口
+		if(sharedKeyboardCapture != null) {
+			long handle = sharedKeyboardCapture.getWindowHandle();
+			if(action == GLFW.GLFW_PRESS) {
+				SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_PRESS,
+						0, 0, 0, glfwKeyToKeysym(key));
+			}
+			else if(action == GLFW.GLFW_RELEASE) {
+				SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_RELEASE,
+						0, 0, 0, glfwKeyToKeysym(key));
+			}
+			return true;
+		}
+		
+		if(bridge == null) return true;
+		
 		if(action == GLFW.GLFW_PRESS) {
 			bridge.pressKey(scancode);
 		}
@@ -847,6 +984,79 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 		
 		return true;
+	}
+	
+	/**
+	 * GLFW keycode → X11 keysym（远端 XTest 注入用）。
+	 * 覆盖字母/数字/功能键/方向键/修饰键/常用符号；未知键原样返回（可能无效但不会崩）。
+	 */
+	public static int glfwKeyToKeysym(int key) {
+		if(key >= GLFW.GLFW_KEY_A && key <= GLFW.GLFW_KEY_Z) {
+			return key + 0x20; // 'A'-'Z' (0x41-0x5A) → 'a'-'z' (0x61-0x7A)
+		}
+		if(key >= GLFW.GLFW_KEY_0 && key <= GLFW.GLFW_KEY_9) {
+			return key; // '0'-'9' (0x30-0x39) 与 X11 数字 keysym 一致
+		}
+		if(key >= GLFW.GLFW_KEY_F1 && key <= GLFW.GLFW_KEY_F12) {
+			return 0xFFBE + (key - GLFW.GLFW_KEY_F1); // XK_F1 = 0xFFBE
+		}
+		if(key >= GLFW.GLFW_KEY_KP_0 && key <= GLFW.GLFW_KEY_KP_9) {
+			return 0xFFB0 + (key - GLFW.GLFW_KEY_KP_0); // XK_KP_0 = 0xFFB0
+		}
+		return switch(key) {
+			case GLFW.GLFW_KEY_ESCAPE -> 0xFF1B;      // XK_Escape
+			case GLFW.GLFW_KEY_ENTER, GLFW.GLFW_KEY_KP_ENTER -> 0xFF0D; // XK_Return
+			case GLFW.GLFW_KEY_TAB -> 0xFF09;         // XK_Tab
+			case GLFW.GLFW_KEY_BACKSPACE -> 0xFF08;   // XK_BackSpace
+			case GLFW.GLFW_KEY_SPACE -> 0x20;         // XK_space
+			case GLFW.GLFW_KEY_LEFT_SHIFT -> 0xFFE1;  // XK_Shift_L
+			case GLFW.GLFW_KEY_RIGHT_SHIFT -> 0xFFE2; // XK_Shift_R
+			case GLFW.GLFW_KEY_LEFT_CONTROL -> 0xFFE3; // XK_Control_L
+			case GLFW.GLFW_KEY_RIGHT_CONTROL -> 0xFFE4; // XK_Control_R
+			case GLFW.GLFW_KEY_LEFT_ALT -> 0xFFE9;    // XK_Alt_L
+			case GLFW.GLFW_KEY_RIGHT_ALT -> 0xFFEA;   // XK_Alt_R
+			case GLFW.GLFW_KEY_LEFT_SUPER -> 0xFFEB;  // XK_Super_L
+			case GLFW.GLFW_KEY_RIGHT_SUPER -> 0xFFEC; // XK_Super_R
+			case GLFW.GLFW_KEY_CAPS_LOCK -> 0xFFE5;   // XK_Caps_Lock
+			case GLFW.GLFW_KEY_UP -> 0xFF52;          // XK_Up
+			case GLFW.GLFW_KEY_DOWN -> 0xFF54;        // XK_Down
+			case GLFW.GLFW_KEY_LEFT -> 0xFF51;        // XK_Left
+			case GLFW.GLFW_KEY_RIGHT -> 0xFF53;       // XK_Right
+			case GLFW.GLFW_KEY_HOME -> 0xFF50;        // XK_Home
+			case GLFW.GLFW_KEY_END -> 0xFF57;         // XK_End
+			case GLFW.GLFW_KEY_PAGE_UP -> 0xFF55;     // XK_Page_Up
+			case GLFW.GLFW_KEY_PAGE_DOWN -> 0xFF56;   // XK_Page_Down
+			case GLFW.GLFW_KEY_DELETE -> 0xFFFF;      // XK_Delete
+			case GLFW.GLFW_KEY_INSERT -> 0xFF63;      // XK_Insert
+			case GLFW.GLFW_KEY_MINUS -> 0x2D;         // '-'
+			case GLFW.GLFW_KEY_EQUAL -> 0x3D;         // '='
+			case GLFW.GLFW_KEY_LEFT_BRACKET -> 0x5B;  // '['
+			case GLFW.GLFW_KEY_RIGHT_BRACKET -> 0x5D; // ']'
+			case GLFW.GLFW_KEY_BACKSLASH -> 0x5C;     // '\'
+			case GLFW.GLFW_KEY_SEMICOLON -> 0x3B;     // ';'
+			case GLFW.GLFW_KEY_APOSTROPHE -> 0x27;    // '\''
+			case GLFW.GLFW_KEY_GRAVE_ACCENT -> 0x60;  // '`'
+			case GLFW.GLFW_KEY_COMMA -> 0x2C;         // ','
+			case GLFW.GLFW_KEY_PERIOD -> 0x2E;        // '.'
+			case GLFW.GLFW_KEY_SLASH -> 0x2F;         // '/'
+			case GLFW.GLFW_KEY_KP_ADD -> 0xFFAB;      // XK_KP_Add
+			case GLFW.GLFW_KEY_KP_SUBTRACT -> 0xFFAD; // XK_KP_Subtract
+			case GLFW.GLFW_KEY_KP_MULTIPLY -> 0xFFAA; // XK_KP_Multiply
+			case GLFW.GLFW_KEY_KP_DIVIDE -> 0xFFAF;   // XK_KP_Divide
+			default -> key;
+		};
+	}
+	
+	/**
+	 * GLFW 鼠标按钮 → X11 按钮号（XTest 用）：1=左 2=中 3=右
+	 */
+	public static int glfwButtonToX11(int button) {
+		return switch(button) {
+			case 0 -> 1;  // 左键
+			case 1 -> 3;  // 右键
+			case 2 -> 2;  // 中键
+			default -> button + 1;
+		};
 	}
 	
 	public static int correctScancode(int scancode) {
@@ -883,10 +1093,8 @@ public class WaylandCraft implements ClientModInitializer {
 			}
 		}
 		if(target == null) {
-			WaylandCraftCommon.LOGGER.info("[move] moveFrontWindow dir={} target=null (无 hover 且视线内无本地窗口，共享窗口不在移动范围)", dir);
 			return;
 		}
-		WaylandCraftCommon.LOGGER.info("[move] moveFrontWindow dir={} target={} pivot={}", dir, target.window, target.pivot);
 		
 		double step = settings.getMoveStep();
 		if(step <= 0) step = 0.5;
@@ -907,6 +1115,42 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		target.pivot = target.pivot.add(move);
 		target.clampVertical();
+	}
+	
+	/**
+	 * 用 Ctrl+方向键移动共享窗口（接收端本地即时 + 回传发送端同步真实窗口）。
+	 * @param display 目标共享窗口
+	 * @param dir 0=上 1=下 2=左 3=右（以玩家视角为基准）
+	 */
+	private void moveSharedWindow(SharedWindowDisplay display, int dir) {
+		if(display == null || settings == null) return;
+		
+		double step = settings.getMoveStep();
+		if(step <= 0) step = 0.5;
+		
+		Vec3 look = new Vec3(Minecraft.getInstance().gameRenderer.getMainCamera().forwardVector());
+		look = new Vec3(look.x, 0, look.z);
+		if(look.lengthSqr() < 1e-6) look = new Vec3(0, 0, 1);
+		look = look.normalize();
+		Vec3 right = look.cross(new Vec3(0, 1, 0)); // 玩家右手方向（水平）
+		
+		Vec3 move = switch(dir) {
+			case 0 -> new Vec3(0, step, 0);   // 上
+			case 1 -> new Vec3(0, -step, 0);  // 下
+			case 2 -> right.scale(-step);     // 左
+			case 3 -> right.scale(step);      // 右
+			default -> Vec3.ZERO;
+		};
+		
+		// 本地即时移动（画面立即响应）
+		display.moveBy(move);
+		
+		// 回传发送端：wayland 移本地 WindowDisplay.pivot（下一帧抓帧自动携带）；
+		// X11 更新 x11Offset（下一帧 payload pivot = 0,0,0 + offset）。
+		// 编码：x/y = deltaX/deltaY（double），button = deltaZ*100（int）
+		SharedWindowClientHandler.sendInteraction(display.getWindowHandle(),
+				SharedWindowInteractionPayload.InteractionType.WINDOW_MOVE,
+				move.x, move.y, (int) Math.round(move.z * 100), 0);
 	}
 	
 	private void anchorToParent(WLCPopup popup) {

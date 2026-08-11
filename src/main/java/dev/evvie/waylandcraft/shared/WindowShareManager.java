@@ -467,11 +467,12 @@ public class WindowShareManager {
 		// X11 无本地 display：默认变换（原点、正对、竖直）
 		// 接收端用原始窗口尺寸（srcW/srcH）算世界四边形大小，
 		// 图像是缩放后的（targetW/targetH），纹理拉伸到原始尺寸。
+		// pivot 携带接收端移动偏移（x11OffsetX/Y/Z），保证两端位置一致。
 		SharedWindowImagePayload imagePayload = new SharedWindowImagePayload(
 			state.windowHandle, 0, 0, 0,
 			targetW, targetH,
 			imageData,
-			0, 0, 0,
+			state.x11OffsetX, state.x11OffsetY, state.x11OffsetZ,
 			0, 0, 1,
 			0, -1, 0,
 			1.0, srcW, srcH,
@@ -814,6 +815,10 @@ public class WindowShareManager {
 		public volatile int x11RootY = 0;      // 窗口原点在根窗口的 Y（交互注入用）
 		public volatile String x11AppId = null;
 		public volatile int x11Pid = 0;
+		// 接收端 Ctrl+方向键移动共享窗口后的偏移（X11 无本地 WindowDisplay，由发送端持久化）
+		public volatile double x11OffsetX = 0;
+		public volatile double x11OffsetY = 0;
+		public volatile double x11OffsetZ = 0;
 
 		public long lastUpdateTime = 0;
 		public long lastFrameSentTime = 0;   // 最近一次实际发送帧的时间（心跳帧用）

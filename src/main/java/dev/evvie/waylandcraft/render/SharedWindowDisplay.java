@@ -230,6 +230,60 @@ public class SharedWindowDisplay {
 	}
 	
 	/**
+	 * 射线检测：返回窗口内像素坐标（相对窗口左上角，含 xoff/yoff 修正）与距离。
+	 * 与本地 WindowDisplay.intersect 一致：只命中正面（dist>=0 由 WorldPlane 处理），
+	 * 且落在 framebuffer 范围内才算命中。
+	 */
+	public @Nullable SharedHit intersect(Vec3 pos, Vec3 dir) {
+		WorldPlane.Intersection inter = getPlane().intersect(pos, dir);
+		if(inter == null) return null;
+		
+		Vec3 local = inter.local();
+		// 窗口渲染从 origin + bufOffset 开始，所以窗口内像素坐标 = 相对 origin 的像素 + xoff/yoff
+		double px = local.x + xoff;
+		double py = local.y + yoff;
+		int w = width > 0 ? width : 1;
+		int h = height > 0 ? height : 1;
+		if(px < 0 || py < 0 || px > w || py > h) return null;
+		
+		return new SharedHit(this, px, py, inter.dist());
+	}
+	
+	/**
+	 * 世界坐标 → 窗口内像素坐标（相对窗口左上角，含 xoff/yoff 修正）。
+	 * 超出窗口范围时返回 null。
+	 */
+	public @Nullable Vec3 worldToWindowPixel(Vec3 world) {
+		Vec3 local = getPlane().worldToLocal(world);
+		double px = local.x + xoff;
+		double py = local.y + yoff;
+		int w = width > 0 ? width : 1;
+		int h = height > 0 ? height : 1;
+		if(px < 0 || py < 0 || px > w || py > h) return null;
+		return new Vec3(px, py, local.z);
+	}
+	
+	/**
+	 * 获取当前 pivot（世界坐标）
+	 */
+	public Vec3 getPivot() {
+		return pivot;
+	}
+	
+	/**
+	 * 平移窗口（世界坐标增量），并保持朝向不变。
+	 */
+	public void moveBy(Vec3 delta) {
+		this.pivot = this.pivot.add(delta);
+	}
+	
+	/**
+	 * 射线命中结果
+	 */
+	public static record SharedHit(SharedWindowDisplay display, double x, double y, double dist) {
+	}
+	
+	/**
 	 * 旋转窗口
 	 */
 	public void rotate(Vec3 normal, Vec3 down) {
