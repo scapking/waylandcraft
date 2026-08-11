@@ -28,6 +28,33 @@ pub struct AudioCaptureState {
     pub active: bool,
     /// 保活 capture stream（drop 会导致 PipeWire 节点消失、link 断开）
     pub _stream: Option<pw::stream::Stream>,
+    /// 保活 mainloop：后台线程跑 run()，stop 时先 quit 再随 state drop
+    pub _mainloop: Option<pw::main_loop::MainLoop>,
+}
+
+// libpipewire 的 pw_stream / pw_core 内部自带线程安全（有锁），Rust 绑定
+// 因持有 NonNull + Rc 引用计数而保守地标记 !Send。实际使用模式：process
+// 回调在 mainloop 线程访问 stream，stop 时先置 active=false、再由持有方 drop，
+// 与 libpipewire 的线程安全模型一致，因此这里显式声明 Send 是安全的。
+unsafe impl Send for AudioCaptureState {}
+
+/// pw_main_loop 指针的 Send 包装：libpipewire 允许跨线程 quit/run
+/// mainloop（标准用法），Rust 绑定因 NonNull 保守标记 !Send。
+struct MainLoopPtr(*mut pipewire::sys::pw_main_loop);
+unsafe impl Send for MainLoopPtr {}
+
+/// 把 MainLoopPtr 整个 move 进后台线程再 run（跨线程调 libpipewire 标准用法）
+fn mainloop_run(ml: MainLoopPtr) {
+    unsafe {
+        pipewire::sys::pw_main_loop_run(ml.0);
+    }
+}
+
+/// 把 MainLoopPtr 整个 move 进定时线程再 quit
+fn mainloop_quit(ml: MainLoopPtr) {
+    unsafe {
+        pipewire::sys::pw_main_loop_quit(ml.0);
+    }
 }
 
 /// 枚举 PipeWire registry 中所有 node / port 的信息
@@ -54,52 +81,55 @@ fn enumerate_topology(collect_ms: u64) -> Result<PwTopology, String> {
         .get_registry()
         .map_err(|e| format!("registry: {}", e))?
         .add_listener_local()
-        .global(|global| {
+        .global(move |global| {
             let mut t = topo_ref.lock().unwrap();
-            match global.type_name() {
-                "PipeWire:Interface:Node" => {
-                    if let Some(media_class) = global.props().get("media.class") {
+            match global.type_ {
+                pw::types::ObjectType::Node => {
+                    if let Some(media_class) = global.props.and_then(|p| p.get("media.class")) {
                         let app_pid = global
-                            .props()
-                            .get("app.process.id")
+                            .props
+                            .and_then(|p| p.get("app.process.id"))
                             .and_then(|s| s.parse::<u32>().ok())
                             .unwrap_or(0);
                         let name = global
-                            .props()
-                            .get("node.name")
+                            .props
+                            .and_then(|p| p.get("node.name"))
                             .unwrap_or("")
                             .to_string();
                         t.nodes
-                            .insert(global.id(), (media_class.to_string(), app_pid, name));
+                            .insert(global.id, (media_class.to_string(), app_pid, name));
                     }
                 }
-                "PipeWire:Interface:Port" => {
+                pw::types::ObjectType::Port => {
                     if let Some(parent_id) = global
-                        .props()
-                        .get("node.id")
+                        .props
+                        .and_then(|p| p.get("node.id"))
                         .and_then(|s| s.parse::<u32>().ok())
                     {
                         let is_output = global
-                            .props()
-                            .get("port.direction")
+                            .props
+                            .and_then(|p| p.get("port.direction"))
                             .map(|d| d == "output")
                             .unwrap_or(false);
-                        t.ports.insert(global.id(), (parent_id, is_output));
+                        t.ports.insert(global.id, (parent_id, is_output));
                     }
                 }
                 _ => {}
             }
         })
-        .register()
-        .map_err(|e| format!("registry listener: {}", e))?;
+        .register();
 
-    let ml = mainloop.clone();
+    // MainLoop 含 Rc 不可跨线程 move；libpipewire 允许从其他线程调用
+    // pw_main_loop_quit（标准用法）。mainloop 在本线程存活到 run() 返回，
+    // 定时线程只 sleep 后 quit 一次，指针生命周期安全。
+    let ml_ptr = MainLoopPtr(mainloop.as_raw_ptr());
     std::thread::spawn(move || {
-        let _ = ml.run();
+        std::thread::sleep(Duration::from_millis(collect_ms));
+        // 整个 MainLoopPtr 传参 → 闭包整体捕获 Send 包装（避免按字段捕获裸指针）
+        mainloop_quit(ml_ptr);
     });
 
-    std::thread::sleep(Duration::from_millis(collect_ms));
-    mainloop.quit();
+    mainloop.run();
 
     let t = topology.lock().unwrap();
     Ok(t.clone())
@@ -176,6 +206,7 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         channels: 2,
         active: true,
         _stream: None,
+        _mainloop: None,
     }));
 
     let stream = pw::stream::Stream::new(
@@ -235,21 +266,13 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         ),
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::AudioRate,
-            Choice,
-            Range,
             Int,
-            48000,
-            8000,
-            192000
+            48000
         ),
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::AudioChannels,
-            Choice,
-            Range,
             Int,
-            2,
-            1,
-            8
+            2
         ),
     );
 
@@ -305,23 +328,23 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         target_port, stream_port, target_node, stream_node
     );
 
-    // 保存全局状态（含保活 stream）；mainloop 在后台线程跑
+    // 保存全局状态（含保活 stream + mainloop）；后台线程跑 mainloop
+    // （裸指针：mainloop 本体由 state 持有，stop 时先 quit 再 drop）
+    let ml_ptr = MainLoopPtr(mainloop.as_raw_ptr());
     {
         let mut guard = AUDIO_CAPTURE.lock().map_err(|e| format!("lock: {}", e))?;
         {
             let mut s = state.lock().map_err(|e| format!("state lock: {}", e))?;
-            s._stream = Some(stream.clone());
+            s._stream = Some(stream);
+            s._mainloop = Some(mainloop);
         }
         *guard = Some(state.clone());
     }
 
-    let ml = mainloop.clone();
     std::thread::Builder::new()
         .name("wc-audio-capture".to_string())
         .spawn(move || {
-            if let Err(e) = ml.run() {
-                eprintln!("[audio] mainloop error: {}", e);
-            }
+            mainloop_run(ml_ptr);
         })
         .map_err(|e| format!("spawn: {}", e))?;
 
@@ -351,7 +374,13 @@ pub fn stop_audio_capture() {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.active = false;
         s.pcm.clear();
-        s._stream = None; // drop stream → PipeWire 节点消失 → link 断开
+        // 先 quit mainloop（后台 pw_main_loop_run 返回后线程退出），
+        // 再 drop stream → PipeWire 节点消失 → link 断开
+        if let Some(ml) = s._mainloop.take() {
+            ml.quit();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        s._stream = None;
     }
     eprintln!("[audio] capture stopped");
 }
