@@ -1,6 +1,7 @@
 package dev.evvie.waylandcraft;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 
@@ -11,21 +12,29 @@ import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.phys.Vec3;
 
 /**
- * 窗口自动布局管理器（v0.3）：窗口固定在初始化坐标周围，不再跟随玩家。
+ * 窗口自动布局管理器（v0.4）：窗口固定在初始化坐标周围，不再跟随玩家。
  *
  * 模板：
- *  - cube（方块）：以初始化坐标为中心、初始化朝向为基准，4 个面（前/右/后/左），
- *    每面 layoutCubePerFace（默认 2）个窗口并排，第一层 4×perFace 个窗口，
- *    排满后向上堆叠。窗口法线水平指向中心（正对，不斜）。
- *  - sphere（圆球/VR）：以初始化坐标为球心，窗口在球面上排布（纬度圈），
- *    法线始终指向球心（从中心看每个窗口都是正对）。相邻窗口水平/垂直弧长
- *    均 ≥ 窗口尺寸 + 间距，保证不重合。
+ *  - cube（方块）：以初始化坐标为中心、初始化朝向为基准，每层 layoutCubePerFace×4
+ *    （默认 2×4 = 8）个窗口，按角度制排布（围绕中心一圈，宽窗口占角度大）。
+ *  - sphere（圆球/VR）：以初始化坐标为圆心，窗口在球面上排布（纬度圈），
+ *    法线始终指向圆心（从中心看每个窗口都是正对）。
+ *
+ * 核心改动（v0.4，用户实测反馈）：
+ *  - 按"数量"排布，不按固定长宽高缩放：窗口保持原尺寸（不缩放），
+ *    槽位/角度按窗口实际宽度自适应，相邻窗口弦长 ≥ 窗口宽 + spacing，
+ *    数学上永不重叠（含 cube 拐角处）。
+ *  - 半径自适应：如果 layoutRadius 太小放不下一层窗口，自动增大半径
+ *    （接受边界宽），而不是缩小窗口。
+ *  - 窗口中心对齐眼睛高度（/wl layout init 存眼睛高度），站在中心平视正对，不斜。
+ *  - 向上堆叠严格：下一层中心 Y = 上一层中心 Y + (上一层最大高 + 下一层最大高)/2
+ *    + stackSpacing，层与层之间保证间距 stackSpacing，不重叠。
+ *  - Ctrl+方向键 = 核心窗口与该方向相邻窗口互换实际位置（不是切换标记）。
  *
  * 其他行为：
  *  - 默认关闭（layoutEnabled=false），开启前必须先 /wl layout init 初始化坐标。
  *  - 新加入的窗口自动 resize 到 layoutDefaultWidth×layoutDefaultHeight。
  *  - 窗口底部始终 ≥ 地面 + groundClearance。
- *  - 第一个窗口 = 核心窗口，Ctrl+方向键切换核心（左/右=同层相邻，上/下=换层）。
  */
 public class WindowLayoutManager {
 
@@ -39,13 +48,13 @@ public class WindowLayoutManager {
 	/** 核心窗口句柄（0 = 未设置，自动选第一个） */
 	private long coreHandle = 0;
 
-	/** 最近一次排布顺序（用于核心窗口切换） */
+	/** 持久排布顺序（Ctrl+方向键交换位置；新窗口追加，消失移除，不按 handle 重排） */
 	private final List<WindowDisplay> ordered = new ArrayList<>();
 
 	/** 已自动 resize 过的窗口（避免每 tick 强制 resize） */
 	private final HashSet<Long> resizedHandles = new HashSet<>();
 
-	/** 每层窗口数（cube: perFace*4；sphere: 每个纬度圈数量），用于上/下换层 */
+	/** 每层窗口数（cube: perFace×4；sphere: 每个纬度圈数量），用于上/下换层 */
 	private final List<Integer> layerSizes = new ArrayList<>();
 
 	public WindowLayoutManager(WaylandCraft wlc) {
@@ -85,7 +94,7 @@ public class WindowLayoutManager {
 		return wlc.settings != null && wlc.settings.getLayoutInitialized();
 	}
 
-	/** 布局中心坐标 */
+	/** 布局中心坐标（y = 眼睛高度） */
 	public Vec3 centerPos() {
 		return new Vec3(wlc.settings.getLayoutInitX(), wlc.settings.getLayoutInitY(), wlc.settings.getLayoutInitZ());
 	}
@@ -119,55 +128,89 @@ public class WindowLayoutManager {
 		if(mc.level == null) return;
 
 		List<WindowDisplay> list = participatingDisplays();
-		ordered.clear();
+		// 同步持久顺序：移除消失/退出的窗口，新窗口追加到末尾（保留用户交换过的顺序）
+		syncOrdered(list);
 		layerSizes.clear();
 		if(list.isEmpty()) {
 			coreHandle = 0;
 			return;
 		}
 
-		// 稳定排序：按 handle 排序，保证排布顺序固定（核心窗口切换可预期）
-		list.sort((a, b) -> Long.compare(((WLCToplevel) a.window).getHandle(), ((WLCToplevel) b.window).getHandle()));
-		ordered.addAll(list);
-
 		// 新窗口自动 resize 到默认分辨率
-		for(WindowDisplay d : list) {
+		for(WindowDisplay d : ordered) {
 			resizeIfNeeded(d);
 		}
 
-		// 按模板排布
+		// 按模板排布（用持久顺序 ordered，Ctrl+方向键交换过的位置在这里生效）
 		String template = wlc.settings.getLayoutTemplate();
 		if("sphere".equals(template)) {
-			arrangeSphere(list);
+			arrangeSphere(ordered);
 		} else {
-			arrangeCube(list);
+			arrangeCube(ordered);
 		}
 
 		// 高度钳制：窗口底部 ≥ 地面 + groundClearance
-		for(WindowDisplay d : list) {
+		for(WindowDisplay d : ordered) {
 			clampToGround(d);
 		}
 
 		// 核心窗口保底：默认第一个
-		if(coreHandle == 0 || !containsHandleIn(list, coreHandle)) {
-			coreHandle = ((WLCToplevel) list.get(0).window).getHandle();
+		if(coreHandle == 0 || !containsHandleIn(ordered, coreHandle)) {
+			coreHandle = ((WLCToplevel) ordered.get(0).window).getHandle();
 		}
 	}
 
-	/** 核心窗口切换。dir: 0=上 1=下 2=左 3=右。返回是否切换成功。 */
-	public boolean cycleCore(int dir) {
+	/** 同步持久顺序 ordered 与当前参与窗口列表：保留既有顺序，新增追加，消失移除 */
+	private void syncOrdered(List<WindowDisplay> list) {
+		ordered.removeIf(d -> !list.contains(d));
+		for(WindowDisplay d : list) {
+			if(!ordered.contains(d)) ordered.add(d);
+		}
+	}
+
+	/**
+	 * 核心窗口与该方向相邻窗口互换实际位置（窗口真的移动）。
+	 * dir: 0=上 1=下 2=左 3=右。核心窗口跟随移动（coreHandle 不变）。
+	 * 返回是否交换成功。
+	 */
+	public boolean swapCore(int dir) {
 		if(ordered.isEmpty()) return false;
 		int n = ordered.size();
 		int idx = indexOfCore();
-		if(idx < 0) idx = 0;
-		int layerSize = layerSizeAt(idx);
-		int next = switch(dir) {
-			case 0 -> (idx - layerSize + n) % n; // 上：上一层
-			case 1 -> (idx + layerSize) % n;     // 下：下一层
-			case 2 -> (idx - 1 + n) % n;         // 左：同层前一个
-			default -> (idx + 1) % n;            // 右：同层后一个
-		};
-		coreHandle = ((WLCToplevel) ordered.get(next).window).getHandle();
+		if(idx < 0) return false;
+
+		int start = layerStartOf(idx);
+		int size = layerSizeAt(idx);
+		int slot = idx - start;
+		int next;
+
+		switch(dir) {
+			case 0: { // 上：上一层同槽位
+				if(start == 0) return false;
+				int prevStart = prevLayerStart(start);
+				int prevSize = start - prevStart;
+				next = prevStart + Math.min(slot, prevSize - 1);
+				break;
+			}
+			case 1: { // 下：下一层同槽位
+				int nextStart = start + size;
+				if(nextStart >= n) return false;
+				int nextSize = layerSizeAt(nextStart);
+				next = nextStart + Math.min(slot, nextSize - 1);
+				break;
+			}
+			case 2: // 左：同层前一个
+				if(idx == start) return false;
+				next = idx - 1;
+				break;
+			default: // 右：同层后一个
+				if(idx == start + size - 1) return false;
+				next = idx + 1;
+				break;
+		}
+
+		if(next < 0 || next >= n || next == idx) return false;
+		Collections.swap(ordered, idx, next);
 		return true;
 	}
 
@@ -179,15 +222,34 @@ public class WindowLayoutManager {
 		return -1;
 	}
 
-	/** 核心窗口所在层的大小；未知时退回同层相邻 ±1 */
+	/** idx 所在层的起始索引 */
+	private int layerStartOf(int idx) {
+		int acc = 0;
+		for(int size : layerSizes) {
+			if(idx < acc + size) return acc;
+			acc += size;
+		}
+		return 0;
+	}
+
+	/** idx 所在层的大小 */
 	private int layerSizeAt(int idx) {
-		if(layerSizes.isEmpty()) return 1;
 		int acc = 0;
 		for(int size : layerSizes) {
 			if(idx < acc + size) return size;
 			acc += size;
 		}
-		return layerSizes.get(layerSizes.size() - 1);
+		return layerSizes.isEmpty() ? 1 : layerSizes.get(layerSizes.size() - 1);
+	}
+
+	/** 给定某层起始索引 start，返回上一层起始索引 */
+	private int prevLayerStart(int start) {
+		int acc = 0;
+		for(int size : layerSizes) {
+			if(acc + size >= start) return acc;
+			acc += size;
+		}
+		return 0;
 	}
 
 	private boolean containsHandleIn(List<WindowDisplay> list, long handle) {
@@ -234,133 +296,153 @@ public class WindowLayoutManager {
 		}
 	}
 
+	// ==================== 角度制通用工具 ====================
+
+	/** 窗口在半径 radius 的圆上所需的角度跨度（弧度），保证相邻窗口中心弦长 ≥ w + spacing */
+	private double angleSpan(WindowDisplay d, double radius, double spacing) {
+		double w = worldWidth(d);
+		double half = (w + spacing) / (2.0 * radius);
+		if(half >= 1.0) half = 0.9999; // 防御性压缩（正常由半径自适应保证 half < 1）
+		return 2.0 * Math.asin(half);
+	}
+
+	/** 设置窗口朝向：法线水平指向中心、down 向下（竖直窗口，从中心平视正对不斜） */
+	private void orientToCenter(WindowDisplay d, Vec3 center) {
+		Vec3 toCenter = new Vec3(center.x - d.pivot.x, 0, center.z - d.pivot.z);
+		if(toCenter.lengthSqr() < 1e-6) toCenter = new Vec3(0, 0, 1);
+		d.rotate(toCenter.normalize(), new Vec3(0, -1, 0));
+	}
+
+	/** 按分层结果设置每层窗口中心 Y：层 1 = 眼睛高度，之后严格按下层高度累加 */
+	private void applyLayerHeights(List<WindowDisplay> list, List<Integer> sizes, List<Double> maxHeights, double firstCenterY, double stackSpacing) {
+		int pos = 0;
+		double layerCenterY = firstCenterY;
+		for(int l = 0; l < sizes.size(); l++) {
+			int count = sizes.get(l);
+			double thisMaxH = maxHeights.get(l);
+			for(int j = 0; j < count; j++) {
+				WindowDisplay d = list.get(pos + j);
+				d.pivot = new Vec3(d.pivot.x, layerCenterY, d.pivot.z);
+			}
+			pos += count;
+			if(l + 1 < sizes.size()) {
+				double nextMaxH = maxHeights.get(l + 1);
+				// 下一层中心 = 本层中心 + (本层最大高 + 下一层最大高)/2 + stackSpacing
+				layerCenterY += (thisMaxH + nextMaxH) / 2.0 + stackSpacing;
+			}
+		}
+	}
+
 	// ==================== cube 方块模板 ====================
 
 	/**
-	 * 方块布局：4 个面围绕中心，每面 perFace 个窗口并排，第一层 4×perFace 个，
-	 * 排满后向上堆。窗口法线水平指向中心（正对，不斜）。
+	 * 方块布局（角度制/VR 屏墙）：每层 layoutCubePerFace×4 个窗口，
+	 * 围绕中心均匀分布一整圈（4 面，每面 perFace 个，面中心朝 baseYaw 的 4 个方向）。
+	 * 半径自适应：若窗口角宽大于槽位角宽（会重叠），自动增大半径（接受边界宽），
+	 * 不缩放窗口。相邻窗口（含拐角）弦长 ≥ 窗口宽 + spacing，永不重叠。
 	 */
 	private void arrangeCube(List<WindowDisplay> list) {
 		WaylandCraftSettings s = wlc.settings;
-		double radius = Math.max(0.5, s.getLayoutRadius());
 		double spacing = Math.max(0, s.getLayoutSpacing());
 		double stackSpacing = Math.max(0, s.getLayoutStackSpacing());
 		int perFace = Math.max(1, s.getLayoutCubePerFace());
 		Vec3 center = centerPos();
 		double baseYaw = centerYawRad();
 
-		int layer = 0;
 		int layerSize = perFace * 4;
-		double layerBaseY = Double.NaN;
-		double layerMaxBottom = 0; // 当前层窗口底部 y 的最大值（决定下一层起始）
-		int inLayer = 0;
+		double slotAngle = (Math.PI / 2.0) / perFace; // 每面内槽位角宽（面 = 90°）
 
-		for(int i = 0; i < list.size(); i++) {
-			WindowDisplay d = list.get(i);
-			double w = worldWidth(d);
-			double h = worldHeight(d);
-
-			if(inLayer == 0) {
-				// 新层：底部 = 上一层底部 + 上一层最大高度 + stackSpacing
-				if(i == 0) {
-					layerBaseY = firstLayerBaseY(center.y, h);
-				} else {
-					layerBaseY = layerMaxBottom + stackSpacing;
-				}
-				layerMaxBottom = layerBaseY + h;
-				layerSizes.add(Math.min(layerSize, list.size() - i));
-			}
-			layerMaxBottom = Math.max(layerMaxBottom, layerBaseY + h);
-			inLayer++;
-			if(inLayer >= layerSize) {
-				layer++;
-				inLayer = 0;
-			}
-
-			int face = (i % layerSize) / perFace;          // 0前 1右 2后 3左
-			int slot = (i % layerSize) % perFace;          // 面内第几个
-
-			double faceYaw = baseYaw + face * Math.PI / 2.0;
-			Vec3 faceDir = new Vec3(Math.sin(faceYaw), 0, Math.cos(faceYaw));
-			Vec3 tangent = new Vec3(Math.cos(faceYaw), 0, -Math.sin(faceYaw)); // 面内右手方向
-
-			// 面中心（在中心前方 radius 处）
-			Vec3 faceCenter = center.add(faceDir.scale(radius));
-			// 面内槽位偏移：槽位居中，间距 spacing
-			double offset = (slot - (perFace - 1) / 2.0) * (w + spacing);
-			Vec3 pivot = faceCenter.add(tangent.scale(offset));
-			pivot = new Vec3(pivot.x, layerBaseY + h / 2.0, pivot.z);
-
-			d.pivot = pivot;
-			// 窗口法线水平指向中心（正对中心，不斜）
-			Vec3 toCenter = new Vec3(center.x - pivot.x, 0, center.z - pivot.z);
-			if(toCenter.lengthSqr() < 1e-6) toCenter = new Vec3(0, 0, 1);
-			d.rotate(toCenter.normalize(), new Vec3(0, -1, 0));
+		// 半径自适应：最宽窗口的角宽 ≤ 槽位角宽 → 均匀排布永不重叠
+		double maxW = 0;
+		for(int j = 0; j < Math.min(layerSize, list.size()); j++) {
+			maxW = Math.max(maxW, worldWidth(list.get(j)));
 		}
+		double need = (maxW + spacing) / (2.0 * Math.sin(slotAngle / 2.0));
+		double radius = Math.max(s.getLayoutRadius(), need);
+
+		List<Integer> sizes = new ArrayList<>();
+		List<Double> maxHeights = new ArrayList<>();
+		int idx = 0;
+		while(idx < list.size()) {
+			int count = Math.min(layerSize, list.size() - idx);
+			sizes.add(count);
+			double layerMaxH = 0;
+			for(int j = 0; j < count; j++) {
+				WindowDisplay d = list.get(idx + j);
+				double h = worldHeight(d);
+				int face = j / perFace;            // 0前 1右 2后 3左
+				int slot = j % perFace;            // 面内第几个
+				double angle = baseYaw + face * Math.PI / 2.0 + (slot - (perFace - 1) / 2.0) * slotAngle;
+				double x = center.x + radius * Math.sin(angle);
+				double z = center.z + radius * Math.cos(angle);
+				d.pivot = new Vec3(x, center.y, z); // Y 由 applyLayerHeights 统一设置
+				orientToCenter(d, center);
+				layerMaxH = Math.max(layerMaxH, h);
+			}
+			maxHeights.add(layerMaxH);
+			idx += count;
+		}
+
+		layerSizes.addAll(sizes);
+		// 第一层窗口中心 = 眼睛高度（center.y = /wl layout init 存的 y + 1.62）
+		applyLayerHeights(list, sizes, maxHeights, center.y, stackSpacing);
 	}
 
 	// ==================== sphere 圆球模板（VR） ====================
 
 	/**
 	 * 圆球布局（VR 屏墙）：以初始化坐标为圆心，窗口围绕中心分层排布。
-	 *
-	 * 数学保证（不重合）：
-	 *  - 水平：相邻窗口中心连线的弦长 ≥ 窗口宽 + spacing。角度间隔
-	 *    θ = 2·asin((w + spacing) / (2·radius))。
-	 *  - 垂直：下一层 y = 上一层 y + 上一层最大窗口高 + stackSpacing，
-	 *    窗口为竖直矩形，垂直方向必然不重叠。
-	 *  - 半径固定（不向外扩）：一层排满后窗口在上一层正上方继续堆叠（向上堆）。
-	 * 窗口始终竖直放置（法线水平指向中心、down 向下），从中心平视时正对，不斜。
+	 * 水平：窗口按角度连续排布，相邻窗口中心弦长 ≥ 窗口宽 + spacing，永不重叠。
+	 * 垂直：下一层中心 Y = 本层中心 Y + (本层最大高 + 下一层最大高)/2 + stackSpacing。
+	 * 半径自适应：若 layoutRadius 放不下最宽窗口，自动增大半径。
+	 * 窗口始终竖直放置（法线水平指向中心、down 向下），中心对齐眼睛高度，不斜。
 	 */
 	private void arrangeSphere(List<WindowDisplay> list) {
 		WaylandCraftSettings s = wlc.settings;
-		double radius = Math.max(1.0, s.getLayoutRadius());
 		double spacing = Math.max(0, s.getLayoutSpacing());
 		double stackSpacing = Math.max(0, s.getLayoutStackSpacing());
 		double baseYaw = centerYawRad();
 		Vec3 center = centerPos();
 
-		double layerY = center.y;      // 当前层窗口中心 y
-		double layerMaxH = 0;          // 当前层最大窗口高
+		// 半径自适应：至少使最宽窗口 half < 1（能放下）
+		double radius = Math.max(1.0, s.getLayoutRadius());
+		double maxW = 0;
+		for(WindowDisplay d : list) {
+			maxW = Math.max(maxW, worldWidth(d));
+		}
+		double need = (maxW + spacing) / 2.0;
+		if(need >= radius) radius = need / 0.9999;
+
+		List<Integer> sizes = new ArrayList<>();
+		List<Double> maxHeights = new ArrayList<>();
 		int i = 0;
 		while(i < list.size()) {
-			double lon = 0;            // 层内累计角度
-			int countInLayer = 0;
+			double lon = 0;
+			int count = 0;
+			double layerMaxH = 0;
 			while(i < list.size()) {
 				WindowDisplay d = list.get(i);
-				double w = worldWidth(d);
 				double h = worldHeight(d);
-				// 弦长公式：保证相邻窗口中心弦长 ≥ w + spacing
-				double half = (w + spacing) / (2.0 * radius);
-				if(half >= 1.0) half = 0.999; // 半径太小放不下，压缩到近乎占满
-				double step = 2.0 * Math.asin(half);
-				if(lon + step > 2 * Math.PI + 1e-9 && countInLayer > 0) break; // 圈满，升层
+				double span = angleSpan(d, radius, spacing);
+				if(lon + span > 2 * Math.PI + 1e-9 && count > 0) break; // 圈满，升层
 
-				double angle = baseYaw + lon + step / 2.0;
+				double angle = baseYaw + lon + span / 2.0;
 				double x = center.x + radius * Math.sin(angle);
 				double z = center.z + radius * Math.cos(angle);
-				Vec3 pivot = new Vec3(x, layerY, z);
-				d.pivot = pivot;
-				// 法线水平指向中心（竖直窗口，不斜）
-				Vec3 toCenter = new Vec3(center.x - x, 0, center.z - z);
-				if(toCenter.lengthSqr() < 1e-6) toCenter = new Vec3(0, 0, 1);
-				d.rotate(toCenter.normalize(), new Vec3(0, -1, 0));
+				d.pivot = new Vec3(x, center.y, z); // Y 由 applyLayerHeights 统一设置
+				orientToCenter(d, center);
 
-				lon += step;
-				countInLayer++;
+				lon += span;
+				count++;
 				layerMaxH = Math.max(layerMaxH, h);
 				i++;
 			}
-			layerSizes.add(countInLayer);
-			// 升层：下一层 y = 当前层 y + 最大高 + 层距（垂直严格不重叠，向上堆）
-			layerY += layerMaxH + stackSpacing;
-			layerMaxH = 0;
+			sizes.add(count);
+			maxHeights.add(layerMaxH);
 		}
-	}
 
-	private double firstLayerBaseY(double centerY, double firstWindowH) {
-		// 第一层窗口底部 = 中心高度 - 第一窗口半高（保证与中心在同一水平线附近）
-		return centerY - firstWindowH / 2.0;
+		layerSizes.addAll(sizes);
+		applyLayerHeights(list, sizes, maxHeights, center.y, stackSpacing);
 	}
 
 	/** 窗口世界尺寸统计（给命令用） */

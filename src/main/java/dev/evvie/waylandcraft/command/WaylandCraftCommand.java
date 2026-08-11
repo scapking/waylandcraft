@@ -390,7 +390,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §e/wl layout cube|sphere§7 — 切换方块/圆球模板并开启（默认关闭）§r"));
 		source.sendFeedback(Component.literal(" §e/wl layout on|off|toggle|status§7 — 布局开关/状态§r"));
 		source.sendFeedback(Component.literal(" §e/wl layout list|add <handle>|remove <handle>|core <handle>§7 — 查看/手动指定布局内窗口与核心窗口§r"));
-		source.sendFeedback(Component.literal(" §7Ctrl+方向键: 布局开启时切换核心窗口；未开启时手动平移面前窗口§r"));
+		source.sendFeedback(Component.literal(" §7Ctrl+方向键: 布局开启时核心窗口与方向相邻窗口互换位置；未开启时手动平移面前窗口§r"));
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
 		source.sendFeedback(Component.literal(" §7<handle> 支持 0x短句柄 / 完整句柄 / 实例别名（4位随机，wl list windows 显示）/ 应用别名（如 firefox_esr）§r"));
 		return 1;
@@ -1627,7 +1627,8 @@ public class WaylandCraftCommand {
 			}
 			var pos = player.position();
 			x = pos.x;
-			y = pos.y;
+			// 存眼睛高度（脚部 + 1.62）：窗口第一层中心对齐眼睛高度，站在中心平视正对不斜
+			y = pos.y + 1.62;
 			z = pos.z;
 			float yawDeg = player.getYRot();
 			// MC yaw: 0=朝+Z? MC 的 yaw 0 朝 +Z 南，90 朝 -X 西（逆时针）。
@@ -1752,7 +1753,7 @@ public class WaylandCraftCommand {
 		if(core != null && core.window instanceof WLCToplevel coreTl) {
 			coreName = getWindowDisplayName(coreTl);
 		}
-		source.sendFeedback(Component.literal(" 核心窗口: §e" + coreName + "§r  §8(Ctrl+方向键切换)§r"));
+		source.sendFeedback(Component.literal(" 核心窗口: §e" + coreName + "§r  §8(Ctrl+方向键: 核心窗口与该方向相邻窗口互换位置)§r"));
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
 		return 1;
 	}
