@@ -316,14 +316,32 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		keyboardCaptureMode = hardCapture ? KeyboardCaptureMode.HARD_CAPTURE : KeyboardCaptureMode.CAPTURE;
 		bridge.activateKeyboard();
+		
+		// 立即绑定当前 hover 的窗口（键盘+鼠标一步到位，不用等下一次指针移动）：
+		// 进入绑定 = 键盘捕获 + 鼠标锁定（视角不再移动，鼠标事件全部转发该窗口）。
+		// 若玩家没 hover 窗口，鼠标仍可自由转动视角，直到 hover 到窗口才锁定。
+		if(hoveredDisplay != null && hoveredDisplay.dist >= 0) {
+			WLCSurface surface = hoveredDisplay.surface;
+			Vec3 rel = hoveredDisplay.surfaceLocalRelative;
+			if(bridge.maybeLockPointer(surface)) {
+				pointerCapture = new PointerCapture(surface, rel.x, rel.y);
+			}
+		}
 	}
 	
+	/**
+	 * 退出键盘捕获。顺序：**先解除键盘绑定，再解除鼠标绑定**——
+	 * 玩家先恢复 WASD/空格等角色控制，鼠标视角随后恢复，
+	 * 避免鼠标先解锁时玩家还按着键导致视角乱转（用户要求的游戏优化）。
+	 */
 	public void disableKeyboardCapture() {
 		if(bridge == null) return;
 		if(keyboardCaptureMode == KeyboardCaptureMode.NONE) return;
 		
+		// 第一步：解除键盘绑定（恢复 Minecraft 角色控制）
 		keyboardCaptureMode = KeyboardCaptureMode.NONE;
 		bridge.deactivateKeyboard();
+		// 第二步：解除鼠标绑定（恢复视角控制）
 		disablePointerCapture();
 	}
 	
@@ -529,10 +547,14 @@ public class WaylandCraft implements ClientModInitializer {
 	}
 	
 	/**
-	 * 控制窗口时显示的光标。hideCursor 开启时隐藏虚拟鼠标光标（沉浸游玩，
-	 * 被控应用自身渲染的光标在窗口画面里仍可见），关闭时显示窗口真实光标。
+	 * 控制窗口时显示的光标。
+	 * - pointerCapture 激活（窗口绑定模式）→ **强制隐藏**虚拟光标：鼠标事件全部
+	 *   在绑定窗口内，沉浸游玩；被控应用自身渲染的光标在窗口画面里仍可见。
+	 * - 仅 hover 未绑定 → 按 hideCursor 设置（H 键切换）决定显示窗口真实光标或隐藏。
+	 * - 非窗口状态 → 返回 null（Minecraft 默认光标）。
 	 */
 	private CursorShape controlCursor() {
+		if(pointerCapture != null) return CursorShape.HIDE;
 		if(settings != null && settings.getHideCursor()) return CursorShape.HIDE;
 		return bridge.getCursorShape();
 	}
