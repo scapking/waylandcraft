@@ -230,10 +230,8 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         ),
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::AudioFormat,
-            Choice,
-            Enum,
             Id,
-            pw::spa::param::audio::AudioFormat::S16LE,
+            pw::spa::param::audio::AudioFormat::S16LE
         ),
         pw::spa::pod::property!(
             pw::spa::param::format::FormatProperties::AudioRate,
