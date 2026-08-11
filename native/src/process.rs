@@ -153,6 +153,14 @@ fn build_env_list(app_type: &str, wayland_display: &str, display: &str) -> Vec<(
         "qt" => {
             env_list.push(("QT_QPA_PLATFORM".to_string(), "wayland".to_string()));
         }
+        "browser" => {
+            // Firefox 的 wayland 开关是 MOZ_ENABLE_WAYLAND（GTK 变量对 Firefox 无效）；
+            // Chromium 系用 OZONE_PLATFORM_HINT。两者都注入，互不干扰。
+            env_list.push(("MOZ_ENABLE_WAYLAND".to_string(), "1".to_string()));
+            env_list.push(("GDK_BACKEND".to_string(), "wayland".to_string()));
+            env_list.push(("ELECTRON_OZONE_PLATFORM_HINT".to_string(), "auto".to_string()));
+            env_list.push(("OZONE_PLATFORM".to_string(), "wayland".to_string()));
+        }
         _ => {
             env_list.push(("GDK_BACKEND".to_string(), "wayland".to_string()));
             env_list.push(("QT_QPA_PLATFORM".to_string(), "wayland".to_string()));

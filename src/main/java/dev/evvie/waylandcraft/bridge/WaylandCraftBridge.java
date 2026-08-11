@@ -581,6 +581,7 @@ public class WaylandCraftBridge {
 			updateGeometry(toplevel);
 			toplevel.title = toplevelTitle(toplevel.getHandle());
 			toplevel.appID = toplevelAppID(toplevel.getHandle());
+			toplevel.pid = toplevelPid(this.instance, toplevel.getHandle());
 			
 			if(ArrayUtils.contains(minimizeRequests, handle)) toplevel.requests.minimize = true;
 			if(ArrayUtils.contains(maximizeRequests, handle)) toplevel.requests.maximize= true;
@@ -782,6 +783,11 @@ public class WaylandCraftBridge {
 	/** 获取 xwayland-satellite 的 X display（如 ":2"）；未启动 satellite 时返回空串 */
 	public String getSatelliteDisplay() {
 		return getSatelliteDisplay(this.instance);
+	}
+	
+	/** 获取原生 wayland 窗口所属客户端进程 PID（SO_PEERCRED）；0 = 未知/X11 窗口 */
+	public int toplevelPid(long topLevelHandle) {
+		return toplevelPid(this.instance, topLevelHandle);
 	}
 	
 	public boolean inputRegionContains(WLCSurface surface, double x, double y) {
@@ -1001,6 +1007,7 @@ public class WaylandCraftBridge {
 	private static native long toplevelSurface(long instance, long topLevelHandle);
 	private static native String toplevelTitle(long topLevelHandle);
 	private static native String toplevelAppID(long topLevelHandle);
+	private static native int toplevelPid(long instance, long topLevelHandle);
 	// Resize toplevel
 	private static native void toplevelResize(long topLevelHandle, int width, int height, boolean interactive);
 	// Resize toplevel override, keep maximized and fullscreen state, stop interactive resize

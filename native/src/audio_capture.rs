@@ -60,8 +60,8 @@ fn mainloop_quit(ml: MainLoopPtr) {
 /// 枚举 PipeWire registry 中所有 node / port 的信息
 #[derive(Default, Clone)]
 struct PwTopology {
-    /// node_id -> (media_class, app_pid, name)
-    pub nodes: HashMap<u32, (String, u32, String)>,
+    /// node_id -> (media_class, app_pid, node_name, app_process_name)
+    pub nodes: HashMap<u32, (String, u32, String, String)>,
     /// port_id -> (parent_node_id, is_output)
     pub ports: HashMap<u32, (u32, bool)>,
 }
@@ -96,8 +96,15 @@ fn enumerate_topology(collect_ms: u64) -> Result<PwTopology, String> {
                             .and_then(|p| p.get("node.name"))
                             .unwrap_or("")
                             .to_string();
-                        t.nodes
-                            .insert(global.id, (media_class.to_string(), app_pid, name));
+                        let proc_name = global
+                            .props
+                            .and_then(|p| p.get("app.process.name"))
+                            .unwrap_or("")
+                            .to_string();
+                        t.nodes.insert(
+                            global.id,
+                            (media_class.to_string(), app_pid, name, proc_name),
+                        );
                     }
                 }
                 pw::types::ObjectType::Port => {
@@ -135,23 +142,80 @@ fn enumerate_topology(collect_ms: u64) -> Result<PwTopology, String> {
     Ok(t.clone())
 }
 
-/// 找目标进程的音频输出节点 + 它的 output 端口
+/// 收集 pid 及其所有后代进程（/proc/<pid>/task/*/children）。
+/// 多进程应用（Firefox/Chrome 等）的音频输出在 content/渲染子进程里，
+/// 窗口 PID 是主进程 —— 只按主进程 PID 精确匹配会永远抓不到声音。
+fn collect_process_tree(pid: u32) -> Vec<u32> {
+    use std::collections::HashSet;
+    let mut result = vec![pid];
+    let mut seen = HashSet::new();
+    seen.insert(pid);
+    let mut queue = vec![pid];
+
+    while let Some(p) = queue.pop() {
+        let task_dir = format!("/proc/{}/task", p);
+        let Ok(entries) = std::fs::read_dir(&task_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let tid = entry.file_name().to_string_lossy().to_string();
+            let children_path = format!("/proc/{}/task/{}/children", p, tid);
+            let Ok(children) = std::fs::read_to_string(children_path) else {
+                continue;
+            };
+            for child in children.split_whitespace() {
+                let Ok(cpid) = child.parse::<u32>() else {
+                    continue;
+                };
+                if seen.insert(cpid) {
+                    result.push(cpid);
+                    queue.push(cpid);
+                }
+            }
+        }
+    }
+    result
+}
+
+/// 窗口进程的可执行文件名（/proc/<pid>/exe basename），用于进程名级匹配。
+fn process_exe_name(pid: u32) -> Option<String> {
+    let exe = std::fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
+    exe.file_name().map(|n| n.to_string_lossy().to_string())
+}
+
+/// 找目标进程的音频输出节点 + 它的 output 端口。
+///
+/// 匹配策略（由松到严，全部走 PipeWire 节点属性）：
+/// 1. app.process.id ∈ 窗口进程树（窗口 PID 本身 + 所有后代，覆盖 Firefox 多进程）；
+/// 2. app.process.name == 窗口进程 exe basename（pipewire 的 app.process.name 取自
+///    进程 exe，content 进程与主进程同名；兜底匹配）。
 fn find_process_audio(pid: u32, topo: &PwTopology) -> Result<(u32, u32), String> {
+    let tree = collect_process_tree(pid);
+    let exe_name = process_exe_name(pid);
+
     // 优先 Stream/Output/Audio（普通应用输出流）；其次 Audio/Sink（某些应用自建 sink）
     let mut best_node = None;
     let mut best_score = 0i32;
 
-    for (node_id, (media_class, app_pid, _name)) in &topo.nodes {
-        if *app_pid != pid {
+    for (node_id, (media_class, app_pid, _name, proc_name)) in &topo.nodes {
+        let pid_ok = tree.iter().any(|p| p == app_pid);
+        let name_ok = !pid_ok
+            && exe_name.is_some()
+            && !proc_name.is_empty()
+            && proc_name.eq_ignore_ascii_case(exe_name.as_deref().unwrap_or(""));
+        if !pid_ok && !name_ok {
             continue;
         }
-        let score = if media_class.contains("Stream/Output/Audio") {
+        let mut score = if media_class.contains("Stream/Output/Audio") {
             2
         } else if media_class == "Audio/Sink" {
             1
         } else {
             0
         };
+        if pid_ok {
+            score += 10; // 进程树精确命中优先于进程名兜底
+        }
         if score > best_score {
             best_score = score;
             best_node = Some(*node_id);
@@ -160,8 +224,8 @@ fn find_process_audio(pid: u32, topo: &PwTopology) -> Result<(u32, u32), String>
 
     let node_id = best_node.ok_or_else(|| {
         format!(
-            "no PipeWire audio node found for pid={} (app may be silent or audio not on PipeWire)",
-            pid
+            "no PipeWire audio node found for pid={} (tree={} nodes, exe={:?}) — app may be silent or audio not on PipeWire",
+            pid, tree.len(), exe_name
         )
     })?;
 

@@ -59,7 +59,7 @@ public class AudioCaptureManager {
 			stop();
 		}
 		
-		int pid = findPidForWindow(title, appId);
+		int pid = findPidForWindow(windowHandle, title, appId);
 		if(pid <= 0) {
 			LOGGER.warn("Audio capture: cannot resolve PID for window '{}' (appId={}) — audio sharing unavailable for this window",
 				title, appId);
@@ -140,16 +140,35 @@ public class AudioCaptureManager {
 	}
 	
 	/**
-	 * 用 X11 窗口枚举（_NET_WM_PID）匹配窗口所属进程 PID。
-	 * 匹配优先级：title+appId 精确 → title 精确 → appId 匹配。
+	 * 解析窗口所属进程 PID。两条路：
 	 * 
-	 * 关键：共享窗口运行在 waylandcraft 自己的 xwayland-satellite X display 上
-	 * （由 native 启动，号是动态的，如 ":2"）。必须显式连 satellite display 枚举，
-	 * 用 Minecraft 进程自己的 DISPLAY 会枚举到空/宿主桌面 → PID 永远解析失败 → 无声。
+	 * 1. 原生 wayland 窗口（Firefox 等）：xdg_toplevel 没有 X11 的 _NET_WM_PID，
+	 *    compositor 直接通过 SO_PEERCRED（wl_client_get_credentials）拿到连
+	 *    wayland socket 的客户端 PID —— 对原生 wayland 窗口这是唯一可靠的 PID 来源。
+	 *    注意 windowHandle 是 xdg_toplevel 的 handle（wayland 共享）或 xid（X11 共享）；
+	 *    传 xid 时 toplevelPid 查不到会返回 0，自动落到下面的 X11 枚举。
+	 * 
+	 * 2. X11 窗口枚举（_NET_WM_PID）：共享窗口运行在 waylandcraft 自己的
+	 *    xwayland-satellite X display 上（由 native 启动，号是动态的，如 ":2"）。
+	 *    必须显式连 satellite display 枚举，用 Minecraft 进程自己的 DISPLAY 会
+	 *    枚举到空/宿主桌面 → PID 永远解析失败 → 无声。
 	 * 
 	 * @return PID；找不到返回 0
 	 */
-	private int findPidForWindow(String title, String appId) {
+	private int findPidForWindow(long windowHandle, String title, String appId) {
+		// 1. 原生 wayland 窗口：直接问 compositor（SO_PEERCRED）
+		if(clientMod != null && clientMod.bridge != null && windowHandle != 0) {
+			try {
+				int pid = clientMod.bridge.toplevelPid(windowHandle);
+				if(pid > 0) {
+					LOGGER.info("Audio capture: wayland client pid={} for window '{}'", pid, title);
+					return pid;
+				}
+			} catch(Throwable t) {
+				LOGGER.debug("Audio capture: toplevelPid failed for window '{}'", title, t);
+			}
+		}
+		
 		String satelliteDisplay = null;
 		if(clientMod != null && clientMod.bridge != null) {
 			try {

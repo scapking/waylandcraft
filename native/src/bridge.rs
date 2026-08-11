@@ -139,6 +139,11 @@ bind_java_type! {
             name = "toplevelAppID",
             fn = toplevel_app_id,
         },
+        static extern fn toplevel_pid {
+            sig = (instance: jlong, toplevel_handle: jlong) -> jint,
+            name = "toplevelPid",
+            fn = toplevel_pid,
+        },
         static extern fn toplevel_resize {
             sig = (
                 toplevel_handle: jlong,
@@ -1635,6 +1640,31 @@ fn toplevel_app_id<'local>(
         Ok(env.new_string(app_id)?)
     } else {
         Ok(JString::null())
+    }
+}
+
+/// 原生 wayland 窗口所属客户端进程 PID。
+///
+/// wayland 的 xdg_toplevel 没有 X11 的 _NET_WM_PID 属性，但 compositor 可以通过
+/// SO_PEERCRED（wl_client_get_credentials）拿到连 wayland socket 的客户端 PID ——
+/// 对原生 wayland 应用（Firefox 等）这就是窗口进程的 PID，是音频按进程捕获的前提。
+fn toplevel_pid<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    toplevel_handle: jlong,
+) -> Result<jint, BridgeError> {
+    let wlc = jptr_to_instance!(instance, "toplevelPid")?;
+    let toplevel = jptr_to_toplevel!(toplevel_handle, "toplevelPid")?;
+
+    let surface = toplevel.wl_surface();
+    let Some(client) = surface.client() else {
+        return Ok(0);
+    };
+
+    match client.get_credentials(&wlc.state.display_handle) {
+        Ok(creds) if creds.pid > 0 => Ok(creds.pid as jint),
+        _ => Ok(0),
     }
 }
 
