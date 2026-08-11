@@ -143,10 +143,6 @@ fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &s
         // wayland 导出机制冲突（"is not a symlink to ../../flatpak/wayland-1 as expected"），
         // 导致沙箱内 wayland-1 时而连不上（QQ 曾 "Failed to connect to Wayland display"）。
         "--socket=wayland".to_string(),
-        // 禁用 manifest 的 --socket=x11：它会把宿主桌面的 X socket（/tmp/.X11-unix/X0/X1 等）
-        // 整个 bind 进沙箱并设 DISPLAY=宿主值，导致 Chrome 等应用窗口出现在宿主桌面而不是 Minecraft。
-        // x11-only 应用走下面 --filesystem 单独暴露 satellite 的 X socket，不受影响。
-        "--nosocket=x11".to_string(),
         format!("--env=WAYLAND_DISPLAY={}", wayland_display),
     ];
 
@@ -154,18 +150,28 @@ fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &s
         // X11-only（微信等）：保留 xcb 后端，不注入 wayland 强制变量。
         // 显式设 xcb 以覆盖 manifest 缺失/冲突的情况；Qt 会连 DISPLAY 指向的 satellite。
         opts.push("--env=QT_QPA_PLATFORM=xcb".to_string());
+        // 关键修复（v0.8.1）：不能再 --nosocket=x11！
+        // 微信 manifest 声明 --socket=x11，之前用 --nosocket=x11 + 只 bind 单个
+        // /tmp/.X11-unix/X<dpy> 文件，导致微信 Qt xcb 极早期崩溃
+        // （Breakpad tgkill 刷屏，连自身日志都没打出来）。
+        // 保留完整 X11 socket（flatpak 会 bind 整个 /tmp/.X11-unix 并设 DISPLAY=宿主值），
+        // 但下方 --env=DISPLAY=:2 显式覆盖指向 xwayland-satellite → 窗口必然回 Minecraft。
     } else {
+        opts.push("--nosocket=x11".to_string());
         opts.push("--env=GDK_BACKEND=wayland".to_string());
         opts.push("--env=QT_QPA_PLATFORM=wayland".to_string());
         opts.push("--env=ELECTRON_OZONE_PLATFORM_HINT=auto".to_string());
     }
     // X11-only flatpak apps need DISPLAY from xwayland-satellite；
-    // 只 bind satellite 的单个 X socket（/tmp/.X11-unix/X<dpy>），不暴露宿主桌面的 X socket，
-    // 这样沙箱内唯一可用的 X server 就是 satellite → 窗口必然回到 Minecraft。
+    // 对 x11-only（微信）：--socket=x11 已 bind 整个 /tmp/.X11-unix，DISPLAY 指向 satellite 即可；
+    // 对 wayland 应用：只 bind satellite 的单个 X socket（/tmp/.X11-unix/X<dpy>），
+    // 不暴露宿主桌面的 X socket，这样沙箱内唯一可用的 X server 就是 satellite → 窗口必然回到 Minecraft。
     if !display.is_empty() {
         let dpy = display.trim_start_matches(':');
         if !dpy.is_empty() {
-            opts.push(format!("--filesystem=/tmp/.X11-unix/X{}", dpy));
+            if !x11_only {
+                opts.push(format!("--filesystem=/tmp/.X11-unix/X{}", dpy));
+            }
             opts.push(format!("--env=DISPLAY={}", display));
         }
     }
