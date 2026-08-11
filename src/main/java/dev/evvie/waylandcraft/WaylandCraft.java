@@ -806,12 +806,16 @@ public class WaylandCraft implements ClientModInitializer {
 				default -> -1;
 			};
 			if(dir >= 0) {
+				WaylandCraftCommon.LOGGER.info("[move] Ctrl+方向键 dir={} layoutEnabled={} layoutInit={} localDisplays={} sharedDisplays={}",
+					dir, layoutManager.isEnabled(), layoutManager.isInitialized(), displays.size(), sharedDisplays.size());
 				if(layoutManager.isEnabled() && layoutManager.isInitialized()) {
 					// Ctrl+方向键：核心标记移动（无聊天输出，静默切换）
-					layoutManager.moveCore(dir);
+					boolean moved = layoutManager.moveCore(dir);
+					WaylandCraftCommon.LOGGER.info("[move] moveCore dir={} moved={}", dir, moved);
 					return true;
 				}
 				moveFrontWindow(dir);
+				WaylandCraftCommon.LOGGER.info("[move] moveFrontWindow dir={} done", dir);
 				return true;
 			}
 		}
@@ -878,7 +882,11 @@ public class WaylandCraft implements ClientModInitializer {
 				}
 			}
 		}
-		if(target == null) return;
+		if(target == null) {
+			WaylandCraftCommon.LOGGER.info("[move] moveFrontWindow dir={} target=null (无 hover 且视线内无本地窗口，共享窗口不在移动范围)", dir);
+			return;
+		}
+		WaylandCraftCommon.LOGGER.info("[move] moveFrontWindow dir={} target={} pivot={}", dir, target.window, target.pivot);
 		
 		double step = settings.getMoveStep();
 		if(step <= 0) step = 0.5;
