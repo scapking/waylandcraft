@@ -181,25 +181,23 @@ public class WindowLayoutManager {
 	 * 新窗口按交替序号（0=核心锚正面中心，1=右1, 2=左1, 3=右2, 4=左2…）继续扩散。
 	 */
 	private void syncOrdered(List<WindowDisplay> list) {
-		ordered.removeIf(d -> !list.contains(d));
-		// 新窗口
-		List<WindowDisplay> fresh = new ArrayList<>();
+		int before = ordered.size();
+		ordered.removeIf(d -> !list.contains(d)); // 移除关闭窗口
+		// 新窗口按参与列表顺序追加到末尾
 		for(WindowDisplay d : list) {
-			if(!ordered.contains(d)) fresh.add(d);
+			if(!ordered.contains(d)) {
+				ordered.add(d);
+			}
 		}
 
-		if(fresh.isEmpty()) return;
-
-		// 交替序号分配：首窗=0（核心锚），之后递增（1=右1, 2=左1, 3=右2, 4=左2…）。
-		// 序号即左右交替位置，与 arrangeCube 的交替角度 [0°, +1, -1, +2, -2, …] 严格对应，
-		// 保证每次只开一个窗口也左右交替；窗口关闭后序号保留，已有窗口位置不动，新窗口继续扩散。
-		for(WindowDisplay d : fresh) {
-			if(ordered.isEmpty() && coreHandle == 0) {
-				d.layoutAltIndex = 0; // 首个窗口 = 核心锚
-			} else {
-				d.layoutAltIndex = nextAltIndex++;
+		// 窗口集合发生变化（关闭或新增）时，按当前顺序实时重新紧凑分配交替序号：
+		// 关闭窗口留下的空洞由后续窗口填补，布局排序实时更新，不再保留空洞/一直不变。
+		// 序号 0..n-1 即窗口在 ordered 中的索引，与 arrangeCube 交替角度 [0°, +1, -1, +2, -2…] 严格对应。
+		if(ordered.size() != before) {
+			for(int i = 0; i < ordered.size(); i++) {
+				ordered.get(i).layoutAltIndex = i;
 			}
-			ordered.add(d);
+			nextAltIndex = ordered.size();
 		}
 	}
 
