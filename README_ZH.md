@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.11-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.16-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -158,7 +158,7 @@
 | 窗口变为物品 | `/wl give <handle>` |
 | 取回窗口 | `/wl take <handle>` |
 | 抓取/拖动窗口 | `/wl grab <handle>` |
-| 在世界中显示/隐藏 | `/wl show <handle>` / `/wl hide <handle>` |
+| 在世界中显示/隐藏 | `/wl show <handle|all>` / `/wl hide <handle|all>` |
 | 固定（常显） | `/wl pin <handle>` / `/wl unpin <handle>` |
 | 关闭应用 | `/wl close <handle>` |
 | 调整大小 | `/wl resize <handle> <w> <h>` |
@@ -428,6 +428,11 @@ cd .. && ./gradlew clean build
 
 **近期亮点：**
 
+- **v0.9.16** — 新增 `/wl show all` / `/wl hide all`（也支持 `*`）一键显示/隐藏全部窗口；`hide all` 一并解除钉住。
+- **v0.9.15** — 布局排序在窗口关闭/新增后实时更新：序号紧凑重排填补空洞。
+- **v0.9.14** — Ctrl+方向键改为与相邻窗口交换位置（swapCore），并修正左右方向对调。
+- **v0.9.13** — Ctrl+方向键恢复为移动鼠标指向的窗口（manualOffset 不被每帧布局重排覆盖）。
+- **v0.9.12** — `/wl share start all` 一键共享全部窗口（`stop all` 同理）；Ctrl+方向键切换布局核心标记。
 - **v0.9.11** — 修复键盘穿透总根因：`xkb_state.update_key` 误用 evdev 键码（`key-8`）更新状态，但 xkbcommon 要求 xkb keycode（evdev+8）。无效键码被静默忽略 → Ctrl/Shift/Alt 修饰位永远置不上 → 单键看似正常、组合键（Ctrl+L 等）全部失效。kb.log 中"Ctrl 按下但 mods(depressed=0)"实锤。**组合键穿透现已完全正常。**
 - **v0.9.10** — 修复 `setKbLogFileNative` JNI 注册名不匹配（Rust 宏 snake→camel 自动生成 vs 显式命名）。
 - **v0.9.9** — Rust 键盘日志独立写文件 `waylandcraft-kb.log`（setKbLogFile），便于上传定位 Rust 侧焦点/发送状态。

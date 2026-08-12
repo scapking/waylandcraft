@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.11-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.16-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -164,7 +164,7 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 | Turn window into item | `/wl give <handle>` |
 | Take window back | `/wl take <handle>` |
 | Grab / drag window | `/wl grab <handle>` |
-| Show / hide in world | `/wl show <handle>` / `/wl hide <handle>` |
+| Show / hide in world | `/wl show <handle|all>` / `/wl hide <handle|all>` |
 | Pin (always visible) | `/wl pin <handle>` / `/wl unpin <handle>` |
 | Terminate app | `/wl close <handle>` |
 | Resize window | `/wl resize <handle> <w> <h>` |
@@ -434,6 +434,11 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
 
 **Recent highlights:**
 
+- **v0.9.16** — Added `/wl show all` / `/wl hide all` (also `*`) to show/hide every window in one command; `hide all` also unpins.
+- **v0.9.15** — Layout order now updates in real time as windows close/open — slots are compactly renumbered to fill gaps.
+- **v0.9.14** — Ctrl+arrow now swaps positions with the adjacent window (swapCore); fixed inverted left/right direction.
+- **v0.9.13** — Ctrl+arrow restored to moving the hovered window (manualOffset survives per-frame layout re-anchoring).
+- **v0.9.12** — `/wl share start all` one-click share every window (`stop all` likewise); Ctrl+arrow switches the layout "core" marker.
 - **v0.9.11** — Fixed the root cause of keyboard passthrough: `xkb_state.update_key` was fed evdev codes (`key-8`) but xkbcommon requires xkb keycodes (evdev+8). The invalid keycodes were silently ignored, so modifier bits (Ctrl/Shift/Alt) never set — single keys looked fine but every shortcut (Ctrl+L etc.) failed. `mods(depressed=0)` observed in kb.log with Ctrl held down was the smoking gun. **Combination keys now pass through correctly.**
 - **v0.9.10** — Fixed `setKbLogFileNative` JNI registration name mismatch (Rust macro snake→camel auto-generation vs explicit name).
 - **v0.9.9** — Rust keyboard log now writes to its own file `waylandcraft-kb.log` (setKbLogFile) for easy upload & diagnosis of focus/send state.

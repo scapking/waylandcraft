@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.11-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.16-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -158,7 +158,7 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 | ウィンドウをアイテム化 | `/wl give <handle>` |
 | ウィンドウを取り戻す | `/wl take <handle>` |
 | ウィンドウを掴む/ドラッグ | `/wl grab <handle>` |
-| 世界内で表示/非表示 | `/wl show <handle>` / `/wl hide <handle>` |
+| 世界内で表示/非表示 | `/wl show <handle|all>` / `/wl hide <handle|all>` |
 | 固定（常時表示） | `/wl pin <handle>` / `/wl unpin <handle>` |
 | アプリ終了 | `/wl close <handle>` |
 | サイズ変更 | `/wl resize <handle> <w> <h>` |
@@ -428,6 +428,11 @@ cd .. && ./gradlew clean build
 
 **最近のハイライト：**
 
+- **v0.9.16** — `/wl show all` / `/wl hide all`（`*` も可）で全ウィンドウを一括表示/非表示；`hide all` はピン留めも解除。
+- **v0.9.15** — ウィンドウの開閉に応じてレイアウト順序をリアルタイム更新：番号を詰め直して隙間を埋める。
+- **v0.9.14** — Ctrl+矢印を隣接ウィンドウとの位置交換（swapCore）に変更し、左右方向の反転も修正。
+- **v0.9.13** — Ctrl+矢印をホバー中のウィンドウ移動に復元（manualOffset が毎フレームの再配置に上書きされないように）。
+- **v0.9.12** — `/wl share start all` で全ウィンドウを一括共有（`stop all` も同様）；Ctrl+矢印でレイアウトのコアマーカーを切替。
 - **v0.9.11** — キーボード透過の根本原因を修正：`xkb_state.update_key` に evdev キーコード（`key-8`）を渡していたが、xkbcommon は xkb キーコード（evdev+8）を要求する。無効なキーコードは黙って無視され、Ctrl/Shift/Alt の修飾ビットが永遠に立たない——単独キーは正常に見えるのに、ショートカット（Ctrl+L など）は全て効かない状態だった。kb.log で「Ctrl を押しているのに mods(depressed=0)」が証拠。**修飾キー付きの組合せキーが正常に透過するようになった。**
 - **v0.9.10** — `setKbLogFileNative` の JNI 登録名不一致を修正（Rust マクロの snake→camel 自動生成 vs 明示名）。
 - **v0.9.9** — Rust キーボードログを独立ファイル `waylandcraft-kb.log`（setKbLogFile）に書き出し。Rust 側のフォーカス/送信状態の診断が容易に。
