@@ -880,6 +880,13 @@ public class WaylandCraftBridge {
 		keyboardInput(instance, scancode, 0);
 	}
 	
+	/** 重复按键（长按）透传：Rust keyboardInput 三态 action=2（REPEAT），
+	 * 由 xkb 状态机在 repeat 后输出对应字符/修饰位。REPEAT 不更新 xkb_state，
+	 * 只把事件发进窗口（修复长按失效根因）。 */
+	public void repeatKey(int scancode) {
+		keyboardInput(instance, scancode, 2);
+	}
+	
 	public void internalKeyUpdate(int scancode, boolean pressed) {
 		keyboardUpdate(instance, scancode, pressed);
 	}
@@ -1090,7 +1097,7 @@ public class WaylandCraftBridge {
 	private static native void keyboardActivate(long instance);
 	private static native void keyboardDeactivate(long instance);
 	
-	// Keyboard input. scancode is the raw keycode. action: 0 is released, 1 is pressed.
+	// Keyboard input. scancode is the raw keycode. action: 0 is released, 1 is pressed, 2 is repeated.
 	private static native void keyboardInput(long instance, int scancode, int action);
 	
 	// Update internal key state

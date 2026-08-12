@@ -335,17 +335,27 @@ public class WaylandCraft implements ClientModInitializer {
 		playerUsingWindowItem = true;
 	}
 	
+	/**
+	 * 键盘捕获绑定（G=纯键盘，J=键盘+鼠标分工）：
+	 *  - hardCapture=true（J / HARD_CAPTURE）：现状不变——键盘 + 鼠标锁定
+	 *    （PointerCapture / SharedPointerCapture 都建，鼠标事件全部转发窗口）。
+	 *  - hardCapture=false（G / CAPTURE）：只绑键盘——只 activateKeyboard() +
+	 *    设 keyboardCaptureMode=CAPTURE + sharedKeyboardCapture（共享窗口 hover 时），
+	 *    **不创建 PointerCapture / SharedPointerCapture**，鼠标继续自由转视角。
+	 */
 	public void enableKeyboardCapture(boolean hardCapture) {
 		if(keyboardCaptureMode != KeyboardCaptureMode.NONE) return;
 		
 		// 共享窗口优先：hover 共享窗口时绑定到共享窗口。
 		// 手机端 viewer-only（bridge==null）本地窗口不可用，共享窗口是唯一可捕获对象。
-		// 共享窗口同样进入"游戏模式"：键盘 + 指针全部锁定到该窗口（指针不再依赖 hover）。
+		// G（CAPTURE）只设 sharedKeyboardCapture，不设 sharedPointerCapture。
 		if(hoveredSharedDisplay != null) {
 			keyboardCaptureMode = hardCapture ? KeyboardCaptureMode.HARD_CAPTURE : KeyboardCaptureMode.CAPTURE;
 			sharedKeyboardCapture = hoveredSharedDisplay;
-			sharedPointerCapture = new SharedPointerCapture(
-				hoveredSharedDisplay.getWindowHandle(), hoveredSharedDisplay, hoveredSharedX, hoveredSharedY);
+			if(hardCapture) {
+				sharedPointerCapture = new SharedPointerCapture(
+					hoveredSharedDisplay.getWindowHandle(), hoveredSharedDisplay, hoveredSharedX, hoveredSharedY);
+			}
 			return;
 		}
 		
@@ -354,15 +364,14 @@ public class WaylandCraft implements ClientModInitializer {
 		keyboardCaptureMode = hardCapture ? KeyboardCaptureMode.HARD_CAPTURE : KeyboardCaptureMode.CAPTURE;
 		bridge.activateKeyboard();
 		
-		// 立即绑定当前 hover 的窗口（键盘+鼠标一步到位，不用等下一次指针移动）：
-		// 进入绑定 = 键盘捕获 + 鼠标锁定（视角不再移动，鼠标事件全部转发该窗口）。
+		// 仅 hardCapture（J）才创建 PointerCapture 锁定鼠标。
 		// 关键修复：不再用 bridge.maybeLockPointer 作为创建 pointerCapture 的前提——
 		// 那要求被控应用自己申请过 zwp_pointer_constraints 指针锁（浏览器/桌面应用都不会），
 		// 导致 J 绑定后鼠标事件依然落到 Minecraft。现在一律创建捕获：
 		//   应用已申请锁 → relativeLocked，用相对移动；
 		//   未申请（浏览器）→ 绝对虚拟光标（onMouseTurn 里 sendMotionRefocus 移动窗口内光标）。
-		// 若玩家没 hover 窗口，鼠标仍可自由转动视角，直到 hover 到窗口才锁定。
-		if(hoveredDisplay != null && hoveredDisplay.dist >= 0) {
+		// G（CAPTURE）不创建 pointerCapture：鼠标仍自由转动视角，直到 hover 窗口才交互。
+		if(hardCapture && hoveredDisplay != null && hoveredDisplay.dist >= 0) {
 			WLCSurface surface = hoveredDisplay.surface;
 			Vec3 rel = hoveredDisplay.surfaceLocalRelative;
 			PointerCapture pc = new PointerCapture(surface, rel.x, rel.y);
@@ -411,6 +420,7 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 		
 		if(keyCaptureKeyboard.consumeClick()) {
+			// G 键：纯键盘绑定（enableKeyboardCapture(false)）——只绑键盘不锁鼠标，视角仍可转动。
 			// 共享窗口 hover 时（含手机端 viewer-only）也能进入键盘捕获；无窗口可绑定时提示
 			if(bridge == null && hoveredSharedDisplay == null) {
 				minecraft.getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 没有可捕获的共享窗口（对准一个共享窗口再按）"), false);
@@ -1045,9 +1055,9 @@ public class WaylandCraft implements ClientModInitializer {
 			return true;
 		}
 
-		// Ctrl + 方向键：键盘捕获中或 hover 共享窗口时优先给窗口
-		//（浏览器切标签/滚动/光标跳词等快捷键），不移动核心；
-		// 否则布局启用时移动核心标记，未启用时调整面前的窗口。
+		// Ctrl + 方向键：**永远移动面前的窗口**（0=上 1=下 2=左 3=右）。
+		// 恢复 v0.2.37 语义：无条件调用 moveFrontWindow(dir)，不受键盘捕获模式、
+		// hover 共享窗口或布局启用影响；布局核心切换（moveCore）不再绑定 Ctrl+方向键。
 		if(action == GLFW.GLFW_PRESS && (modifiers & GLFW.GLFW_MOD_CONTROL) != 0) {
 			int dir = switch(key) {
 				case GLFW.GLFW_KEY_UP -> 0;
@@ -1056,14 +1066,9 @@ public class WaylandCraft implements ClientModInitializer {
 				case GLFW.GLFW_KEY_RIGHT -> 3;
 				default -> -1;
 			};
-			if(dir >= 0 && keyboardCaptureMode == KeyboardCaptureMode.NONE && hoveredSharedDisplay == null) {
+			if(dir >= 0) {
 				WaylandCraftCommon.LOGGER.info("[move] Ctrl+方向键 dir={} layoutEnabled={} layoutInit={} localDisplays={} sharedDisplays={}",
 					dir, layoutManager.isEnabled(), layoutManager.isInitialized(), displays.size(), sharedDisplays.size());
-				if(layoutManager.isEnabled() && layoutManager.isInitialized()) {
-					// Ctrl+方向键：核心标记移动（无聊天输出，静默切换）
-					layoutManager.moveCore(dir);
-					return true;
-				}
 				moveFrontWindow(dir);
 				return true;
 			}
@@ -1090,11 +1095,17 @@ public class WaylandCraft implements ClientModInitializer {
 
 		if(bridge == null) return true;
 
+		// 本地 bridge 路径三态完整透传（Rust keyboardInput 0=release 1=press 2=repeat）。
+		// 之前 REPEAT 在这里被吞掉 → 长按失效（窗口收不到重复按键）。
+		// pressedForwardKeys/forwardedMods 只属于共享窗口网络转发，本地路径直接透传。
 		if(action == GLFW.GLFW_PRESS) {
 			bridge.pressKey(scancode);
 		}
 		else if(action == GLFW.GLFW_RELEASE) {
 			bridge.releaseKey(scancode);
+		}
+		else if(action == GLFW.GLFW_REPEAT) {
+			bridge.repeatKey(scancode);
 		}
 
 		return true;

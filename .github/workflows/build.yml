@@ -410,6 +410,11 @@ jobs:
     runs-on: ubuntu-24.04
     if: needs.build-java.result == 'success' && (github.event.inputs.tag != '' || github.event_name == 'push')
     steps:
+    - uses: actions/checkout@v6
+      with:
+        # fetch history + tags so release notes can diff commits against the
+        # previous release tag (and the source archives ship from this checkout)
+        fetch-depth: 0
     - name: Download jars
       uses: actions/download-artifact@v8
       with:
@@ -420,6 +425,48 @@ jobs:
       run: |
         ls -la jars/
         sha256sum jars/*.jar
+    - name: Generate release notes
+      env:
+        TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+      run: |
+        # Notes = per-version changelog (commits since previous release tag) +
+        # the platform/asset summary. Never the stale generic text.
+        PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo "")
+        {
+          echo "## 变更内容 (Changes)"
+          echo ""
+          if [ -n "$PREV" ]; then
+            echo "Since \`$PREV\`:"
+            echo ""
+            git log --pretty=format:'- `%h` %s' --no-merges "$PREV..$TAG" || true
+          else
+            git log --pretty=format:'- `%h` %s' --no-merges -30 "$TAG" || true
+          fi
+          echo ""
+          echo ""
+          echo "---"
+          echo ""
+          echo "## 平台与产物 (Platforms & Assets)"
+          echo ""
+          echo "Native (full capture + share + view):"
+          echo "- waylandcraft-linux-x86_64.jar / waylandcraft-linux-arm64.jar (desktop Linux)"
+          echo "- waylandcraft-android-x86_64.jar / waylandcraft-android-arm64.jar (Android launchers like OnyxLauncher)"
+          echo ""
+          echo "Viewer-only (view shared windows, no local capture):"
+          echo "- waylandcraft-windows-x86_64.jar / waylandcraft-windows-arm64.jar"
+          echo "- waylandcraft-macos-x86_64.jar / waylandcraft-macos-arm64.jar"
+          echo "- waylandcraft-ios-arm64.jar (PojavLauncher/Amethyst)"
+          echo ""
+          echo "Server (pure Java, install on the dedicated server):"
+          echo "- waylandcraft-server.jar"
+          echo ""
+          echo "Universal (catch-all, bundles every native platform):"
+          echo "- waylandcraft-universal.jar"
+          echo ""
+          echo "源码包 (Source code): zip / tar.gz 由 GitHub 自动附加。"
+        } > notes.md
+        echo "=== release notes ==="
+        cat notes.md
     - name: Create or update GitHub Release
       env:
         GH_TOKEN: ${{ github.token }}
@@ -427,20 +474,10 @@ jobs:
       run: |
         cd jars
         if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-          echo "Release $TAG exists, uploading assets"
+          echo "Release $TAG exists, updating notes + uploading assets"
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$GITHUB_WORKSPACE/notes.md"
           gh release upload "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --clobber
         else
           echo "Creating release $TAG"
-          gh release create "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Automated per-platform release (native + viewer + server + universal):
-        Native (full capture + share + view):
-        - waylandcraft-linux-x86_64.jar / waylandcraft-linux-arm64.jar (desktop Linux)
-        - waylandcraft-android-x86_64.jar / waylandcraft-android-arm64.jar (Android launchers like OnyxLauncher)
-        Viewer-only (view shared windows, no local capture):
-        - waylandcraft-windows-x86_64.jar / waylandcraft-windows-arm64.jar
-        - waylandcraft-macos-x86_64.jar / waylandcraft-macos-arm64.jar
-        - waylandcraft-ios-arm64.jar (PojavLauncher/Amethyst)
-        Server (pure Java, install on the dedicated server):
-        - waylandcraft-server.jar
-        Universal (catch-all, bundles every native platform):
-        - waylandcraft-universal.jar"
+          gh release create "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file "$GITHUB_WORKSPACE/notes.md"
         fi

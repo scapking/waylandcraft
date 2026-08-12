@@ -2,6 +2,7 @@
 
 use crate::egl::{EGLDisplay, EGLHelper};
 use crate::java_types::*;
+use crate::seat::KeyboardAction;
 use crate::utils::get_time;
 use crate::xdg_spec::RawDesktopEntry;
 use crate::{WaylandCraft, wlc_init};
@@ -19,7 +20,6 @@ use smithay::{
             Resource,
             protocol::{
                 wl_buffer::WlBuffer,
-                wl_keyboard::KeyState,
                 wl_pointer::{Axis, ButtonState},
                 wl_surface::WlSurface,
             },
@@ -1367,6 +1367,9 @@ fn keyboard_deactivate<'local>(
     Ok(())
 }
 
+/// keyboardInput(instance, scancode, action) —— Java 侧按 action 三态调用：
+/// 0 = release（releaseKey）、1 = press（pressKey）、2 = repeat（repeatKey）。
+/// Repeat 由 seat 层保证不改变 xkb 状态机（见 `WLCSeatState::keyboard_key`）。
 fn keyboard_input<'local>(
     _env: &mut Env<'local>,
     _class: JClass<'local>,
@@ -1376,16 +1379,10 @@ fn keyboard_input<'local>(
 ) -> Result<(), BridgeError> {
     let instance = jptr_to_instance!(instance, "keyboardInput")?;
 
-    let scancode = scancode as u32;
-    let action = match action {
-        0 => KeyState::Released,
-        1 => KeyState::Pressed,
-        _ => {
-            return Err(BridgeError::UnknownKeyboardState(action));
-        }
-    };
+    let action = KeyboardAction::from_i32(action)
+        .ok_or(BridgeError::UnknownKeyboardState(action))?;
 
-    instance.state.seat.keyboard_key(scancode, action);
+    instance.state.seat.keyboard_key(scancode as u32, action);
 
     Ok(())
 }

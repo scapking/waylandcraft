@@ -104,6 +104,40 @@ pub struct RMLVO {
     pub options: String,
 }
 
+/// 键盘动作三态。与 Java 侧 bridge 的 action 约定一致：
+/// `0 = release`、`1 = press`、`2 = repeat`。
+/// Java 侧 `pressKey/releaseKey` 已按此传参，`repeatKey` 会调
+/// `keyboardInput(instance, scancode, 2)` 走 Repeat 分支。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyboardAction {
+    Release = 0,
+    Press = 1,
+    Repeat = 2,
+}
+
+impl KeyboardAction {
+    /// 从 bridge 收到的 `jint` action 还原为三态；非法值返回 `None`。
+    pub fn from_i32(action: i32) -> Option<Self> {
+        match action {
+            0 => Some(Self::Release),
+            1 => Some(Self::Press),
+            2 => Some(Self::Repeat),
+            _ => None,
+        }
+    }
+
+    /// 发到 wire 的 `wl_keyboard.key` state。
+    /// Repeat 复用 `Pressed`：客户端看到按键保持按下；但 xkb 状态机不被改变
+    /// （repeat 不重新触发 Caps Lock 切换、不重复累加 Shift/Ctrl 按下），
+    /// 该不变式由 `keyboard_key` 保证 —— 它从不更新 xkb_state。
+    pub fn key_state(self) -> KeyState {
+        match self {
+            Self::Release => KeyState::Released,
+            Self::Press | Self::Repeat => KeyState::Pressed,
+        }
+    }
+}
+
 fn with_pointer_data<F, R>(pointer: &WlPointer, f: F) -> R
 where
     F: FnOnce(&mut WLCPointerData) -> R,
@@ -346,6 +380,10 @@ impl WLCSeatState {
         // （Shift/Ctrl/Alt/Super）的 mods 状态全部错位 → 应用永远收不到组合键：
         // 单键正常（key 事件照发），但 Ctrl+B / Shift+字母 等快捷键全部失效。
         // 修复前这里直接用 key（evdev+8）更新 xkb → serialize_mods 报 0 修饰。
+        // 只有 PRESS/RELEASE 会走到这里（Java 侧 KeyboardHandlerMixin 只在
+        // GLFW_PRESS/GLFW_RELEASE 时调 keyboardUpdate；REPEAT 不调），因此
+        // repeat 天然不会重复改变状态机 —— 这正是"长按不重复触发 Caps Lock
+        // 切换、不重复进入 Shift/Ctrl"的关键。
         let code = xkb::Keycode::new(key.saturating_sub(8));
         let dir = match pressed {
             true => xkb::KeyDirection::Down,
@@ -449,6 +487,17 @@ impl WLCSeatState {
         self.keyboard_refocus();
     }
 
+    /// 发送 `wl_keyboard.modifiers`。四个字段与 xkb_state 的对应关系（wl 协议
+    /// 位掩码与 xkb 的 ModMask 一致：Shift=0、Lock=1、Control=2、Mod1(Alt)=3…）：
+    ///   - depressed = 当前按住的瞬时修饰键（Shift / Ctrl / Alt / Super …）
+    ///   - latched   = 被 latch 的修饰键（一般不用，如实上报）
+    ///   - locked    = 锁定修饰键（Caps Lock / Num Lock …）
+    ///   - group     = 当前布局索引（xkb layout，serialize_layout 返回 0 基索引）
+    ///
+    /// xkb_state 由 `keyboard_update_xkb` 用与 wire 事件相同的 evdev 键码更新，
+    /// 因此这里序列化出的掩码与实际按键一一对应：按下 Caps Lock 时 xkb 内部切换
+    /// Lock 位 → `serialize_mods(STATE_MODS_LOCKED)` 上报 LockMask，客户端据此
+    /// 切换大小写；Shift/Ctrl/Alt 按下 → `serialize_mods(STATE_MODS_DEPRESSED)`。
     fn send_modifiers(&self, keyboard: &WlKeyboard, serial: u32) {
         if !self.kb_active {
             keyboard.modifiers(
@@ -479,14 +528,27 @@ impl WLCSeatState {
         });
     }
 
-    pub fn keyboard_key(&self, key: u32, state: KeyState) {
+    /// 向所有聚焦的 wl_keyboard 客户端发送 key 事件，并紧随其后发送 modifiers。
+    ///
+    /// **这里绝不改动 xkb_state 与 pressed_keys** —— 它们只由
+    /// `keyboard_update_xkb`（keyboardUpdate）在按下/释放时维护。正因为如此，
+    /// `KeyboardAction::Repeat` 只会向客户端补发一次 `Pressed` 键事件，而不会
+    /// 重复改变状态机（不重复触发 Caps Lock 切换、不重复累加修饰键按下）。
+    /// Java 侧保证在调用本函数前已先调 keyboardUpdate 同步状态机。
+    ///
+    /// 发 wire 事件时把键码还原为 evdev（`key - 8`，与 keyboard_update_xkb
+    /// 中更新 xkb_state 所用的键码完全一致），保证 modifiers 序列化
+    /// （MODS_DEPRESSED / MODS_LOCKED）与 key 事件一一对应。
+    pub fn keyboard_key(&self, key: u32, action: KeyboardAction) {
         if !self.kb_active {
             return;
         }
         let serial = new_serial();
+        let wire_key = key.saturating_sub(8);
+        let state = action.key_state();
         self.for_all_keyboards(|keyboard, data| {
             if data.focus.is_some() {
-                keyboard.key(serial, get_time(), key - 8, state);
+                keyboard.key(serial, get_time(), wire_key, state);
                 self.send_modifiers(keyboard, serial);
             }
         });
