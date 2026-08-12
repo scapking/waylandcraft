@@ -165,6 +165,9 @@
 | 查看位置 | `/wl pos <handle>` |
 | 移动（绝对值或 `~` 相对值） | `/wl move <handle> <x> <y> <z>` |
 | 旋转（角度） | `/wl rotate <handle> <angle>` |
+| 列出 X11 桌面窗口 | `/wl x11 list` |
+| 直接共享 X11 窗口 | `/wl x11 share <index>` |
+| 停止 X11 共享 | `/wl x11 stop <handle>` |
 
 **句柄格式** — `<handle>` 支持：`0x` 短句柄、完整句柄、**实例别名**（4 位随机，如 `k7xq`，来自 `/wl list windows`，本次会话内唯一）、应用别名（如 `firefox_esr`）。同一应用多窗口用 `别名:N`（如 `firefox:2`）。
 
@@ -236,6 +239,8 @@
 
 ### 共享画质参数
 
+`/wl share config <handle> <参数> <值>` 支持：
+
 | 参数 | 说明 | 范围 |
 |------|------|------|
 | `scale` | 分辨率缩放 | 0.1 – 1.0 |
@@ -243,6 +248,11 @@
 | `fps` | 最大帧率 | 5 – 120 |
 | `bitrate` | 最大码率（kbps） | 0 = 不限 |
 | `diffThreshold` | 像素变化阈值 | 0.001 – 1.0 |
+| `diff` | 差异帧传输开关 | true / false |
+| `buffer` | 帧缓冲数 | 1 – 8 |
+| `latency` | 延迟补偿（ms） | 0 – 500 |
+| `prediction` | 运动预测开关 | true / false |
+| `compression` | 压缩方式 | 如 `lz4` / `zlib` / `none` |
 
 ### 预设
 
@@ -253,13 +263,40 @@
 | `quality` | 1.0 | 1.0 | 30 | 不限 |
 | `lowlatency` | 0.35 | 0.6 | 60 | 1500 kbps |
 
+### X11 窗口共享
+
+直接共享 X11 桌面的窗口（经 `xwayland-satellite`），无需 Wayland 顶层窗口：
+
+| 命令 | 作用 |
+|------|------|
+| `/wl x11 list [display]` | 列出 X11 桌面窗口（默认 satellite 显示器） |
+| `/wl x11 share <index>` | 共享列表中第 N 个窗口 |
+| `/wl x11 stop <handle>` | 停止共享 X11 窗口 |
+
 ### 全局设置
+
+`/wl settings set <key> <value>` 支持以下全部键（`/wl settings list` 亦可查看）：
 
 | 键 | 默认值 | 说明 |
 |----|--------|------|
 | `pixelsPerBlock` | `500` | 每方块窗口像素密度 |
 | `windowAntialiasing` | `false` | RGSS 抗锯齿（仅无光影时） |
 | `focusOnHover` | `false` | 悬停自动聚焦窗口 |
+| `hideCursor` | `false` | 控制窗口时隐藏虚拟鼠标光标 |
+| `layoutEnabled` | `true` | 布局默认开启（v0.2.37 行为；未初始化时自动用玩家位置初始化） |
+| `layoutAutoJoin` | `true` | 新窗口自动加入布局（false = 只排 `/wl layout add` 手动指定的窗口） |
+| `layoutTemplate` | `cube` | 布局模板：`cube` 或 `sphere` |
+| `layoutInitialized` | `false` | 是否已执行 `/wl layout init`（未初始化布局不可用） |
+| `layoutInitX` / `Y` / `Z` | `0.0` | 布局中心坐标 |
+| `layoutInitYaw` | `0.0` | 布局朝向（度，0=朝+Z，顺时针） |
+| `layoutRadius` | `6.0` | 布局半径（格，中心到窗口水平距离） |
+| `layoutSpacing` | `0.4` | 同层窗口最小水平间距（格） |
+| `layoutStackSpacing` | `0.4` | 层间垂直间距（格） |
+| `layoutCubePerFace` | `2` | 立方体模板每面窗口数（4 面共 8 个） |
+| `layoutDefaultWidth` | `1080` | 加入布局的窗口自动调整到的分辨率 |
+| `layoutDefaultHeight` | `540` | 加入布局的窗口自动调整到的分辨率 |
+| `groundClearance` | `0.4` | 窗口底部距地面最小净空（格） |
+| `moveStep` | `0.5` | Ctrl+方向键手动移动步长 |
 
 ---
 

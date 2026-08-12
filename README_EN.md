@@ -51,6 +51,7 @@ Turn any Wayland window into an in-game object. Launch apps, view them on a virt
 - **Pure CLI mode** — all operations via `/wl` commands; vanilla rendering, no sci-fi UI clutter
 - **Unified rendering** — local and remotely shared windows share the same render path for identical visuals
 - **Window placement** — drag, resize, pin, hide, rotate; save/restore layouts with templates
+- **Full keyboard passthrough** — single keys, modifier combos (Ctrl/Shift/Alt), and long-press REPEAT all reach the focused window; capture split **G = keyboard only, J = keyboard + mouse**
 - **X11 app support** — bundled `xwayland-satellite` gives X11 applications a `DISPLAY` automatically (both `x86_64` and `arm64` binaries included)
 
 ### 👥 Multiplayer Window Sharing
@@ -170,6 +171,9 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 | Position / inspect | `/wl pos <handle>` |
 | Move (abs or `~` relative) | `/wl move <handle> <x> <y> <z>` |
 | Rotate (degrees) | `/wl rotate <handle> <angle>` |
+| List X11 desktop windows | `/wl x11 list` |
+| Share an X11 window directly | `/wl x11 share <index>` |
+| Stop X11 sharing | `/wl x11 stop <handle>` |
 
 **Handle formats** — `<handle>` accepts: `0x` short handle, full handle, **instance alias** (4-char random, e.g. `k7xq`, from `/wl list windows`, unique per session), or app alias (e.g. `firefox_esr`). Multiple windows of the same app: `alias:N` (e.g. `firefox:2`).
 
@@ -241,6 +245,8 @@ Windows can be arranged automatically around a fixed initialized origin (they no
 
 ### Share Quality Parameters
 
+`/wl share config <handle> <param> <value>` accepts:
+
 | Parameter | Description | Range |
 |-----------|-------------|-------|
 | `scale` | Resolution scale | 0.1 – 1.0 |
@@ -248,6 +254,11 @@ Windows can be arranged automatically around a fixed initialized origin (they no
 | `fps` | Max framerate | 5 – 120 |
 | `bitrate` | Max bitrate (kbps) | 0 = unlimited |
 | `diffThreshold` | Pixel-change threshold | 0.001 – 1.0 |
+| `diff` | Diff-frame transfer on/off | true / false |
+| `buffer` | Frame buffer count | 1 – 8 |
+| `latency` | Latency compensation (ms) | 0 – 500 |
+| `prediction` | Motion prediction on/off | true / false |
+| `compression` | Compression method | e.g. `lz4` / `zlib` / `none` |
 
 ### Presets
 
@@ -258,13 +269,40 @@ Windows can be arranged automatically around a fixed initialized origin (they no
 | `quality` | 1.0 | 1.0 | 30 | unlimited |
 | `lowlatency` | 0.35 | 0.6 | 60 | 1500 kbps |
 
+### X11 Window Sharing
+
+Share windows from the X11 desktop (via `xwayland-satellite`) directly, without a Wayland toplevel:
+
+| Command | Purpose |
+|---------|---------|
+| `/wl x11 list [display]` | List X11 desktop windows (defaults to satellite display) |
+| `/wl x11 share <index>` | Share the Nth window from the list |
+| `/wl x11 stop <handle>` | Stop sharing an X11 window |
+
 ### Global Settings
+
+`/wl settings set <key> <value>` accepts all of the following (also visible via `/wl settings list`):
 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `pixelsPerBlock` | `500` | Pixel density of a window per block |
 | `windowAntialiasing` | `false` | RGSS antialiasing (no shaders only) |
 | `focusOnHover` | `false` | Auto-focus window on hover |
+| `hideCursor` | `false` | Hide the virtual mouse cursor while controlling a window |
+| `layoutEnabled` | `true` | Auto-layout enabled by default (v0.2.37 behavior; auto-inits at player position) |
+| `layoutAutoJoin` | `true` | New windows auto-join the layout (false = only `/wl layout add` windows) |
+| `layoutTemplate` | `cube` | Layout template: `cube` or `sphere` |
+| `layoutInitialized` | `false` | Whether `/wl layout init` was run (layout unusable until set) |
+| `layoutInitX` / `Y` / `Z` | `0.0` | Layout center coordinates |
+| `layoutInitYaw` | `0.0` | Layout facing (degrees, 0 = toward +Z, clockwise) |
+| `layoutRadius` | `6.0` | Layout radius in blocks (center → window horizontal distance) |
+| `layoutSpacing` | `0.4` | Min horizontal spacing between windows on a layer (blocks) |
+| `layoutStackSpacing` | `0.4` | Vertical spacing between layers (blocks) |
+| `layoutCubePerFace` | `2` | Cube template windows per face (4 faces → 8 total) |
+| `layoutDefaultWidth` | `1080` | Resolution applied to windows joining the layout |
+| `layoutDefaultHeight` | `540` | Resolution applied to windows joining the layout |
+| `groundClearance` | `0.4` | Min clearance of window bottom above floor (blocks) |
+| `moveStep` | `0.5` | Manual move step for Ctrl+arrow key movement |
 
 ---
 

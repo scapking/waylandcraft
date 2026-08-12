@@ -165,6 +165,9 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 | 位置確認 | `/wl pos <handle>` |
 | 移動（絶対値または `~` 相対値） | `/wl move <handle> <x> <y> <z>` |
 | 回転（角度） | `/wl rotate <handle> <angle>` |
+| X11 デスクトップウィンドウ一覧 | `/wl x11 list` |
+| X11 ウィンドウを直接共有 | `/wl x11 share <index>` |
+| X11 共有を停止 | `/wl x11 stop <handle>` |
 
 **ハンドル形式** — `<handle>` は：`0x` 短ハンドル、完全ハンドル、**インスタンスエイリアス**（4 桁ランダム、例 `k7xq`、`/wl list windows` 由来、セッション内で一意）、アプリエイリアス（例 `firefox_esr`）に対応。同一アプリの複数ウィンドウは `エイリアス:N`（例 `firefox:2`）。
 
@@ -236,6 +239,8 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 
 ### 共有画質パラメータ
 
+`/wl share config <handle> <パラメータ> <値>` で設定可能：
+
 | パラメータ | 説明 | 範囲 |
 |------------|------|------|
 | `scale` | 解像度スケール | 0.1 – 1.0 |
@@ -243,6 +248,11 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 | `fps` | 最大フレームレート | 5 – 120 |
 | `bitrate` | 最大ビットレート（kbps） | 0 = 無制限 |
 | `diffThreshold` | ピクセル変化閾値 | 0.001 – 1.0 |
+| `diff` | 差分フレーム転送のオン/オフ | true / false |
+| `buffer` | フレームバッファ数 | 1 – 8 |
+| `latency` | 遅延補正（ms） | 0 – 500 |
+| `prediction` | モーション予測のオン/オフ | true / false |
+| `compression` | 圧縮方式 | 例 `lz4` / `zlib` / `none` |
 
 ### プリセット
 
@@ -253,13 +263,40 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 | `quality` | 1.0 | 1.0 | 30 | 無制限 |
 | `lowlatency` | 0.35 | 0.6 | 60 | 1500 kbps |
 
+### X11 ウィンドウ共有
+
+Wayland トップレベルを経由せず、X11 デスクトップのウィンドウを直接共有（`xwayland-satellite` 経由）：
+
+| コマンド | 用途 |
+|----------|------|
+| `/wl x11 list [display]` | X11 デスクトップウィンドウを一覧（デフォルトは satellite ディスプレイ） |
+| `/wl x11 share <index>` | 一覧の N 番目のウィンドウを共有 |
+| `/wl x11 stop <handle>` | X11 ウィンドウの共有を停止 |
+
 ### グローバル設定
+
+`/wl settings set <key> <value>` は以下の全キーに対応（`/wl settings list` でも確認可）：
 
 | キー | デフォルト | 説明 |
 |------|------------|------|
 | `pixelsPerBlock` | `500` | 1 ブロックあたりのウィンドウ画素密度 |
 | `windowAntialiasing` | `false` | RGSS アンチエイリアス（シェーダーなし時のみ） |
 | `focusOnHover` | `false` | ホバーで自動フォーカス |
+| `hideCursor` | `false` | ウィンドウ操作中に仮想マウスカーソルを非表示 |
+| `layoutEnabled` | `true` | レイアウトをデフォルトで有効化（v0.2.37 の動作；未初期化時はプレイヤー位置で自動初期化） |
+| `layoutAutoJoin` | `true` | 新規ウィンドウを自動でレイアウトに参加（false = `/wl layout add` で指定したもののみ） |
+| `layoutTemplate` | `cube` | レイアウトテンプレート：`cube` または `sphere` |
+| `layoutInitialized` | `false` | `/wl layout init` 実行済みか（未初期化ならレイアウト不可） |
+| `layoutInitX` / `Y` / `Z` | `0.0` | レイアウト中心座標 |
+| `layoutInitYaw` | `0.0` | レイアウト向き（度、0=+Z 方向、時計回り） |
+| `layoutRadius` | `6.0` | レイアウト半径（ブロック、中心からウィンドウまでの水平距離） |
+| `layoutSpacing` | `0.4` | 同一レイヤーのウィンドウ間の最小水平間隔（ブロック） |
+| `layoutStackSpacing` | `0.4` | レイヤー間の垂直間隔（ブロック） |
+| `layoutCubePerFace` | `2` | cube テンプレートの各面あたりウィンドウ数（4 面で計 8） |
+| `layoutDefaultWidth` | `1080` | レイアウト参加時に適用する解像度 |
+| `layoutDefaultHeight` | `540` | レイアウト参加時に適用する解像度 |
+| `groundClearance` | `0.4` | ウィンドウ下端の地面からの最小クリアランス（ブロック） |
+| `moveStep` | `0.5` | Ctrl+矢印キーでの手動移動ステップ |
 
 ---
 
