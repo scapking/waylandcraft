@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.2.35-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.11-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -183,6 +183,24 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 | `/wl template applyp <name>` | Apply permanent template: auto-launch apps and place them |
 | `/wl template list` | List all templates |
 | `/wl template remove <name>` / `removep <name>` | Delete temporary / permanent template |
+
+### Auto Layout (cube / sphere)
+
+Windows can be arranged automatically around a fixed initialized origin (they no longer follow the player). Disabled by default.
+
+| Command | Purpose |
+|---------|---------|
+| `/wl layout init [<x> <y> <z> [<yaw>]]` | Initialize layout center + yaw (no args = player position) |
+| `/wl layout cube` | Switch to cube template (4 faces × N windows per face) and enable |
+| `/wl layout sphere` | Switch to sphere template (VR screen-wall ring, stack upward) and enable |
+| `/wl layout on` / `off` / `toggle` | Enable / disable / toggle auto layout |
+| `/wl layout status` | Show template, center, radius, spacing, core window |
+| `/wl layout list` | List windows in the layout (`➤` marks the core window) |
+| `/wl layout add <handle>` / `remove <handle>` | Manually add / remove a window (when `layoutAutoJoin` is off) |
+| `/wl layout core <handle>` | Set the core window explicitly |
+
+* `Ctrl` + arrow keys moves the **core marker** to the neighbour window in that direction — any window can become the core (left/right wrap around, up/down cross layers, unlimited). The core window is highlighted with a cyan outline in-world. When auto layout is disabled, `Ctrl` + arrows still moves the hovered window manually.
+* `G` captures the keyboard; the default key `H` toggles the cursor (both rebindable in the vanilla key settings).
 
 ### Sharing
 
@@ -378,6 +396,18 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
 
 **Recent highlights:**
 
+- **v0.9.11** — Fixed the root cause of keyboard passthrough: `xkb_state.update_key` was fed evdev codes (`key-8`) but xkbcommon requires xkb keycodes (evdev+8). The invalid keycodes were silently ignored, so modifier bits (Ctrl/Shift/Alt) never set — single keys looked fine but every shortcut (Ctrl+L etc.) failed. `mods(depressed=0)` observed in kb.log with Ctrl held down was the smoking gun. **Combination keys now pass through correctly.**
+- **v0.9.10** — Fixed `setKbLogFileNative` JNI registration name mismatch (Rust macro snake→camel auto-generation vs explicit name).
+- **v0.9.9** — Rust keyboard log now writes to its own file `waylandcraft-kb.log` (setKbLogFile) for easy upload & diagnosis of focus/send state.
+- **v0.9.8** — Fixed the main keyboard passthrough root cause: `correctScancode` no longer adds +8 on Wayland (double keycode offset).
+- **v0.9.7** — Log noise reduction; `keyboard_key` now logs modifier state (mods summary per key); tick focus log throttled; `keyboard_focus` idempotent-silent.
+- **v0.9.6** — Full-pipeline keyboard debug logging (mixin entry / onKeyPress branch / local forward / bridge / Rust focus / per-key send).
+- **v0.9.5** — Fixed local window keyboard passthrough (scenario B): focus fallback + forward self-healing + diagnostic logs.
+- **v0.9.4** — Fixed Ctrl+arrow direction inverted + J false-trigger while G-bound.
+- **v0.9.3** — Shared window long-press REPEAT passthrough (`forwardSharedKey` Repeat branch; requirement 1 completion).
+- **v0.9.2** — Ctrl+arrows now swap layout order (plan A) — no range limits.
+- **v0.9.1** — Fixed all-keyboard-dead after G binding — set keyboard focus (focusSurface) on bind/hover.
+- **v0.9.0** — 键盘输入子系统重构（方案 C）：长按 REPEAT 事件完整透传（修复长按失效）；组合键/大小写由 Rust xkb 状态机全权维护，Java 只做透传；Ctrl+方向键**永远移动窗口**（恢复 v0.2.37 语义，布局核心切换解绑）；捕获分工 **G=纯键盘、J=键盘+鼠标**；release 自动生成按版本变更描述。
 - **v0.2.35** — iOS detection added (PojavLauncher/Amethyst runtime): viewer-only mode, same jar, shared windows render; platform matrix updated.
 - **v0.2.34** — Windows/macOS now supported in **viewer-only mode**: platform auto-detection skips native capture; the same jar works on Linux/Windows/macOS/Android; shared windows still render.
 - **v0.2.33** — Window instance aliases are now 4-char random codes (e.g. `k7xq`) instead of `w1/w2/…`; ambiguous characters `0/o/1/l/i` excluded for easier typing.

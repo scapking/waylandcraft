@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.2.35-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.11-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -51,6 +51,7 @@
 - **純 CLI モード** — すべての操作は `/wl` コマンドで完結。バニラ描画に回帰し、SF 風 UI のノイズなし
 - **統一描画** — ローカルウィンドウとリモート共有ウィンドウが同じ描画パスを通るため、見た目は完全一致
 - **自由なウィンドウ配置** — ドラッグ・リサイズ・固定・非表示・回転が可能。テンプレートでレイアウトを保存/復元
+- **完全なキーボード透過** — 単独キー・修飾キー（Ctrl/Shift/Alt）・長押し REPEAT がすべてフォーカス中のウィンドウへ到達。キャプチャ分担 **G=キーボードのみ、J=キーボード+マウス**
 - **X11 アプリ対応** — 同梱の `xwayland-satellite` が X11 アプリに `DISPLAY` を自動提供（`x86_64` と `arm64` の両アーキテクチャ対応）
 
 ### 👥 マルチプレイヤーでのウィンドウ共有
@@ -177,6 +178,24 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 | `/wl template applyp <name>` | 永続テンプレート適用：アプリを自動起動して配置 |
 | `/wl template list` | 全テンプレート一覧 |
 | `/wl template remove <name>` / `removep <name>` | 一時/永続テンプレートを削除 |
+
+### 自動レイアウト（cube / sphere）
+
+ウィンドウを固定された初期化原点を中心に自動配置できる（プレイヤーに追従しなくなる）。デフォルトでは無効。
+
+| コマンド | 用途 |
+|----------|------|
+| `/wl layout init [<x> <y> <z> [<yaw>]]` | レイアウト中心 + ヨーを初期化（引数なし = プレイヤー位置） |
+| `/wl layout cube` | cube テンプレートに切り替え（4 面 × 各面 N ウィンドウ）して有効化 |
+| `/wl layout sphere` | sphere テンプレートに切り替え（VR スクリーン壁リング、上に積み上げ）して有効化 |
+| `/wl layout on` / `off` / `toggle` | 自動レイアウトを有効/無効/切り替え |
+| `/wl layout status` | テンプレート・中心・半径・間隔・コアウィンドウを表示 |
+| `/wl layout list` | レイアウト内のウィンドウ一覧（`➤` はコアウィンドウ） |
+| `/wl layout add <handle>` / `remove <handle>` | 手動でウィンドウを追加/削除（`layoutAutoJoin` が off のとき） |
+| `/wl layout core <handle>` | コアウィンドウを明示指定 |
+
+* `Ctrl` + 矢印キーで**コアマーカー**をその方向の隣のウィンドウへ移動——任意のウィンドウがコアになれる（左右は折り返し、上下はレイヤー間移動、無制限）。コアウィンドウはワールド内でシアンの輪郭でハイライト。自動レイアウト無効時も、`Ctrl` + 矢印キーでホバー中のウィンドウを手動移動できる。
+* `G` キーでキーボードをキャプチャ；デフォルトの `H` キーでカーソルを切り替え（両方ともバニラのキー設定で再バインド可能）。
 
 ### 共有
 
@@ -372,6 +391,18 @@ cd .. && ./gradlew clean build
 
 **最近のハイライト：**
 
+- **v0.9.11** — キーボード透過の根本原因を修正：`xkb_state.update_key` に evdev キーコード（`key-8`）を渡していたが、xkbcommon は xkb キーコード（evdev+8）を要求する。無効なキーコードは黙って無視され、Ctrl/Shift/Alt の修飾ビットが永遠に立たない——単独キーは正常に見えるのに、ショートカット（Ctrl+L など）は全て効かない状態だった。kb.log で「Ctrl を押しているのに mods(depressed=0)」が証拠。**修飾キー付きの組合せキーが正常に透過するようになった。**
+- **v0.9.10** — `setKbLogFileNative` の JNI 登録名不一致を修正（Rust マクロの snake→camel 自動生成 vs 明示名）。
+- **v0.9.9** — Rust キーボードログを独立ファイル `waylandcraft-kb.log`（setKbLogFile）に書き出し。Rust 側のフォーカス/送信状態の診断が容易に。
+- **v0.9.8** — キーボード透過の主因を修正：`correctScancode` が Wayland で +8 しなくなった（キーコード二重オフセット）。
+- **v0.9.7** — ログを整理；`keyboard_key` が修飾キー状態を毎キー出力；tick フォーカスログをスロットル化；`keyboard_focus` を冪等サイレント化。
+- **v0.9.6** — キーボード透過の全パイプライン debug ログ（mixin 入口/onKeyPress 分岐/ローカル転送/bridge/Rust フォーカス/毎キー送信）。
+- **v0.9.5** — ローカルウィンドウのキーボード透過（シナリオ B）を修正：フォーカスフォールバック + 転送自己復旧 + 診断ログ。
+- **v0.9.4** — Ctrl+矢印キーの方向反転と、G バインド中の J キー誤発動を修正。
+- **v0.9.3** — 共有ウィンドウの長押し REPEAT 透過を補完（`forwardSharedKey` の Repeat 分岐、要件 1 を完成）。
+- **v0.9.2** — Ctrl+矢印キーをレイアウト順序の入れ替え（プラン A）に変更——範囲制限なし。
+- **v0.9.1** — G バインド後に全キーが効かなくなる問題を修正——バインド/ホバー時にキーボードフォーカスを設定（focusSurface）。
+- **v0.9.0** — キーボード入力サブシステムを再構築（プラン C）：長押し REPEAT イベントを完全透過（長押し不能を修正）；組合せキー/大文字小文字は Rust xkb ステートマシンが一元的に管理、Java は透過のみ；Ctrl+矢印キーで**常にウィンドウを移動**（v0.2.37 の意味論を復元、レイアウトコア切り替えは解除）；キャプチャ分担 **G=キーボードのみ、J=キーボード+マウス**；release がバージョン変更内容に基づき自動生成。
 - **v0.2.35** — iOS 検出を追加（PojavLauncher/Amethyst ランタイム）：表示のみモード、同じ jar、共有ウィンドウの表示は継続。対応プラットフォーム表を更新。
 - **v0.2.34** — Windows/macOS を**表示のみモード**で対応：プラットフォームを自動検出してローカルキャプチャをスキップ。同じ jar が Linux/Windows/macOS/Android で動作し、共有ウィンドウの表示は継続。
 - **v0.2.33** — ウィンドウのインスタンスエイリアスを 4 桁のランダムコード（例 `k7xq`）に変更（w1/w2… は廃止）。紛らわしい `0/o/1/l/i` を除外し入力しやすく。

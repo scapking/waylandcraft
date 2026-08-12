@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.0-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.11-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -51,6 +51,7 @@
 - **纯命令行模式** — 所有操作通过 `/wl` 命令完成；回归原版渲染，无科幻 UI 干扰
 - **统一渲染** — 本地窗口与远程共享窗口走同一渲染路径，画面完全一致
 - **窗口自由摆放** — 拖动、缩放、固定、隐藏、旋转；模板一键保存/恢复布局
+- **完整键盘穿透** — 单键、组合键（Ctrl/Shift/Alt）、长按 REPEAT 全部直达焦点窗口；捕获分工 **G=纯键盘、J=键盘+鼠标**
 - **X11 应用支持** — 内置 `xwayland-satellite` 自动为 X11 程序提供 `DISPLAY`（已包含 `x86_64` 与 `arm64` 双架构二进制）
 
 ### 👥 多人窗口共享
@@ -177,6 +178,24 @@
 | `/wl template applyp <name>` | 应用永久模板：自动启动应用并按位置摆放 |
 | `/wl template list` | 列出全部模板 |
 | `/wl template remove <name>` / `removep <name>` | 删除临时/永久模板 |
+
+### 自动布局（立方体 / 球体）
+
+窗口围绕固定的初始化原点自动排列（不再跟随玩家）。默认关闭。
+
+| 命令 | 作用 |
+|------|------|
+| `/wl layout init [<x> <y> <z> [<yaw>]]` | 初始化布局中心+朝向（无参数=玩家位置） |
+| `/wl layout cube` | 切换立方体模板（4 面 × 每面 N 个窗口）并启用 |
+| `/wl layout sphere` | 切换球体模板（VR 幕墙环，向上堆叠）并启用 |
+| `/wl layout on` / `off` / `toggle` | 启用 / 禁用 / 切换自动布局 |
+| `/wl layout status` | 显示模板、中心、半径、间距、核心窗口 |
+| `/wl layout list` | 列出布局内窗口（`➤` 标记核心窗口） |
+| `/wl layout add <handle>` / `remove <handle>` | 手动添加/移除窗口（`layoutAutoJoin` 关闭时） |
+| `/wl layout core <handle>` | 显式指定核心窗口 |
+
+* `Ctrl` + 方向键移动**核心标记**到该方向的相邻窗口——任意窗口都能成为核心（左右环绕、上下跨层、无限制）。核心窗口在游戏内以青色轮廓高亮。自动布局关闭时，`Ctrl` + 方向键仍可手动移动悬停窗口。
+* `G` 捕获键盘；默认 `H` 键切换光标（均可在原版按键设置中改绑）。
 
 ### 共享
 
@@ -372,6 +391,17 @@ cd .. && ./gradlew clean build
 
 **近期亮点：**
 
+- **v0.9.11** — 修复键盘穿透总根因：`xkb_state.update_key` 误用 evdev 键码（`key-8`）更新状态，但 xkbcommon 要求 xkb keycode（evdev+8）。无效键码被静默忽略 → Ctrl/Shift/Alt 修饰位永远置不上 → 单键看似正常、组合键（Ctrl+L 等）全部失效。kb.log 中"Ctrl 按下但 mods(depressed=0)"实锤。**组合键穿透现已完全正常。**
+- **v0.9.10** — 修复 `setKbLogFileNative` JNI 注册名不匹配（Rust 宏 snake→camel 自动生成 vs 显式命名）。
+- **v0.9.9** — Rust 键盘日志独立写文件 `waylandcraft-kb.log`（setKbLogFile），便于上传定位 Rust 侧焦点/发送状态。
+- **v0.9.8** — 修复键盘穿透主根因：`correctScancode` 在 Wayland 平台去掉 +8（键码双重偏移）。
+- **v0.9.7** — 日志降噪；`keyboard_key` 每键打印修饰键状态；tick 焦点日志节流；`keyboard_focus` 幂等静默。
+- **v0.9.6** — 键盘穿透全链路 debug 日志（mixin 入口/onKeyPress 分支/本地转发/bridge/Rust 焦点/每键发送）。
+- **v0.9.5** — 修复本地窗口键盘穿透（场景 B）：焦点兜底 + 转发自愈 + 诊断日志。
+- **v0.9.4** — 修复 Ctrl+方向键方向相反 + G 绑定下 J 键误触发。
+- **v0.9.3** — 共享窗口长按 REPEAT 透传补全（`forwardSharedKey` Repeat 分支，需求 1 补全）。
+- **v0.9.2** — Ctrl+方向键改为交换布局排序（方案 A）——无任何范围限制。
+- **v0.9.1** — 修复 G 键绑定后按键全失效——绑定/悬停时设置键盘焦点（focusSurface）。
 - **v0.9.0** — 键盘输入子系统重构（方案 C）：长按 REPEAT 事件完整透传（修复长按失效）；组合键/大小写由 Rust xkb 状态机全权维护，Java 只做透传；Ctrl+方向键**永远移动窗口**（恢复 v0.2.37 语义，布局核心切换解绑）；捕获分工 **G=纯键盘、J=键盘+鼠标**；release 自动生成按版本变更描述。
 - **v0.2.35** — 新增 iOS 检测（PojavLauncher/Amethyst 运行时）：仅查看模式、同一份 jar、共享窗口可渲染；平台矩阵更新。
 - **v0.2.34** — Windows/macOS 支持**仅查看模式**：自动检测平台并跳过本地捕获；同一份 jar 在 Linux/Windows/macOS/Android 通用；共享窗口仍可渲染。

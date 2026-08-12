@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.0-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.11-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -51,6 +51,7 @@ Turn any Wayland window into an in-game object. Launch apps, view them on a virt
 - **Pure CLI mode** — all operations via `/wl` commands; vanilla rendering, no sci-fi UI clutter
 - **Unified rendering** — local and remotely shared windows share the same render path for identical visuals
 - **Window placement** — drag, resize, pin, hide, rotate; save/restore layouts with templates
+- **Full keyboard passthrough** — single keys, modifier combos (Ctrl/Shift/Alt), and long-press REPEAT all reach the focused window; capture split **G = keyboard only, J = keyboard + mouse**
 - **X11 app support** — bundled `xwayland-satellite` gives X11 applications a `DISPLAY` automatically (both `x86_64` and `arm64` binaries included)
 
 ### 👥 Multiplayer Window Sharing
@@ -396,6 +397,17 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
 
 **Recent highlights:**
 
+- **v0.9.11** — Fixed the root cause of keyboard passthrough: `xkb_state.update_key` was fed evdev codes (`key-8`) but xkbcommon requires xkb keycodes (evdev+8). The invalid keycodes were silently ignored, so modifier bits (Ctrl/Shift/Alt) never set — single keys looked fine but every shortcut (Ctrl+L etc.) failed. `mods(depressed=0)` observed in kb.log with Ctrl held down was the smoking gun. **Combination keys now pass through correctly.**
+- **v0.9.10** — Fixed `setKbLogFileNative` JNI registration name mismatch (Rust macro snake→camel auto-generation vs explicit name).
+- **v0.9.9** — Rust keyboard log now writes to its own file `waylandcraft-kb.log` (setKbLogFile) for easy upload & diagnosis of focus/send state.
+- **v0.9.8** — Fixed the main keyboard passthrough root cause: `correctScancode` no longer adds +8 on Wayland (double keycode offset).
+- **v0.9.7** — Log noise reduction; `keyboard_key` now logs modifier state (mods summary per key); tick focus log throttled; `keyboard_focus` idempotent-silent.
+- **v0.9.6** — Full-pipeline keyboard debug logging (mixin entry / onKeyPress branch / local forward / bridge / Rust focus / per-key send).
+- **v0.9.5** — Fixed local window keyboard passthrough (scenario B): focus fallback + forward self-healing + diagnostic logs.
+- **v0.9.4** — Fixed Ctrl+arrow direction inverted + J false-trigger while G-bound.
+- **v0.9.3** — Shared window long-press REPEAT passthrough (`forwardSharedKey` Repeat branch; requirement 1 completion).
+- **v0.9.2** — Ctrl+arrows now swap layout order (plan A) — no range limits.
+- **v0.9.1** — Fixed all-keyboard-dead after G binding — set keyboard focus (focusSurface) on bind/hover.
 - **v0.9.0** — 键盘输入子系统重构（方案 C）：长按 REPEAT 事件完整透传（修复长按失效）；组合键/大小写由 Rust xkb 状态机全权维护，Java 只做透传；Ctrl+方向键**永远移动窗口**（恢复 v0.2.37 语义，布局核心切换解绑）；捕获分工 **G=纯键盘、J=键盘+鼠标**；release 自动生成按版本变更描述。
 - **v0.2.35** — iOS detection added (PojavLauncher/Amethyst runtime): viewer-only mode, same jar, shared windows render; platform matrix updated.
 - **v0.2.34** — Windows/macOS now supported in **viewer-only mode**: platform auto-detection skips native capture; the same jar works on Linux/Windows/macOS/Android; shared windows still render.
