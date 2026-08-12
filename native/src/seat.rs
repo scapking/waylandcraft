@@ -53,6 +53,8 @@ pub struct WLCSeatState {
     pub xkb_context: xkb::Context,
     pub xkb_state: xkb::State,
     pub cursor_shape: Option<u32>,
+    /// 诊断：kb_active 但所有 keyboard 都无 focus 时只 warn 一次，避免刷屏
+    pub no_focus_warned: std::cell::Cell<bool>,
 }
 
 pub struct WLCPointerData {
@@ -209,6 +211,7 @@ impl WLCSeatState {
             xkb_context,
             xkb_state,
             cursor_shape: None,
+            no_focus_warned: std::cell::Cell::new(false),
         }
     }
 
@@ -546,12 +549,23 @@ impl WLCSeatState {
         let serial = new_serial();
         let wire_key = key.saturating_sub(8);
         let state = action.key_state();
+        let mut any_focus = false;
         self.for_all_keyboards(|keyboard, data| {
             if data.focus.is_some() {
+                any_focus = true;
                 keyboard.key(serial, get_time(), wire_key, state);
                 self.send_modifiers(keyboard, serial);
             }
         });
+        // 诊断：键盘已激活但没有任何 wl_keyboard 有焦点 —— 按键被静默丢弃
+        // （"穿透不了窗口"的直接证据）。只 warn 一次避免刷屏。
+        if !any_focus && !self.no_focus_warned.get() {
+            self.no_focus_warned.set(true);
+            eprintln!(
+                "[kb] WARN: kb_active=true 但无任何 keyboard focus（key={}）——按键被丢弃！Java 侧应 focusSurface 一个窗口",
+                wire_key
+            );
+        }
     }
 
     pub fn pointer_unlock(&self) {

@@ -125,6 +125,9 @@ public class WaylandCraft implements ClientModInitializer {
 	// Only non-null, when no exclusive pointer grabs are currently active
 	public DisplayHitResult hoveredDisplay = null;
 	
+	// 诊断：本地键盘首次转发已打日志（避免每键刷屏）
+	private boolean keyboardForwardLogged = false;
+	
 	// 当前 hover 的共享窗口（手机端 viewer-only 无本地窗口时也可用；与 hoveredDisplay 互斥）
 	public SharedWindowDisplay hoveredSharedDisplay = null;
 	// hover 共享窗口时的窗口内像素坐标（相对窗口左上角，含 xoff/yoff）
@@ -299,12 +302,19 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		// Make sure the toplevels are focused in their respective order and being refocused when a toplevel disappears
 		if(!inWMScreen) {
-			WLCToplevel focus = bridge.getMostToLeastRecentFocus()
-					.filter((t) -> hasDisplayFor(t))
-					.findFirst()
-					.orElse(null);
-			
-			bridge.focusSurface(focus);
+			// 绑定模式下焦点跟随 hover 的窗口（用户鼠标指向哪个窗口，键盘就进哪个窗口）；
+			// 未绑定才按"最近焦点"排序。之前无条件用最近焦点 —— 如果 hover 窗口不是最近焦点，
+			// 每 tick 会把焦点从 hover 窗口抢走/或 focus 为 null 时清掉焦点 → 按键进不去窗口。
+			if(keyboardCaptureMode != KeyboardCaptureMode.NONE && hoveredSharedDisplay == null) {
+				ensureKeyboardFocus("tick");
+			} else {
+				WLCToplevel focus = bridge.getMostToLeastRecentFocus()
+						.filter((t) -> hasDisplayFor(t))
+						.findFirst()
+						.orElse(null);
+				
+				bridge.focusSurface(focus);
+			}
 		}
 		
 		if(Minecraft.getInstance().player == null || !Minecraft.getInstance().player.isUsingItem()) playerUsingWindowItem = false;
@@ -368,17 +378,7 @@ public class WaylandCraft implements ClientModInitializer {
 		// Rust keyboard_key 只有在有 surface 获得 focus 时才转发按键（data.focus.is_some()），
 		// 之前 G 键只 activateKeyboard() 不设焦点 → 所有按键被 Rust 丢弃 → 键盘绑定形同虚设。
 		// J 键之前"看起来能用"是因为鼠标 hover 路径（onMouseTurn）会顺手 focusSurface。
-		WLCToplevel kbFocus = null;
-		if(hoveredDisplay != null && hoveredDisplay.dist >= 0 && hoveredDisplay.target.window instanceof WLCToplevel t) {
-			kbFocus = t;
-		}
-		else {
-			kbFocus = bridge.getMostToLeastRecentFocus()
-					.filter((t) -> hasDisplayFor(t))
-					.findFirst()
-					.orElse(null);
-		}
-		if(kbFocus != null) bridge.focusSurface(kbFocus);
+		ensureKeyboardFocus("enableKeyboardCapture");
 		
 		// 仅 hardCapture（J）才创建 PointerCapture 锁定鼠标。
 		// 关键修复：不再用 bridge.maybeLockPointer 作为创建 pointerCapture 的前提——
@@ -393,6 +393,54 @@ public class WaylandCraft implements ClientModInitializer {
 			PointerCapture pc = new PointerCapture(surface, rel.x, rel.y);
 			pc.relativeLocked = bridge.maybeLockPointer(surface);
 			pointerCapture = pc;
+		}
+	}
+	
+	/**
+	 * 确保本地键盘焦点存在且正确。优先级：
+	 *   1. 当前 hover 的本地窗口（绑定模式下焦点跟随鼠标指向的窗口）；
+	 *   2. 最近焦点窗口（有对应 display 的）；
+	 *   3. 兜底：displays 里第一个 toplevel —— 保证绑定后**必有**焦点。
+	 * Rust keyboard_key 只有在某 wl_keyboard 有 focus 时才转发按键；
+	 * 之前 G 键如果既没 hover 窗口、最近焦点列表又为空 → kbFocus == null →
+	 * focusSurface 不调用 → 按键全被 Rust 丢弃 → "键盘输入不能穿透窗口"。
+	 * focusSurface 是幂等的（Rust 侧 "Surface already focused" 短路），每帧调用成本极低。
+	 */
+	private void ensureKeyboardFocus(String origin) {
+		if(bridge == null) return;
+		WLCToplevel kbFocus = null;
+		String source = "none";
+		if(hoveredDisplay != null && hoveredDisplay.dist >= 0 && hoveredDisplay.target.window instanceof WLCToplevel t) {
+			kbFocus = t;
+			source = "hover";
+		}
+		else {
+			kbFocus = bridge.getMostToLeastRecentFocus()
+					.filter((t) -> hasDisplayFor(t))
+					.findFirst()
+					.orElse(null);
+			if(kbFocus != null) source = "recent";
+		}
+		if(kbFocus == null) {
+			for(WindowDisplay d : displays) {
+				if(d.window instanceof WLCToplevel t) {
+					kbFocus = t;
+					source = "fallback";
+					break;
+				}
+			}
+		}
+		if(kbFocus != null) {
+			bridge.focusSurface(kbFocus);
+			// 只对"绑定/每 tick"这类低频入口打 info；onKeyPress 高频入口不打（避免刷屏）
+			if(!"onKeyPress".equals(origin)) {
+				WaylandCraftCommon.LOGGER.info("[kb] {} 焦点={} (来源={}, hovered={}, displays={})",
+					origin, WaylandCraft.getWindowName(kbFocus), source,
+					hoveredDisplay != null ? "yes" : "no", displays.size());
+			}
+		} else {
+			WaylandCraftCommon.LOGGER.warn("[kb] {} 无任何可聚焦窗口（displays={} toplevels={}）——按键将全部被 Rust 丢弃",
+				origin, displays.size(), bridge.getToplevels().length);
 		}
 	}
 	
@@ -1127,6 +1175,17 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 
 		if(bridge == null) return true;
+
+		// 本地路径焦点自愈：转发前确保焦点在 hover 窗口（幂等；防止焦点被意外清掉
+		// 后按键被 Rust 丢弃——这是"键盘输入不能穿透窗口"的最后一道保险）。
+		ensureKeyboardFocus("onKeyPress");
+
+		// 诊断：首次本地转发打日志（区分 mixin 注入失效 vs 焦点问题）
+		if(!keyboardForwardLogged) {
+			keyboardForwardLogged = true;
+			WaylandCraftCommon.LOGGER.info("[kb] onKeyPress 首次本地转发 key={} action={} mode={}",
+				key, action, keyboardCaptureMode);
+		}
 
 		// 本地 bridge 路径三态完整透传（Rust keyboardInput 0=release 1=press 2=repeat）。
 		// 之前 REPEAT 在这里被吞掉 → 长按失效（窗口收不到重复按键）。
