@@ -56,10 +56,6 @@ public class WindowDisplay {
 	// 持久分配：窗口关闭/重开不影响其它窗口序号，新窗口继续按序号递增扩散。
 	public int layoutAltIndex = -1;
 	
-	// 手动偏移（Ctrl+方向键移动窗口）：布局模式 arrange 排布后叠加，自由模式直接改 pivot。
-	// 独立于 pivot 存储，确保 arrange 每帧重排不会覆盖用户手动移动的位置。
-	public Vec3 manualOffset = Vec3.ZERO;
-	
 	public WindowDisplay(WLCAbstractWindow window) {
 		this.window = window;
 		this.updateGeometry();
@@ -146,12 +142,6 @@ public class WindowDisplay {
 		poseStack.pushPose();
 		poseStack.translate(originRel.x, originRel.y, originRel.z);
 		RenderUtils.renderFramebuffer(window.framebuffer, poseStack, ctx.submitNodeCollector(), true, tl, bl, br, tr);
-		
-		// 核心窗口青色轮廓高亮：鼠标指向谁，谁就是核心（青色高亮），方向键移动它
-		if(WaylandCraft.instance != null && WaylandCraft.instance.hoveredDisplay != null
-			&& WaylandCraft.instance.hoveredDisplay.target == this) {
-			RenderUtils.renderCoreOutline(poseStack, ctx.submitNodeCollector(), tl, bl, br, tr);
-		}
 		poseStack.popPose();
 	}
 	

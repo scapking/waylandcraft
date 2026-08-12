@@ -210,49 +210,6 @@ public class RenderUtils {
 	}
 	
 	/**
-	 * 核心窗口青色轮廓 — 沿窗口四边形四边各画一条细长条带（thickness 为 block 单位）。
-	 * 复用原版 entity 管线（Iris 兼容），颜色由顶点色决定，纹理用白色 1x1。
-	 * 顶点使用与窗口本体相同的局部坐标（调用方已 translate poseStack 到窗口 origin）。
-	 */
-	public static final record CoreOutlineInstance(Vec3 tl, Vec3 bl, Vec3 br, Vec3 tr, float thickness, int r, int g, int b, int a) implements CustomGeometryRenderer {
-		
-		@Override
-		public void render(Pose pose, VertexConsumer buffer) {
-			Vec3 ux = br.subtract(bl);
-			Vec3 uy = tl.subtract(bl);
-			double lenX = ux.length();
-			double lenY = uy.length();
-			if(lenX < 1e-9 || lenY < 1e-9) return;
-			ux = ux.scale(1.0 / lenX);
-			uy = uy.scale(1.0 / lenY);
-			float w = thickness;
-			// 上边（沿 uy 负向扩展）
-			quad(pose, buffer, tl.add(uy.scale(-w)), tl, tr, tr.add(uy.scale(-w)), r, g, b, a);
-			// 下边（沿 uy 正向扩展）
-			quad(pose, buffer, bl, bl.add(uy.scale(-w)), br.add(uy.scale(-w)), br, r, g, b, a);
-			// 左边（沿 ux 负向扩展）
-			quad(pose, buffer, tl.add(ux.scale(-w)), tl, bl, bl.add(ux.scale(-w)), r, g, b, a);
-			// 右边（沿 ux 正向扩展）
-			quad(pose, buffer, tr, tr.add(ux.scale(w)), br.add(ux.scale(w)), br, r, g, b, a);
-		}
-		
-		private void quad(Pose pose, VertexConsumer buffer, Vec3 p0, Vec3 p1, Vec3 p2, Vec3 p3, int r, int g, int b, int a) {
-			buffer.addVertex(pose, p0.toVector3f()).setColor(r, g, b, a).setUv(0.0f, 0.0f).setOverlay(OverlayTexture.NO_OVERLAY).setLight(0xF000F0).setNormal(0.0f, 0.0f, 1.0f);
-			buffer.addVertex(pose, p1.toVector3f()).setColor(r, g, b, a).setUv(0.0f, 1.0f).setOverlay(OverlayTexture.NO_OVERLAY).setLight(0xF000F0).setNormal(0.0f, 0.0f, 1.0f);
-			buffer.addVertex(pose, p2.toVector3f()).setColor(r, g, b, a).setUv(1.0f, 1.0f).setOverlay(OverlayTexture.NO_OVERLAY).setLight(0xF000F0).setNormal(0.0f, 0.0f, 1.0f);
-			buffer.addVertex(pose, p3.toVector3f()).setColor(r, g, b, a).setUv(1.0f, 0.0f).setOverlay(OverlayTexture.NO_OVERLAY).setLight(0xF000F0).setNormal(0.0f, 0.0f, 1.0f);
-		}
-		
-	}
-	
-	/** 核心窗口青色轮廓（CYAN #00E5FF，半透明） */
-	public static void renderCoreOutline(PoseStack poseStack, SubmitNodeCollector collector, Vec3 tl, Vec3 bl, Vec3 br, Vec3 tr) {
-		Identifier white = Identifier.fromNamespaceAndPath("minecraft", "textures/block/white.png");
-		collector.submitCustomGeometry(poseStack, VANILLA_ENTITY_TRANSLUCENT.apply(white),
-			new CoreOutlineInstance(tl, bl, br, tr, 0.05f, 0, 229, 255, 230));
-	}
-	
-	/**
 	 * 统一窗口纹理渲染入口 — 本地帧缓冲与远程共享纹理共用同一套渲染逻辑
 	 * 
 	 * 同一管线（WINDOW_CUTOUT/WINDOW_TRANSLUCENT + BACKGROUND），同一几何实例

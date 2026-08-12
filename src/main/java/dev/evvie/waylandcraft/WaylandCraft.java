@@ -1167,9 +1167,10 @@ public class WaylandCraft implements ClientModInitializer {
 			return true;
 		}
 
-		// Ctrl + 方向键：移动鼠标指向（hover）的窗口（0=上 1=下 2=左 3=右）。
-		// 鼠标指向谁，谁就是"核心窗口"，方向键移动它；布局模式下移动后保留
-		// （manualOffset 机制），不会被每帧重排弹回。左/右相对玩家视线，上/下为竖直。
+		// Ctrl + 方向键：**与相邻窗口交换位置**（0=上 1=下 2=左 3=右）。
+		// 布局启用并初始化时：核心窗口与该方向相邻窗口交换排序（位置真的互换），
+		// 左/右环绕、上/下跨层环绕。布局未启用时：无条件调用 moveFrontWindow(dir)
+		// （v0.2.37 语义自由移动窗口）。
 		if(action == GLFW.GLFW_PRESS && (modifiers & GLFW.GLFW_MOD_CONTROL) != 0) {
 			int dir = switch(key) {
 				case GLFW.GLFW_KEY_UP -> 0;
@@ -1179,9 +1180,13 @@ public class WaylandCraft implements ClientModInitializer {
 				default -> -1;
 			};
 			if(dir >= 0) {
-				WaylandCraftCommon.LOGGER.info("[move] Ctrl+方向键 dir={} layoutEnabled={} layoutInit={} localDisplays={} sharedDisplays={}",
+				WaylandCraftCommon.LOGGER.info("[swap] Ctrl+方向键 dir={} layoutEnabled={} layoutInit={} localDisplays={} sharedDisplays={}",
 					dir, layoutManager.isEnabled(), layoutManager.isInitialized(), displays.size(), sharedDisplays.size());
-				moveFrontWindow(dir);
+				if(layoutManager.isEnabled() && layoutManager.isInitialized()) {
+					layoutManager.swapCore(dir);
+				} else {
+					moveFrontWindow(dir);
+				}
 				return true;
 			}
 		}
@@ -1498,9 +1503,6 @@ public class WaylandCraft implements ClientModInitializer {
 		};
 		
 		target.pivot = target.pivot.add(move);
-		// 同步手动偏移：布局模式下 arrange 每帧重排，只有写进 manualOffset 才会保留
-		// （arrange 末尾会 pivot = 排布位置 + manualOffset）；自由模式下 pivot 直接生效。
-		target.manualOffset = target.manualOffset.add(move);
 		target.clampVertical();
 	}
 	

@@ -246,11 +246,11 @@ public class WindowLayoutManager {
 				}
 				break;
 			}
-			case 2: // 左：angleOf 更大的窗口（逆时针/视觉左侧，玩家面向 baseYaw 时左 = 角度更大）；最左环绕到同层最右
-				next = findLayerNeighbor(idx, start, size, +1);
-				break;
-			default: // 右：angleOf 更小的窗口（顺时针/视觉右侧）；最右环绕到同层最左
+			case 2: // 左：angleOf 更小的窗口（视觉左侧，玩家面向 baseYaw 时左 = 角度更小）；最左环绕到同层最右
 				next = findLayerNeighbor(idx, start, size, -1);
+				break;
+			default: // 右：angleOf 更大的窗口（视觉右侧）；最右环绕到同层最左
+				next = findLayerNeighbor(idx, start, size, +1);
 				break;
 		}
 
@@ -311,11 +311,11 @@ public class WindowLayoutManager {
 				}
 				break;
 			}
-			case 2: // 左：angleOf 更大的窗口（逆时针/视觉左侧，玩家面向 baseYaw 时左 = 角度更大）；最左环绕到同层最右
-				next = findLayerNeighbor(idx, start, size, +1);
-				break;
-			default: // 右：angleOf 更小的窗口（顺时针/视觉右侧）；最右环绕到同层最左
+			case 2: // 左：angleOf 更小的窗口（视觉左侧，玩家面向 baseYaw 时左 = 角度更小）；最左环绕到同层最右
 				next = findLayerNeighbor(idx, start, size, -1);
+				break;
+			default: // 右：angleOf 更大的窗口（视觉右侧）；最右环绕到同层最左
+				next = findLayerNeighbor(idx, start, size, +1);
 				break;
 		}
 
@@ -509,14 +509,6 @@ public class WindowLayoutManager {
 			}
 			prevMaxTop = layerMaxTop;
 			pos += count;
-		}
-		
-		// 手动偏移（Ctrl+方向键移动窗口）：在所有排布/贴地钳制之后叠加，
-		// 使手动移动的位置不被每帧重排覆盖。自由移动不受贴地约束。
-		for(WindowDisplay d : list) {
-			if(d.manualOffset.lengthSqr() > 1e-12) {
-				d.pivot = d.pivot.add(d.manualOffset);
-			}
 		}
 	}
 
