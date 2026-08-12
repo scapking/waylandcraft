@@ -1167,9 +1167,9 @@ public class WaylandCraft implements ClientModInitializer {
 			return true;
 		}
 
-		// Ctrl + 方向键：**移动面前窗口 / 交换布局排序**（0=上 1=下 2=左 3=右）。
-		// 布局启用并初始化时：交换核心窗口与该方向窗口的排序（窗口真的移动，
-		// 无任何范围限制，左/右环绕、上/下跨层环绕，怎么排序都可以）。
+		// Ctrl + 方向键：**核心标记移动 / 自由移动面前窗口**（0=上 1=下 2=左 3=右）。
+		// 布局启用并初始化时：核心标记移动到该方向相邻窗口（核心身份转移，窗口位置不动，
+		// 指向谁谁就是核心窗口——青色轮廓高亮跟随标记；左/右环绕、上/下跨层环绕）。
 		// 布局未启用时：无条件调用 moveFrontWindow(dir)（v0.2.37 语义自由移动）。
 		if(action == GLFW.GLFW_PRESS && (modifiers & GLFW.GLFW_MOD_CONTROL) != 0) {
 			int dir = switch(key) {
@@ -1183,7 +1183,7 @@ public class WaylandCraft implements ClientModInitializer {
 				WaylandCraftCommon.LOGGER.info("[move] Ctrl+方向键 dir={} layoutEnabled={} layoutInit={} localDisplays={} sharedDisplays={}",
 					dir, layoutManager.isEnabled(), layoutManager.isInitialized(), displays.size(), sharedDisplays.size());
 				if(layoutManager.isEnabled() && layoutManager.isInitialized()) {
-					layoutManager.swapCore(dir);
+					layoutManager.moveCore(dir);
 				} else {
 					moveFrontWindow(dir);
 				}
