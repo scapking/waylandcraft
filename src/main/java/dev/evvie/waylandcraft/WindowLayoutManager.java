@@ -172,26 +172,19 @@ public class WindowLayoutManager {
 			String.format("%.2f", pos.x), String.format("%.2f", pos.y + 1.62), String.format("%.2f", pos.z), String.format("%.1f", yaw));
 	}
 
-	/** 同步持久顺序 ordered 与当前参与窗口列表：保留既有顺序，新窗口分配交替序号，消失移除 */
+	/**
+	 * 同步持久顺序 ordered 与当前参与窗口列表：保留既有顺序，新窗口分配交替序号，消失移除。
+	 *
+	 * 布局锚点 = 初始化坐标 + 朝向（固定中心），核心标记只在窗口之间转移（moveCore），
+	 * 窗口位置一旦分配就**永不移动**（绝不重排已有窗口）——模板稳定、切换无死循环。
+	 * 新窗口按交替序号（0=核心锚正面中心，1=右1, 2=左1, 3=右2, 4=左2…）继续扩散。
+	 */
 	private void syncOrdered(List<WindowDisplay> list) {
 		ordered.removeIf(d -> !list.contains(d));
 		// 新窗口
 		List<WindowDisplay> fresh = new ArrayList<>();
 		for(WindowDisplay d : list) {
 			if(!ordered.contains(d)) fresh.add(d);
-		}
-
-		// 核心始终作为布局锚点：身份变更（moveCore 转移）后，新窗口加入时把核心提到最前，
-		// 全量紧凑重排交替序号，布局以当前核心为中心重新扩散（核心固定前中，左右交替）。
-		// 注：moveCore 本身不改窗口位置（v0.6 身份转移语义），只在有新窗口加入时以新核心重排。
-		int ci = indexOfCore();
-		if(ci > 0) {
-			WindowDisplay core = ordered.remove(ci);
-			ordered.add(0, core);
-			for(int i = 0; i < ordered.size(); i++) {
-				ordered.get(i).layoutAltIndex = i; // 0=核心，1,2,3…=右1,左1,右2…（奇右偶左）
-			}
-			nextAltIndex = ordered.size();
 		}
 
 		if(fresh.isEmpty()) return;
@@ -262,6 +255,8 @@ public class WindowLayoutManager {
 
 		if(next < 0 || next >= n || next == idx) return false;
 		coreHandle = ((WLCToplevel) ordered.get(next).window).getHandle();
+		WaylandCraftCommon.LOGGER.info("[move] 核心 -> {} (dir={}, layerIdx={}/{})",
+			WaylandCraft.getWindowName((WLCToplevel) ordered.get(next).window), dir, next - start + 1, size);
 		return true;
 	}
 
