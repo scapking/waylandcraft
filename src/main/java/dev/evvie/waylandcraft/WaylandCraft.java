@@ -1425,10 +1425,25 @@ public class WaylandCraft implements ClientModInitializer {
 		};
 	}
 	
+	/**
+	 * 键码校正。**实测证据：GLFW 在 Linux（X11 与 Wayland）返回的 scancode 已经是
+	 * X11/xkb keycode（= evdev + 8）**：
+	 *   - 实测日志 mixin onPress key=87(W) scancode=25、key=280(CapsLock) scancode=66
+	 *     —— W 的 X11 keycode=25（evdev=17）、CapsLock 的 X11 keycode=66（evdev=58）。
+	 *
+	 * Rust 侧（keyboard_update_xkb / keyboard_key）统一用 `key - 8` 把这里传过去的
+	 * X11 keycode 还原为 evdev 键码：xkb_state 更新、pressed_keys、以及发往窗口的
+	 * wl_keyboard.key 键码（协议要求 evdev）全部正确。
+	 *
+	 * **曾经在这里 wayland 平台 `scancode += 8` 是"键盘穿透"总根因**：GLFW 已给
+	 * X11 keycode，再 +8 → evdev+16，Rust -8 还原后仍是 X11 keycode（evdev+8）→
+	 * 发给窗口的键码全部错位 +8：
+	 *   - Caps Lock 发 66（evdev 66 不是 Caps Lock）→ xkb 锁定位不翻转、Firefox 不切换 → 永远小写；
+	 *   - Ctrl_L 发 37（evdev 37 不是 Ctrl）→ 修饰键错位 → Ctrl+C/L 等快捷键全部失效；
+	 *   - 普通字母（W=25 → evdev 25=KEY_P）→ 窗口收到别的键。
+	 * 修复：不再 +8，原样返回（两个平台 GLFW 都已是 X11 keycode）。
+	 */
 	public static int correctScancode(int scancode) {
-		if(GLFW.glfwGetPlatform() == GLFW.GLFW_PLATFORM_WAYLAND) {
-			scancode += 8;
-		}
 		return scancode;
 	}
 	
