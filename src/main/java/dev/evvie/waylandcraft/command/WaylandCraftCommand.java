@@ -391,8 +391,8 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §e/wl take <handle>§7 — 从背包收回窗口物品§r"));
 		source.sendFeedback(Component.literal(" §e/wl capture§7      — 弹出Portal选择，捕获桌面窗口§r"));
 		source.sendFeedback(Component.literal(" §e/wl grab <handle>§7 — 抓取窗口，移动鼠标在世界中拖动§r"));
-		source.sendFeedback(Component.literal(" §e/wl show <handle>§7 — 在世界中显示窗口§r"));
-		source.sendFeedback(Component.literal(" §e/wl hide <handle>§7 — 从世界中隐藏窗口显示§r"));
+		source.sendFeedback(Component.literal(" §e/wl show <handle|all>§7 — 在世界中显示窗口（all 一键全部）§r"));
+		source.sendFeedback(Component.literal(" §e/wl hide <handle|all>§7 — 从世界中隐藏窗口显示（all 一键全部）§r"));
 		source.sendFeedback(Component.literal(" §e/wl pin <handle>§7  — 钉住窗口（世界中保持显示，不受隐藏/最小化影响）§r"));
 		source.sendFeedback(Component.literal(" §e/wl unpin <handle>§7— 解除钉住§r"));
 		source.sendFeedback(Component.literal(" §e/wl close <handle>§7— 终止应用进程（关闭窗口）§r"));
@@ -810,6 +810,36 @@ public class WaylandCraftCommand {
 		FabricClientCommandSource source = context.getSource();
 		String handleStr = StringArgumentType.getString(context, "handle");
 
+		// 一键显示全部窗口：/wl show all（或 *）
+		if(handleStr.equalsIgnoreCase("all") || handleStr.equals("*")) {
+			WaylandCraft wlc = WaylandCraft.instance;
+			if(wlc == null || wlc.bridge == null) {
+				source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+				return 0;
+			}
+			WLCToplevel[] toplevels = wlc.bridge.getToplevels();
+			if(toplevels == null || toplevels.length == 0) {
+				source.sendError(Component.literal("§c✘ 没有可显示的窗口（未捕获任何 Wayland 窗口）§r"));
+				return 0;
+			}
+			Minecraft mc = Minecraft.getInstance();
+			Camera camera = mc.gameRenderer.getMainCamera();
+			int shown = 0, already = 0;
+			for(WLCToplevel toplevel : toplevels) {
+				boolean existed = wlc.hasDisplayFor(toplevel);
+				WindowDisplay display = wlc.getOrCreateDisplay(toplevel);
+				if(!existed) {
+					display.anchorToCamera(camera);
+					display.clampVertical();
+					shown++;
+				} else {
+					already++;
+				}
+			}
+			source.sendFeedback(Component.literal("§a✔ 已显示 §f" + shown + "§a 个窗口" + (already > 0 ? "（§7" + already + " 个原本已显示§a）" : "") + "§r"));
+			return shown > 0 ? 1 : 0;
+		}
+
 		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
 		if(toplevel == null) return 0;
 
@@ -845,6 +875,25 @@ public class WaylandCraftCommand {
 	private static int hideWindow(CommandContext<FabricClientCommandSource> context) {
 		FabricClientCommandSource source = context.getSource();
 		String handleStr = StringArgumentType.getString(context, "handle");
+
+		// 一键隐藏全部窗口：/wl hide all（或 *）
+		if(handleStr.equalsIgnoreCase("all") || handleStr.equals("*")) {
+			WaylandCraft wlc = WaylandCraft.instance;
+			if(wlc == null) {
+				source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+				return 0;
+			}
+			int hidden = wlc.displays.size();
+			if(hidden == 0) {
+				source.sendError(Component.literal("§c✘ 当前没有任何在世界中显示的窗口§r"));
+				return 0;
+			}
+			// 批量隐藏时一并解除钉住
+			wlc.pinnedToplevel = null;
+			wlc.displays.clear();
+			source.sendFeedback(Component.literal("§a✔ 已隐藏全部 §f" + hidden + "§a 个窗口§7（钉住已一并解除，窗口管理屏中仍可见）§r"));
+			return 1;
+		}
 
 		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
 		if(toplevel == null) return 0;
