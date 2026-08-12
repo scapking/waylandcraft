@@ -387,17 +387,26 @@ impl WLCSeatState {
     }
 
     pub fn keyboard_update_xkb(&mut self, key: u32, pressed: bool) {
-        // Java 侧 correctScancode 在 wayland 平台给 scancode +8（X11 风格键码），
-        // keyboard_key 发 wire 事件时用 `key - 8` 还原为 evdev/wayland 键码。
-        // xkb_state 必须用与 wl_keyboard.key 完全相同的键码更新，否则修饰键
-        // （Shift/Ctrl/Alt/Super）的 mods 状态全部错位 → 应用永远收不到组合键：
-        // 单键正常（key 事件照发），但 Ctrl+B / Shift+字母 等快捷键全部失效。
-        // 修复前这里直接用 key（evdev+8）更新 xkb → serialize_mods 报 0 修饰。
+        // 键码体系（三套，别混）：
+        //   Java scancode（correctScancode 后）= X11 keycode = evdev + 8
+        //   wl_keyboard.key 协议要求 evdev 键码（Linux input 定义，无 +8）
+        //   xkbcommon Keycode 要求 xkb keycode = evdev + 8 = 与 Java scancode 相同
+        //
+        // 因此：
+        //   - keyboard_key 发 wire 事件：key - 8 → evdev（协议正确）
+        //   - keyboard_update_xkb 更新 xkb_state：直接用 key（= xkb keycode）
+        //
+        // v0.9.6 曾误用 `key - 8`（evdev）更新 xkb_state —— xkbcommon 认为 8 以下
+        // 是保留 keycode，29/38 等 evdev 值不是有效 xkb keycode → update_key 静默
+        // 无效 → Ctrl/Shift/Alt 的 mods 永远置不上（kb.log 里 mods(depressed=0)
+        // 与 Ctrl 按下共存就是证据）→ 窗口收不到修饰键 → Ctrl+L 等组合键全失效。
+        // 单键不依赖 mods 所以"看起来正常"，实际窗口拿到的 modifiers 事件恒为 0。
+        //
         // 只有 PRESS/RELEASE 会走到这里（Java 侧 KeyboardHandlerMixin 只在
         // GLFW_PRESS/GLFW_RELEASE 时调 keyboardUpdate；REPEAT 不调），因此
         // repeat 天然不会重复改变状态机 —— 这正是"长按不重复触发 Caps Lock
         // 切换、不重复进入 Shift/Ctrl"的关键。
-        let code = xkb::Keycode::new(key.saturating_sub(8));
+        let code = xkb::Keycode::new(key);
         let dir = match pressed {
             true => xkb::KeyDirection::Down,
             false => xkb::KeyDirection::Up,
