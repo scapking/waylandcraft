@@ -127,6 +127,9 @@ public class WaylandCraft implements ClientModInitializer {
 	
 	// 诊断：本地键盘首次转发已打日志（避免每键刷屏）
 	private boolean keyboardForwardLogged = false;
+	// 诊断：tick 焦点日志降噪（窗口变化或 ≥5s 才打一次）
+	private String lastFocusLogTitle = "";
+	private long lastFocusLogTime = 0;
 	
 	// 当前 hover 的共享窗口（手机端 viewer-only 无本地窗口时也可用；与 hoveredDisplay 互斥）
 	public SharedWindowDisplay hoveredSharedDisplay = null;
@@ -438,11 +441,19 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 		if(kbFocus != null) {
 			bridge.focusSurface(kbFocus);
-			// 只对"绑定/每 tick"这类低频入口打 info；onKeyPress 高频入口不打（避免刷屏）
+			// 日志降噪：tick 每帧调用，只在"焦点窗口变化"或"距上次 ≥5 秒"时打一次，
+			// 避免每秒刷 20 行淹没按键日志；onKeyPress 入口不打（高频）。
 			if(!"onKeyPress".equals(origin)) {
-				WaylandCraftCommon.LOGGER.info("[kb] {} 焦点={} (来源={}, hovered={}, displays={})",
-					origin, WaylandCraft.getWindowName(kbFocus), source,
-					hoveredDisplay != null ? "yes" : "no", displays.size());
+				String title = WaylandCraft.getWindowName(kbFocus);
+				long now = System.currentTimeMillis();
+				boolean changed = !title.equals(lastFocusLogTitle);
+				if(changed || now - lastFocusLogTime > 5000) {
+					lastFocusLogTitle = title;
+					lastFocusLogTime = now;
+					WaylandCraftCommon.LOGGER.info("[kb] {} 焦点={} (来源={}, hovered={}, displays={})",
+						origin, title, source,
+						hoveredDisplay != null ? "yes" : "no", displays.size());
+				}
 			}
 		} else {
 			WaylandCraftCommon.LOGGER.warn("[kb] {} 无任何可聚焦窗口（displays={} toplevels={}）——按键将全部被 Rust 丢弃",
