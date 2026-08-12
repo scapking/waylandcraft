@@ -132,10 +132,15 @@ public class WaylandCraft implements ClientModInitializer {
 	public double hoveredSharedY = 0;
 	// 键盘捕获绑定的共享窗口（G/J 后按键走网络转发；与 pointerCapture 对应）
 	public SharedWindowDisplay sharedKeyboardCapture = null;
+	// 共享窗口"游戏模式"指针捕获：J 绑定共享窗口后，鼠标事件全部转发该窗口（即使不 hover）
+	public SharedPointerCapture sharedPointerCapture = null;
 	// 共享窗口键盘转发配对跟踪：press 记入、release 移除；hover/绑定窗口切换或退出绑定时
 	// 向旧窗口补发 release——防止远端窗口一直维持 Shift/CapsLock 等按键状态（"卡住大小写"）
 	private long lastKeyForwardHandle = -1;
 	private final java.util.HashSet<Integer> pressedForwardKeys = new java.util.HashSet<>();
+	// 已发送给共享窗口的修饰键掩码（GLFW_MOD_*）：转发普通键前把远端修饰键状态对齐到
+	// 本次事件的 modifiers，保证 Ctrl/Shift/Alt 组合键在远端生效（GLFW 漏发修饰键事件时也能兜底）
+	private int forwardedMods = 0;
 	// MOUSE_MOVE 转发节流：上次发送的窗口/像素/时间
 	private long lastSharedMouseHandle = -1;
 	private double lastSharedMouseX = Double.NaN;
@@ -335,9 +340,12 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		// 共享窗口优先：hover 共享窗口时绑定到共享窗口。
 		// 手机端 viewer-only（bridge==null）本地窗口不可用，共享窗口是唯一可捕获对象。
+		// 共享窗口同样进入"游戏模式"：键盘 + 指针全部锁定到该窗口（指针不再依赖 hover）。
 		if(hoveredSharedDisplay != null) {
 			keyboardCaptureMode = hardCapture ? KeyboardCaptureMode.HARD_CAPTURE : KeyboardCaptureMode.CAPTURE;
 			sharedKeyboardCapture = hoveredSharedDisplay;
+			sharedPointerCapture = new SharedPointerCapture(
+				hoveredSharedDisplay.getWindowHandle(), hoveredSharedDisplay, hoveredSharedX, hoveredSharedY);
 			return;
 		}
 		
@@ -348,13 +356,18 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		// 立即绑定当前 hover 的窗口（键盘+鼠标一步到位，不用等下一次指针移动）：
 		// 进入绑定 = 键盘捕获 + 鼠标锁定（视角不再移动，鼠标事件全部转发该窗口）。
+		// 关键修复：不再用 bridge.maybeLockPointer 作为创建 pointerCapture 的前提——
+		// 那要求被控应用自己申请过 zwp_pointer_constraints 指针锁（浏览器/桌面应用都不会），
+		// 导致 J 绑定后鼠标事件依然落到 Minecraft。现在一律创建捕获：
+		//   应用已申请锁 → relativeLocked，用相对移动；
+		//   未申请（浏览器）→ 绝对虚拟光标（onMouseTurn 里 sendMotionRefocus 移动窗口内光标）。
 		// 若玩家没 hover 窗口，鼠标仍可自由转动视角，直到 hover 到窗口才锁定。
 		if(hoveredDisplay != null && hoveredDisplay.dist >= 0) {
 			WLCSurface surface = hoveredDisplay.surface;
 			Vec3 rel = hoveredDisplay.surfaceLocalRelative;
-			if(bridge.maybeLockPointer(surface)) {
-				pointerCapture = new PointerCapture(surface, rel.x, rel.y);
-			}
+			PointerCapture pc = new PointerCapture(surface, rel.x, rel.y);
+			pc.relativeLocked = bridge.maybeLockPointer(surface);
+			pointerCapture = pc;
 		}
 	}
 	
@@ -374,6 +387,8 @@ public class WaylandCraft implements ClientModInitializer {
 		// 第一步：解除键盘绑定（恢复 Minecraft 角色控制）
 		keyboardCaptureMode = KeyboardCaptureMode.NONE;
 		sharedKeyboardCapture = null;
+		sharedPointerCapture = null;
+		forwardedMods = 0;
 		// 第二步：解除鼠标绑定（恢复视角控制）
 		if(bridge != null) {
 			bridge.deactivateKeyboard();
@@ -594,6 +609,7 @@ public class WaylandCraft implements ClientModInitializer {
 	 * - 非窗口状态 → 返回 null（Minecraft 默认光标）。
 	 */
 	private CursorShape controlCursor() {
+		if(sharedPointerCapture != null) return CursorShape.HIDE;
 		if(pointerCapture != null) return CursorShape.HIDE;
 		if(settings != null && settings.getHideCursor()) return CursorShape.HIDE;
 		return bridge.getCursorShape();
@@ -601,6 +617,16 @@ public class WaylandCraft implements ClientModInitializer {
 	
 	private void processPointerMotion(Camera camera) {
 		this.cursorShape = null;
+		
+		// 共享窗口"游戏模式"：指针已锁定到绑定窗口，跳过 hover 检测（视角不转、鼠标全进窗口）
+		if(sharedPointerCapture != null) {
+			if(sharedPointerCapture.display == null || !sharedPointerCapture.display.isValid()) {
+				disableKeyboardCapture();
+				return;
+			}
+			this.cursorShape = CursorShape.HIDE;
+			return;
+		}
 		
 		if(pointerCapture != null) {
 			if(!pointerCapture.surface.isAlive()) {
@@ -610,9 +636,9 @@ public class WaylandCraft implements ClientModInitializer {
 			
 			this.cursorShape = controlCursor();
 			
-			if(!bridge.maybeLockPointer(pointerCapture.surface)) {
-				disablePointerCapture();
-			}
+			// 修复：不再因 maybeLockPointer 失败就解除捕获（浏览器从未申请指针锁）。
+			// 捕获是否激活由 onMouseTurn 里的 relativeLocked 决定相对/绝对光标，
+			// 这里只保留捕获本身（surface 存活即有效），鼠标事件全部转发绑定窗口。
 			
 			return;
 		}
@@ -750,8 +776,11 @@ public class WaylandCraft implements ClientModInitializer {
 			if(bridge != null) this.cursorShape = controlCursor();
 			bridge.sendMotionRefocus(surface, rel.x, rel.y);
 			
-			if(keyboardCaptureMode != KeyboardCaptureMode.NONE && bridge.maybeLockPointer(surface)) {
-				pointerCapture = new PointerCapture(surface, rel.x, rel.y);
+			if(keyboardCaptureMode != KeyboardCaptureMode.NONE) {
+				// 绑定中 hover 到窗口 → 立即锁定鼠标（不再要求应用申请过指针锁）
+				PointerCapture pc = new PointerCapture(surface, rel.x, rel.y);
+				pc.relativeLocked = bridge.maybeLockPointer(surface);
+				pointerCapture = pc;
 			}
 			
 			// Focus on hover
@@ -780,6 +809,23 @@ public class WaylandCraft implements ClientModInitializer {
 			else if(action == 0) {
 				// Forward release to minecraft if it wasn't part of this pointer capture
 				return false;
+			}
+			return true;
+		}
+		
+		// 共享窗口"游戏模式"：点击/释放发往绑定窗口的虚拟光标位置（不再依赖 hover）
+		if(sharedPointerCapture != null) {
+			long handle = sharedPointerCapture.windowHandle;
+			if(action == 1) {
+				if(!sharedPointerCapture.pressedButtons.contains(button)) {
+					SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.MOUSE_CLICK,
+							sharedPointerCapture.x, sharedPointerCapture.y, glfwButtonToX11(button), 0);
+					sharedPointerCapture.pressedButtons.add(button);
+				}
+			} else if(action == 0 && sharedPointerCapture.pressedButtons.contains(button)) {
+				SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.MOUSE_RELEASE,
+						sharedPointerCapture.x, sharedPointerCapture.y, glfwButtonToX11(button), 0);
+				sharedPointerCapture.pressedButtons.remove(button);
 			}
 			return true;
 		}
@@ -839,9 +885,45 @@ public class WaylandCraft implements ClientModInitializer {
 	 * Returns true when the mouse move has been consumed
 	 */
 	public boolean onMouseTurn(double dx, double dy) {
+		// 共享窗口"游戏模式"：鼠标移动 → 绑定窗口内虚拟光标移动（视角不再转动）
+		if(sharedPointerCapture != null) {
+			SharedWindowDisplay d = sharedPointerCapture.display;
+			if(d == null || !d.isValid()) {
+				disableKeyboardCapture();
+				return true;
+			}
+			double w = d.getWidth() > 0 ? d.getWidth() : 1;
+			double h = d.getHeight() > 0 ? d.getHeight() : 1;
+			double nx = Math.max(0, Math.min(w, sharedPointerCapture.x + dx));
+			double ny = Math.max(0, Math.min(h, sharedPointerCapture.y + dy));
+			if(nx != sharedPointerCapture.x || ny != sharedPointerCapture.y) {
+				sharedPointerCapture.x = nx;
+				sharedPointerCapture.y = ny;
+				SharedWindowClientHandler.sendInteraction(sharedPointerCapture.windowHandle,
+						SharedWindowInteractionPayload.InteractionType.MOUSE_MOVE, nx, ny, 0, 0);
+			}
+			return true;
+		}
+		
 		if(pointerCapture == null) return false;
 		
-		bridge.sendRelativeMotion(dx, dy);
+		// 应用申请过指针锁（游戏类）→ 相对移动（原路径）
+		if(pointerCapture.relativeLocked) {
+			bridge.sendRelativeMotion(dx, dy);
+		}
+		else {
+			// 浏览器/桌面应用未申请指针锁 → 绝对虚拟光标：鼠标移动换算成窗口内像素移动，
+			// 用 sendMotionRefocus 移动窗口内光标（应用自身光标会跟随，点击落在光标处）。
+			double w = Math.max(1, pointerCapture.surface.width());
+			double h = Math.max(1, pointerCapture.surface.height());
+			double nx = Math.max(0, Math.min(w, pointerCapture.x + dx));
+			double ny = Math.max(0, Math.min(h, pointerCapture.y + dy));
+			if(nx != pointerCapture.x || ny != pointerCapture.y) {
+				pointerCapture.x = nx;
+				pointerCapture.y = ny;
+				bridge.sendMotionRefocus(pointerCapture.surface, pointerCapture.x, pointerCapture.y);
+			}
+		}
 		return true;
 	}
 	
@@ -862,6 +944,15 @@ public class WaylandCraft implements ClientModInitializer {
 
 		if(pointerGrabs.isExclusiveGrabActive()) {
 			pointerGrabs.onScroll(scrollX, scrollY);
+			return true;
+		}
+		
+		// 共享窗口"游戏模式"：滚轮发往绑定窗口（即使不 hover）
+		if(sharedPointerCapture != null) {
+			int data = ((int) Math.round(scrollX * 100) & 0xFFFF) | (((int) Math.round(scrollY * 100) & 0xFFFF) << 16);
+			SharedWindowClientHandler.sendInteraction(sharedPointerCapture.windowHandle,
+					SharedWindowInteractionPayload.InteractionType.SCROLL,
+					sharedPointerCapture.x, sharedPointerCapture.y, data, 0);
 			return true;
 		}
 		
@@ -926,16 +1017,21 @@ public class WaylandCraft implements ClientModInitializer {
 	 */
 	// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
 	public boolean onKeyPress(long windowHandle, int key, int scancode, int action, int modifiers) {
-		// J 键：一键绑定/解绑键盘捕获（锁定 hover 窗口的键盘+鼠标）。
-		// 按下 = 绑定（键盘+鼠标一步到位，鼠标事件全部到该窗口）；再按 = 全部解绑退出。
+		// J 键：进入"游戏模式"（绑定键盘+鼠标，鼠标事件全部进窗口、隐藏鼠标）。
+		// 用户需求：J 默认进入绑定，**按 ESC 之前不退出**——已在绑定中时再按 J 不解除，
+		// 只提示按 ESC 退出。
 		if(key == GLFW.GLFW_KEY_J) {
 			if(action == 0) return true;
 
 			if(keyboardCaptureMode == KeyboardCaptureMode.NONE) {
+				if(bridge == null && hoveredSharedDisplay == null) {
+					Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 没有可捕获的窗口（对准一个窗口再按 J）"), false);
+					return true;
+				}
 				enableKeyboardCapture(true);
 			}
 			else {
-				disableKeyboardCapture();
+				Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 已在绑定模式，按 ESC 退出"), false);
 			}
 			return true;
 		}
@@ -976,7 +1072,7 @@ public class WaylandCraft implements ClientModInitializer {
 		if(keyboardCaptureMode == KeyboardCaptureMode.NONE) {
 			// 未捕获：hover 共享窗口时按键直接转发（对准窗口即操作窗口，无需先绑定）
 			if(hoveredSharedDisplay != null) {
-				forwardSharedKey(hoveredSharedDisplay.getWindowHandle(), key, action);
+				forwardSharedKey(hoveredSharedDisplay.getWindowHandle(), key, action, modifiers);
 				return true;
 			}
 			// hover 已丢失：补发旧窗口仍按住的键 release（防止远端窗口卡 Shift/CapsLock）
@@ -988,7 +1084,7 @@ public class WaylandCraft implements ClientModInitializer {
 
 		// 共享键盘捕获：按键走网络转发到发送端注入真实窗口
 		if(sharedKeyboardCapture != null) {
-			forwardSharedKey(sharedKeyboardCapture.getWindowHandle(), key, action);
+			forwardSharedKey(sharedKeyboardCapture.getWindowHandle(), key, action, modifiers);
 			return true;
 		}
 
@@ -1004,13 +1100,43 @@ public class WaylandCraft implements ClientModInitializer {
 		return true;
 	}
 
-	/** 转发单个按键到共享窗口（配对跟踪：press 记入、release 移除；目标窗口切换时先补发旧窗口 release，防卡键） */
-	private void forwardSharedKey(long handle, int key, int action) {
-		int keysym = glfwKeyToKeysym(key);
+	/**
+	 * 转发单个按键到共享窗口（配对跟踪：press 记入、release 移除；目标窗口切换时先补发旧窗口 release，防卡键）。
+	 *
+	 * 修饰键处理（修复"浏览器快捷键失效/只有单键有效"）：
+	 *  - 修饰键事件本身：立即转发 press/release，并更新 forwardedMods；
+	 *  - 普通键事件：先调用 syncForwardedModifiers 把远端修饰键状态对齐到本次事件的
+	 *    modifiers（只发差异），再转发该键。这样即使某些平台（如 Android 物理键盘）
+	 *    GLFW 漏发修饰键事件，只要普通键事件的 modifiers 正确，组合键就能在远端生效。
+	 */
+	private void forwardSharedKey(long handle, int key, int action, int modifiers) {
 		if(handle != lastKeyForwardHandle) {
 			releaseAllForwardedKeys(lastKeyForwardHandle);
 			lastKeyForwardHandle = handle;
 		}
+
+		// 修饰键：按事件本身更新状态并转发（忽略 event.modifiers，避免重复/错乱）
+		int modBit = glfwModifierBit(key);
+		if(modBit != 0) {
+			if(action == GLFW.GLFW_PRESS) {
+				if((forwardedMods & modBit) == 0) {
+					forwardedMods |= modBit;
+					forwardModifierKey(handle, key, true);
+				}
+			}
+			else if(action == GLFW.GLFW_RELEASE) {
+				if((forwardedMods & modBit) != 0) {
+					forwardedMods &= ~modBit;
+					forwardModifierKey(handle, key, false);
+				}
+			}
+			return;
+		}
+
+		// 普通键：先把远端修饰键状态同步到本次事件的 modifiers，再转发该键
+		syncForwardedModifiers(handle, modifiers);
+
+		int keysym = glfwKeyToKeysym(key);
 		if(action == GLFW.GLFW_PRESS) {
 			pressedForwardKeys.add(keysym);
 			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_PRESS,
@@ -1023,8 +1149,62 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 	}
 
+	/** 转发单个修饰键 press/release（与普通键同一配对集合，releaseAllForwardedKeys 统一兜底） */
+	private void forwardModifierKey(long handle, int key, boolean pressed) {
+		int keysym = glfwKeyToKeysym(key);
+		if(pressed) {
+			pressedForwardKeys.add(keysym);
+			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_PRESS,
+					0, 0, 0, keysym);
+		}
+		else {
+			pressedForwardKeys.remove(keysym);
+			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_RELEASE,
+					0, 0, 0, keysym);
+		}
+	}
+
+	/**
+	 * 把远端修饰键状态对齐到 desiredMods（GLFW_MOD_* 掩码），只发差异。
+	 * 保证 Ctrl+B / Shift+字母 / Ctrl+C/V 等组合键在远端 X11 窗口生效。
+	 */
+	private void syncForwardedModifiers(long handle, int desiredMods) {
+		final int[] modKeys = {
+			GLFW.GLFW_KEY_LEFT_CONTROL, GLFW.GLFW_KEY_LEFT_SHIFT,
+			GLFW.GLFW_KEY_LEFT_ALT, GLFW.GLFW_KEY_LEFT_SUPER
+		};
+		final int[] modBits = {
+			GLFW.GLFW_MOD_CONTROL, GLFW.GLFW_MOD_SHIFT,
+			GLFW.GLFW_MOD_ALT, GLFW.GLFW_MOD_SUPER
+		};
+		for(int i = 0; i < modBits.length; i++) {
+			boolean want = (desiredMods & modBits[i]) != 0;
+			boolean have = (forwardedMods & modBits[i]) != 0;
+			if(want && !have) {
+				forwardedMods |= modBits[i];
+				forwardModifierKey(handle, modKeys[i], true);
+			}
+			else if(!want && have) {
+				forwardedMods &= ~modBits[i];
+				forwardModifierKey(handle, modKeys[i], false);
+			}
+		}
+	}
+
+	/** GLFW key → GLFW_MOD_* 位（非修饰键返回 0） */
+	private static int glfwModifierBit(int key) {
+		return switch(key) {
+			case GLFW.GLFW_KEY_LEFT_CONTROL, GLFW.GLFW_KEY_RIGHT_CONTROL -> GLFW.GLFW_MOD_CONTROL;
+			case GLFW.GLFW_KEY_LEFT_SHIFT, GLFW.GLFW_KEY_RIGHT_SHIFT -> GLFW.GLFW_MOD_SHIFT;
+			case GLFW.GLFW_KEY_LEFT_ALT, GLFW.GLFW_KEY_RIGHT_ALT -> GLFW.GLFW_MOD_ALT;
+			case GLFW.GLFW_KEY_LEFT_SUPER, GLFW.GLFW_KEY_RIGHT_SUPER -> GLFW.GLFW_MOD_SUPER;
+			default -> 0;
+		};
+	}
+
 	/** 向窗口补发所有仍按住的键的 release（窗口切换/退出绑定时调用，防止远端窗口卡 Shift/CapsLock） */
 	private void releaseAllForwardedKeys(long handle) {
+		forwardedMods = 0;
 		if(handle < 0 || pressedForwardKeys.isEmpty()) return;
 		for(int keysym : pressedForwardKeys) {
 			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_RELEASE,
@@ -1198,10 +1378,36 @@ public class WaylandCraft implements ClientModInitializer {
 		public double x;
 		public double y;
 		
+		// 应用是否申请过 zwp_pointer_constraints 指针锁（游戏类）：
+		// true → onMouseTurn 用 sendRelativeMotion（相对移动，锁内标准路径）；
+		// false（浏览器/桌面应用）→ 用绝对虚拟光标 sendMotionRefocus 移动窗口内光标。
+		public boolean relativeLocked = false;
+		
 		public HashSet<Integer> pressedButtons = new HashSet<Integer>();
 		
 		public PointerCapture(WLCSurface surface, double x, double y) {
 			this.surface = surface;
+			this.x = x;
+			this.y = y;
+		}
+		
+	}
+	
+	/** 共享窗口"游戏模式"指针捕获：J 绑定共享窗口后鼠标事件全部转发该窗口（不依赖 hover） */
+	public static class SharedPointerCapture {
+		
+		public final long windowHandle;
+		public final SharedWindowDisplay display;
+		
+		// 窗口内虚拟光标位置（像素，相对窗口左上角，含 xoff/yoff）
+		public double x;
+		public double y;
+		
+		public HashSet<Integer> pressedButtons = new HashSet<Integer>();
+		
+		public SharedPointerCapture(long windowHandle, SharedWindowDisplay display, double x, double y) {
+			this.windowHandle = windowHandle;
+			this.display = display;
 			this.x = x;
 			this.y = y;
 		}

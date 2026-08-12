@@ -340,17 +340,25 @@ impl WLCSeatState {
     }
 
     pub fn keyboard_update_xkb(&mut self, key: u32, pressed: bool) {
+        // Java 侧 correctScancode 在 wayland 平台给 scancode +8（X11 风格键码），
+        // keyboard_key 发 wire 事件时用 `key - 8` 还原为 evdev/wayland 键码。
+        // xkb_state 必须用与 wl_keyboard.key 完全相同的键码更新，否则修饰键
+        // （Shift/Ctrl/Alt/Super）的 mods 状态全部错位 → 应用永远收不到组合键：
+        // 单键正常（key 事件照发），但 Ctrl+B / Shift+字母 等快捷键全部失效。
+        // 修复前这里直接用 key（evdev+8）更新 xkb → serialize_mods 报 0 修饰。
+        let code = xkb::Keycode::new(key.saturating_sub(8));
         let dir = match pressed {
             true => xkb::KeyDirection::Down,
             false => xkb::KeyDirection::Up,
         };
-        let code = xkb::Keycode::new(key);
         self.xkb_state.update_key(code, dir);
 
+        // pressed_keys 用于 keyboard.enter 的按下键数组，同样必须是 wire 键码（evdev）
+        let wire = key.saturating_sub(8);
         if pressed {
-            self.pressed_keys.insert(key);
+            self.pressed_keys.insert(wire);
         } else {
-            self.pressed_keys.remove(&key);
+            self.pressed_keys.remove(&wire);
         }
     }
 

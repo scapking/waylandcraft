@@ -84,6 +84,20 @@ public class SharedWindowDisplay {
 	}
 	
 	/**
+	 * 获取窗口 framebuffer 宽度（像素；未更新时返回 0）
+	 */
+	public int getWidth() {
+		return width;
+	}
+	
+	/**
+	 * 获取窗口 framebuffer 高度（像素；未更新时返回 0）
+	 */
+	public int getHeight() {
+		return height;
+	}
+	
+	/**
 	 * 获取窗口标题
 	 */
 	public String getWindowTitle() {

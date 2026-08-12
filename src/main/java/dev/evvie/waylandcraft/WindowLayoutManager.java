@@ -181,9 +181,14 @@ public class WindowLayoutManager {
 			if(!ordered.contains(d)) fresh.add(d);
 		}
 
-		// 核心始终作为布局锚点：身份变更（moveCore 转移）后，新窗口加入时把核心提到最前，
+		if(fresh.isEmpty()) return;
+
+		// 核心始终作为布局锚点：身份变更（moveCore 转移）后，只有**新窗口加入**时才把核心提到最前，
 		// 全量紧凑重排交替序号，布局以当前核心为中心重新扩散（核心固定前中，左右交替）。
-		// 注：moveCore 本身不改窗口位置（v0.6 身份转移语义），只在有新窗口加入时以新核心重排。
+		// 注：moveCore 本身不改窗口位置（v0.6 身份转移语义）。
+		// 关键：此重排**绝不能每 tick 无条件执行**——否则 moveCore 后下一 tick 就会把新核心提到
+		// 最前并把旧核心排到"右1"，随后 Ctrl+右永远只能在新旧核心之间往返（2 窗口死循环），
+		// 几何方向切换失效。只有 fresh 非空（真有新窗口要扩散）时才重排。
 		int ci = indexOfCore();
 		if(ci > 0) {
 			WindowDisplay core = ordered.remove(ci);
@@ -193,8 +198,6 @@ public class WindowLayoutManager {
 			}
 			nextAltIndex = ordered.size();
 		}
-
-		if(fresh.isEmpty()) return;
 
 		// 交替序号分配：首窗=0（核心锚），之后递增（1=右1, 2=左1, 3=右2, 4=左2…）。
 		// 序号即左右交替位置，与 arrangeCube 的交替角度 [0°, +1, -1, +2, -2, …] 严格对应，
