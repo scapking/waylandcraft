@@ -204,8 +204,8 @@ Iris を自動検出し、バニラのエンティティ描画パイプライン
 
 | コマンド | 用途 |
 |----------|------|
-| `/wl share start <handle>` | 共有を開始 |
-| `/wl share stop <handle>` | 共有を停止 |
+| `/wl share start <handle>` | 共有を開始（`all` / `*` = 全ウィンドウを一括共有） |
+| `/wl share stop <handle>` | 共有を停止（`all` / `*` = すべて停止） |
 | `/wl share quality <handle> <s> <q> <fps>` | スケール/品質/フレームレートを設定 |
 | `/wl share preset <handle> <preset>` | プリセット適用（[設定](#️-設定)参照） |
 | `/wl share config <handle> <param> <value>` | 単一パラメータ調整 |

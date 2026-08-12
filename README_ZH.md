@@ -204,8 +204,8 @@
 
 | 命令 | 作用 |
 |------|------|
-| `/wl share start <handle>` | 开始共享窗口 |
-| `/wl share stop <handle>` | 停止共享 |
+| `/wl share start <handle>` | 开始共享窗口（`all` / `*` = 一键共享全部） |
+| `/wl share stop <handle>` | 停止共享（`all` / `*` = 停止全部） |
 | `/wl share quality <handle> <s> <q> <fps>` | 设置缩放/质量/帧率 |
 | `/wl share preset <handle> <preset>` | 应用预设（见 [配置](#️-配置)） |
 | `/wl share config <handle> <param> <value>` | 调整单个参数 |

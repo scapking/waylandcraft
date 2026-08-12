@@ -210,8 +210,8 @@ Windows can be arranged automatically around a fixed initialized origin (they no
 
 | Command | Purpose |
 |---------|---------|
-| `/wl share start <handle>` | Start sharing a window |
-| `/wl share stop <handle>` | Stop sharing |
+| `/wl share start <handle>` | Start sharing a window (`all` / `*` = share every window) |
+| `/wl share stop <handle>` | Stop sharing (`all` / `*` = stop all) |
 | `/wl share quality <handle> <s> <q> <fps>` | Set scale / quality / framerate |
 | `/wl share preset <handle> <preset>` | Apply a preset (see [Configuration](#️-configuration)) |
 | `/wl share config <handle> <param> <value>` | Tune a single parameter |

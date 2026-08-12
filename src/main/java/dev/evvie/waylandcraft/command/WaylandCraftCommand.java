@@ -2,6 +2,7 @@ package dev.evvie.waylandcraft.command;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
@@ -397,7 +398,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §e/wl close <handle>§7— 终止应用进程（关闭窗口）§r"));
 		source.sendFeedback(Component.literal(" §e/wl resize <handle> <w> <h>§7 — 调整窗口分辨率§r"));
 		source.sendFeedback(Component.literal(" §e/wl settings list|set <key> <value>§7 — 查看/修改设置§r"));
-		source.sendFeedback(Component.literal(" §e/wl share start|stop|quality|preset|config|reset|info|resolution|stats <handle> [...]§7 — 共享管理§r"));
+		source.sendFeedback(Component.literal(" §e/wl share start|stop|quality|preset|config|reset|info|resolution|stats <handle> [...]§7 — 共享管理（start/stop 支持 all 一键全部）§r"));
 		source.sendFeedback(Component.literal(" §e/wl permission list|default|allow|deny|remove§7 — 共享权限管理§r"));
 		source.sendFeedback(Component.literal(" §e/wl pos <handle>§7 — 查看窗口位置/朝向/缩放/分辨率§r"));
 		source.sendFeedback(Component.literal(" §e/wl move <handle> <x> <y> <z>§7 — 设置窗口坐标（绝对如 §e100.5§7 或相对如 §e~0.5§7 / §e~§7）§r"));
@@ -1857,6 +1858,34 @@ public class WaylandCraftCommand {
 		FabricClientCommandSource source = context.getSource();
 		String handleStr = StringArgumentType.getString(context, "handle");
 
+		// 一键共享全部窗口：/wl share start all（或 *）
+		if(handleStr.equalsIgnoreCase("all") || handleStr.equals("*")) {
+			WaylandCraft wlc = WaylandCraft.instance;
+			if(wlc == null || wlc.bridge == null) {
+				source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+				return 0;
+			}
+			WLCToplevel[] toplevels = wlc.bridge.getToplevels();
+			if(toplevels == null || toplevels.length == 0) {
+				source.sendError(Component.literal("§c✘ 没有可共享的窗口（未捕获任何 Wayland 窗口）§r"));
+				return 0;
+			}
+			int shared = 0, skipped = 0;
+			for(WLCToplevel toplevel : toplevels) {
+				String displayName = getWindowDisplayName(toplevel);
+				boolean ok;
+				if(wlc.windowShareManager != null) {
+					ok = wlc.windowShareManager.startSharing(toplevel.getHandle(), displayName);
+				} else {
+					SharedWindowClientHandler.requestWindowRegister(toplevel.getHandle(), displayName);
+					ok = true;
+				}
+				if(ok) shared++; else skipped++;
+			}
+			source.sendFeedback(Component.literal("§a✔ 已共享 §f" + shared + "§a 个窗口" + (skipped > 0 ? "（§7跳过 " + skipped + " 个已共享/失败§a）" : "") + "§r"));
+			return shared > 0 ? 1 : 0;
+		}
+
 		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
 		if(toplevel == null) return 0;
 
@@ -1874,6 +1903,26 @@ public class WaylandCraftCommand {
 	private static int unshareWindow(CommandContext<FabricClientCommandSource> context) {
 		FabricClientCommandSource source = context.getSource();
 		String handleStr = StringArgumentType.getString(context, "handle");
+
+		// 一键停止全部共享：/wl share stop all（或 *）
+		if(handleStr.equalsIgnoreCase("all") || handleStr.equals("*")) {
+			WaylandCraft wlc = WaylandCraft.instance;
+			if(wlc == null || wlc.windowShareManager == null) {
+				source.sendError(Component.literal("§c✘ WaylandCraft not initialized（服务器端不支持批量停止）§r"));
+				return 0;
+			}
+			Map<Long, WindowShareManager.ShareState> states = wlc.windowShareManager.getAllShareStates();
+			if(states.isEmpty()) {
+				source.sendError(Component.literal("§c✘ 当前没有任何共享中的窗口§r"));
+				return 0;
+			}
+			// getAllShareStates 返回不可变副本，遍历时安全移除
+			for(long handle : states.keySet()) {
+				wlc.windowShareManager.stopSharing(handle);
+			}
+			source.sendFeedback(Component.literal("§a✔ 已停止全部 §f" + states.size() + "§a 个窗口的共享§r"));
+			return 1;
+		}
 
 		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
 		if(toplevel == null) return 0;
