@@ -1184,6 +1184,15 @@ public class WaylandCraft implements ClientModInitializer {
 			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_RELEASE,
 					0, 0, 0, keysym);
 		}
+		else if(action == GLFW.GLFW_REPEAT) {
+			// 长按透传（需求1 补全）：共享窗口网络转发路径之前只处理 PRESS/RELEASE，
+			// REPEAT 被静默丢弃 → 远端窗口长按失效（XTest injectKey 是单次注入，无 autorepeat）。
+			// X11 autorepeat 语义 = 重复 down 事件（无独立 up），因此 REPEAT 重发 KEY_PRESS；
+			// 配对集合保持原有记录（press 已加入），只确保万一漏记时补上。
+			pressedForwardKeys.add(keysym);
+			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_PRESS,
+					0, 0, 0, keysym);
+		}
 	}
 
 	/** 转发单个修饰键 press/release（与普通键同一配对集合，releaseAllForwardedKeys 统一兜底） */
