@@ -7,6 +7,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import dev.evvie.waylandcraft.WaylandCraft;
+import dev.evvie.waylandcraft.WaylandCraftCommon;
 import net.minecraft.client.KeyboardHandler;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.input.KeyEvent;
@@ -44,6 +45,14 @@ public class KeyboardHandlerMixin {
 	public void onPress(long windowHandle, int action, KeyEvent event, CallbackInfo info) {
 		int scancode = WaylandCraft.correctScancode(event.scancode());
 		
+		// [kb-debug] mixin 注入生效的证据：这里执行 = KeyboardHandlerMixin 已注入成功。
+		// 若用户日志里完全没有 [kb-debug] 行 → 注入失效，按键根本没进 WaylandCraft。
+		WaylandCraftCommon.LOGGER.info("[kb-debug] mixin onPress key={} action={} scancode={} level={} screen={} mode={}",
+			event.key(), action, scancode,
+			Minecraft.getInstance().level != null ? "in" : "none",
+			Minecraft.getInstance().screen != null ? Minecraft.getInstance().screen.getClass().getSimpleName() : "none",
+			WaylandCraft.instance.keyboardCaptureMode);
+		
 		// 第一步：xkb 状态先行（PRESS/RELEASE 才更新，REPEAT 不重复触发 Caps Lock 切换）
 		if((action == GLFW.GLFW_PRESS || action == GLFW.GLFW_RELEASE)
 				&& WaylandCraft.instance.bridge != null) {
@@ -54,7 +63,10 @@ public class KeyboardHandlerMixin {
 		if(Minecraft.getInstance().level == null) return;
 		if(Minecraft.getInstance().screen != null) return;
 		
-		if(WaylandCraft.instance.onKeyPress(windowHandle, event.key(), scancode, action, event.modifiers())) info.cancel();
+		boolean intercepted = WaylandCraft.instance.onKeyPress(windowHandle, event.key(), scancode, action, event.modifiers());
+		if(intercepted) info.cancel();
+		// [kb-debug] onKeyPress 返回值 = 是否拦截（true 才 cancel，Minecraft 收不到该键）
+		WaylandCraftCommon.LOGGER.info("[kb-debug] onKeyPress 返回 {} (key={} action={})", intercepted, event.key(), action);
 	}
 	
 }

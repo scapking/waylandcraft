@@ -356,6 +356,12 @@ public class WaylandCraft implements ClientModInitializer {
 	public void enableKeyboardCapture(boolean hardCapture) {
 		if(keyboardCaptureMode != KeyboardCaptureMode.NONE) return;
 		
+		WaylandCraftCommon.LOGGER.info("[kb-debug] enableKeyboardCapture hardCapture={} hoveredShared={} hoveredLocal={} bridge={}",
+			hardCapture,
+			hoveredSharedDisplay != null ? "yes" : "no",
+			hoveredDisplay != null ? (hoveredDisplay.dist >= 0 ? "hit" : "miss") : "none",
+			bridge != null ? "yes" : "no");
+		
 		// 共享窗口优先：hover 共享窗口时绑定到共享窗口。
 		// 手机端 viewer-only（bridge==null）本地窗口不可用，共享窗口是唯一可捕获对象。
 		// G（CAPTURE）只设 sharedKeyboardCapture，不设 sharedPointerCapture。
@@ -451,6 +457,9 @@ public class WaylandCraft implements ClientModInitializer {
 	 */
 	public void disableKeyboardCapture() {
 		if(keyboardCaptureMode == KeyboardCaptureMode.NONE) return;
+		
+		WaylandCraftCommon.LOGGER.info("[kb-debug] disableKeyboardCapture mode={} sharedCap={}",
+			keyboardCaptureMode, sharedKeyboardCapture != null ? "yes" : "no");
 		
 		// 第零步：补发所有仍按住的共享键 release（防止退出绑定后远端窗口卡 Shift/CapsLock）
 		long fwd = sharedKeyboardCapture != null ? sharedKeyboardCapture.getWindowHandle() : -1;
@@ -1096,6 +1105,14 @@ public class WaylandCraft implements ClientModInitializer {
 	 */
 	// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
 	public boolean onKeyPress(long windowHandle, int key, int scancode, int action, int modifiers) {
+		// [kb-debug] onKeyPress 入口：确认按键到达这里 + 当前捕获模式
+		WaylandCraftCommon.LOGGER.info("[kb-debug] onKeyPress 入口 key={} scancode={} action={} mode={} bridge={} sharedCap={} hoveredLocal={} hoveredShared={}",
+			key, scancode, action, keyboardCaptureMode,
+			bridge != null ? "yes" : "no",
+			sharedKeyboardCapture != null ? "yes" : "no",
+			hoveredDisplay != null ? (hoveredDisplay.dist >= 0 ? "hit" : "miss") : "none",
+			hoveredSharedDisplay != null ? "yes" : "no");
+
 		// J 键：进入"游戏模式"（绑定键盘+鼠标，鼠标事件全部进窗口、隐藏鼠标）。
 		// 用户需求：J 默认进入绑定，**按 ESC 之前不退出**——已在绑定中时再按 J 不解除。
 		// 修复：G 纯键盘绑定（CAPTURE）下按 J **作为普通键转发给窗口**（G 模式按键全部
@@ -1180,12 +1197,10 @@ public class WaylandCraft implements ClientModInitializer {
 		// 后按键被 Rust 丢弃——这是"键盘输入不能穿透窗口"的最后一道保险）。
 		ensureKeyboardFocus("onKeyPress");
 
-		// 诊断：首次本地转发打日志（区分 mixin 注入失效 vs 焦点问题）
-		if(!keyboardForwardLogged) {
-			keyboardForwardLogged = true;
-			WaylandCraftCommon.LOGGER.info("[kb] onKeyPress 首次本地转发 key={} action={} mode={}",
-				key, action, keyboardCaptureMode);
-		}
+		// [kb-debug] 本地转发：每次转发都打（确认 Java 侧真正调了 bridge）
+		WaylandCraftCommon.LOGGER.info("[kb-debug] 本地转发 key={} scancode={} action={} ({} -> bridge)",
+			key, scancode, action,
+			action == GLFW.GLFW_PRESS ? "pressKey" : action == GLFW.GLFW_RELEASE ? "releaseKey" : "repeatKey");
 
 		// 本地 bridge 路径三态完整透传（Rust keyboardInput 0=release 1=press 2=repeat）。
 		// 之前 REPEAT 在这里被吞掉 → 长按失效（窗口收不到重复按键）。

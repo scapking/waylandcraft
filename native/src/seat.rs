@@ -405,11 +405,14 @@ impl WLCSeatState {
 
     pub fn keyboard_focus(&mut self, surface: WlSurface) {
         if !surface.is_alive() {
+            eprintln!("[kb-debug] keyboard_focus: surface NOT ALIVE —— 焦点设置失败！");
             return;
         };
         let client = surface.client().unwrap();
         let serial = new_serial();
 
+        let mut matched_any = false;
+        let mut entered_any = false;
         self.for_all_keyboards(|keyboard, data| {
             let keyboard_client = keyboard.client().unwrap();
 
@@ -418,9 +421,11 @@ impl WLCSeatState {
                 if let Some(focus) = &data.focus {
                     keyboard.leave(serial, focus);
                     data.focus = None;
+                    eprintln!("[kb-debug] keyboard_focus: keyboard(client {:?}) lost focus (surface 属于另一 client)", keyboard_client.id());
                 }
                 return;
             }
+            matched_any = true;
 
             // This keyboard is now guaranteed to be of the same client as the
             // surface
@@ -439,9 +444,17 @@ impl WLCSeatState {
 
             keyboard.enter(serial, &surface, pressed);
             data.focus = Some(surface.clone());
+            entered_any = true;
 
             self.send_modifiers(keyboard, serial);
         });
+        eprintln!(
+            "[kb-debug] keyboard_focus: surface.client={:?} keyboards={} matched={} entered={}",
+            client.id(),
+            self.keyboards.len(),
+            matched_any,
+            entered_any
+        );
     }
 
     fn serialize_pressed_keys(&self) -> Vec<u8> {
@@ -543,20 +556,35 @@ impl WLCSeatState {
     /// 中更新 xkb_state 所用的键码完全一致），保证 modifiers 序列化
     /// （MODS_DEPRESSED / MODS_LOCKED）与 key 事件一一对应。
     pub fn keyboard_key(&self, key: u32, action: KeyboardAction) {
+        let wire_key = key.saturating_sub(8);
         if !self.kb_active {
+            eprintln!(
+                "[kb-debug] keyboard_key: DROPPED —— kb_active=false (key={} wire={} action={:?})",
+                key, wire_key, action
+            );
             return;
         }
         let serial = new_serial();
-        let wire_key = key.saturating_sub(8);
         let state = action.key_state();
         let mut any_focus = false;
+        let mut focus_descs = String::new();
         self.for_all_keyboards(|keyboard, data| {
             if data.focus.is_some() {
                 any_focus = true;
+                focus_descs.push_str(&format!(" kb{}:focused", keyboard.id()));
                 keyboard.key(serial, get_time(), wire_key, state);
                 self.send_modifiers(keyboard, serial);
+            } else {
+                focus_descs.push_str(&format!(" kb{}:NO_FOCUS", keyboard.id()));
             }
         });
+        // [kb-debug] 每键打：确认 Rust 收到 + 有没有 focus 可发。
+        // 任何键盘有 focus → key 事件已发出；全 NO_FOCUS → 按键被丢弃（Java 侧 focusSurface 没生效）。
+        eprintln!(
+            "[kb-debug] keyboard_key: key={} wire={} action={:?} kb_active=true |{}{}",
+            key, wire_key, action, focus_descs,
+            if any_focus { " -> SENT" } else { " -> DROPPED(no focus)" }
+        );
         // 诊断：键盘已激活但没有任何 wl_keyboard 有焦点 —— 按键被静默丢弃
         // （"穿透不了窗口"的直接证据）。只 warn 一次避免刷屏。
         if !any_focus && !self.no_focus_warned.get() {
