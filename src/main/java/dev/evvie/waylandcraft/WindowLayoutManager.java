@@ -1,6 +1,7 @@
 package dev.evvie.waylandcraft;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 
@@ -257,6 +258,81 @@ public class WindowLayoutManager {
 		coreHandle = ((WLCToplevel) ordered.get(next).window).getHandle();
 		WaylandCraftCommon.LOGGER.info("[move] 核心 -> {} (dir={}, layerIdx={}/{})",
 			WaylandCraft.getWindowName((WLCToplevel) ordered.get(next).window), dir, next - start + 1, size);
+		return true;
+	}
+
+	/**
+	 * 核心窗口与该方向相邻窗口互换排序（位置互换，窗口真的移动）。
+	 * dir: 0=上 1=下 2=左 3=右。
+	 *
+	 * 无任何范围限制（用户拍板：怎么排序都可以，不能有限制）：
+	 *  - 左/右 = 同层内按世界方位角几何相邻（顺时针/逆时针最近），最左/最右环绕到对侧，可一直切换；
+	 *  - 上/下 = 跨层同槽位，无上层/下层时环绕到对侧；
+	 *  - 单窗口无邻居时返回 false，除此之外不做任何边界/数量限制。
+	 *
+	 * 交换 = ordered 顺序 + layoutAltIndex 同时交换：
+	 *  - cube 模板按 layoutAltIndex 算槽位 → altIndex 互换即位置互换；
+	 *  - sphere 模板按 ordered 顺序连续排布 → 顺序互换即位置互换。
+	 * 核心身份跟随核心窗口（coreHandle 不变），交换后下一 tick 按新排序重排生效。
+	 * 返回是否交换成功。
+	 */
+	public boolean swapCore(int dir) {
+		if(ordered.isEmpty()) return false;
+		int n = ordered.size();
+		int idx = indexOfCore();
+		if(idx < 0) return false;
+
+		int start = layerStartOf(idx);
+		int size = layerSizeAt(idx);
+		int slot = idx - start;
+		int next;
+
+		switch(dir) {
+			case 0: { // 上：上一层同槽位；无上层则环绕到最底层同槽位
+				if(start == 0) {
+					int lastSize = layerSizes.isEmpty() ? n : layerSizes.get(layerSizes.size() - 1);
+					int lastStart = n - lastSize;
+					next = lastStart + Math.min(slot, lastSize - 1);
+				} else {
+					int prevStart = prevLayerStart(start);
+					int prevSize = start - prevStart;
+					next = prevStart + Math.min(slot, prevSize - 1);
+				}
+				break;
+			}
+			case 1: { // 下：下一层同槽位；无下层则环绕到最上层同槽位
+				int nextStart = start + size;
+				if(nextStart >= n) {
+					int firstSize = layerSizes.isEmpty() ? 1 : layerSizes.get(0);
+					next = Math.min(slot, firstSize - 1);
+				} else {
+					int nextSize = layerSizeAt(nextStart);
+					next = nextStart + Math.min(slot, nextSize - 1);
+				}
+				break;
+			}
+			case 2: // 左：同层内角度更小的窗口（逆时针相邻）；最左环绕到同层最右
+				next = findLayerNeighbor(idx, start, size, -1);
+				break;
+			default: // 右：同层内角度更大的窗口（顺时针相邻）；最右环绕到同层最左
+				next = findLayerNeighbor(idx, start, size, +1);
+				break;
+		}
+
+		if(next < 0 || next >= n || next == idx) return false;
+
+		WindowDisplay a = ordered.get(idx);
+		WindowDisplay b = ordered.get(next);
+		Collections.swap(ordered, idx, next);
+		// layoutAltIndex 跟着窗口走：cube 按它算槽位，交换后位置互换
+		int tmpAlt = a.layoutAltIndex;
+		a.layoutAltIndex = b.layoutAltIndex;
+		b.layoutAltIndex = tmpAlt;
+
+		WaylandCraftCommon.LOGGER.info("[swap] 核心 {} <-> {} (dir={}, alt {}<->{})",
+			WaylandCraft.getWindowName((WLCToplevel) a.window),
+			WaylandCraft.getWindowName((WLCToplevel) b.window), dir,
+			b.layoutAltIndex, a.layoutAltIndex);
 		return true;
 	}
 

@@ -1133,3 +1133,429 @@ impl Dispatch<WpCursorShapeDeviceV1, WLCCursorShapeDevice> for WLCState {
         }
     }
 }
+
+#[cfg(test)]
+mod keyboard_focus_tests {
+    use super::*;
+    use smithay::reexports::wayland_server::{
+        Display, DisplayHandle, GlobalDispatch, New, Resource,
+        backend::{ClientData, ClientId, DisconnectReason},
+        protocol::{
+            wl_compositor, wl_compositor::WlCompositor,
+            wl_keyboard::WlKeyboard, wl_seat::WlSeat,
+            wl_surface, wl_surface::WlSurface,
+        },
+    };
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+
+    // ================= server 端：最小 compositor =================
+
+    struct TestState {
+        seat: WLCSeatState,
+        surfaces: Vec<WlSurface>,
+    }
+
+    struct TestClientData;
+
+    impl ClientData for TestClientData {
+        fn initialized(&self, _id: ClientId) {}
+        fn disconnected(&self, _id: ClientId, _reason: DisconnectReason) {}
+    }
+
+    impl GlobalDispatch<WlSeat, ()> for TestState {
+        fn bind(
+            _state: &mut Self,
+            _handle: &DisplayHandle,
+            _client: &Client,
+            resource: New<WlSeat>,
+            _data: &(),
+            data_init: &mut DataInit<'_, Self>,
+        ) {
+            let seat: WlSeat = data_init.init(resource, ());
+            let mut caps: wl_seat::Capability = wl_seat::Capability::empty();
+            caps.insert(wl_seat::Capability::Pointer);
+            caps.insert(wl_seat::Capability::Keyboard);
+            seat.capabilities(caps);
+        }
+    }
+
+    impl Dispatch<WlSeat, ()> for TestState {
+        fn request(
+            state: &mut Self,
+            _client: &Client,
+            _seat_resource: &WlSeat,
+            request: wl_seat::Request,
+            _data: &(),
+            _disp: &DisplayHandle,
+            data_init: &mut DataInit<'_, Self>,
+        ) {
+            match request {
+                wl_seat::Request::GetKeyboard { id } => {
+                    let keyboard_data = WLCKeyboardData { focus: None };
+                    let keyboard_data = Arc::new(Mutex::new(keyboard_data));
+
+                    let keyboard: WlKeyboard =
+                        data_init.init(id, keyboard_data.clone());
+
+                    state.seat.keyboards.push(keyboard.clone());
+
+                    let keymap = &state.seat.keymap_file;
+                    keyboard.keymap(
+                        KeymapFormat::XkbV1,
+                        keymap.as_fd(),
+                        keymap.size() as u32,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl Dispatch<WlKeyboard, WLCKeyboard> for TestState {
+        fn request(
+            _state: &mut Self,
+            _client: &Client,
+            _keyboard_resource: &WlKeyboard,
+            request: wl_keyboard::Request,
+            _data: &WLCKeyboard,
+            _disp: &DisplayHandle,
+            _data_init: &mut DataInit<'_, Self>,
+        ) {
+            match request {
+                wl_keyboard::Request::Release => {}
+                _ => {}
+            }
+        }
+    }
+
+    impl GlobalDispatch<WlCompositor, ()> for TestState {
+        fn bind(
+            _state: &mut Self,
+            _handle: &DisplayHandle,
+            _client: &Client,
+            resource: New<WlCompositor>,
+            _data: &(),
+            data_init: &mut DataInit<'_, Self>,
+        ) {
+            data_init.init(resource, ());
+        }
+    }
+
+    impl Dispatch<WlCompositor, ()> for TestState {
+        fn request(
+            state: &mut Self,
+            _client: &Client,
+            _compositor_resource: &WlCompositor,
+            request: wl_compositor::Request,
+            _data: &(),
+            _disp: &DisplayHandle,
+            data_init: &mut DataInit<'_, Self>,
+        ) {
+            match request {
+                wl_compositor::Request::CreateSurface { id } => {
+                    let surface: WlSurface = data_init.init(id, ());
+                    state.surfaces.push(surface);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    impl Dispatch<WlSurface, ()> for TestState {
+        fn request(
+            _state: &mut Self,
+            _client: &Client,
+            _surface_resource: &WlSurface,
+            request: wl_surface::Request,
+            _data: &(),
+            _disp: &DisplayHandle,
+            _data_init: &mut DataInit<'_, Self>,
+        ) {
+            match request {
+                _ => {}
+            }
+        }
+    }
+
+    // ================= client 端：真实 wayland-client，收集事件 =================
+    // 注意：wayland-client 与 wayland-server 是同名协议的**不同 crate**，
+    // 类型不能混用。这里把 client 完全隔离进子模块。
+
+    mod client_side {
+        use std::os::unix::net::UnixStream;
+        use wayland_client::{
+            delegate_noop, Connection, Dispatch, EventQueue, Proxy,
+            QueueHandle,
+            protocol::{
+                wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_surface,
+            },
+        };
+
+        pub use wayland_client::protocol::wl_keyboard as c_wl_keyboard;
+
+        pub struct ClientState {
+            pub key_events: Vec<(u32, wl_keyboard::KeyState)>,
+            pub enter_count: usize,
+            pub leave_count: usize,
+            // 持有 proxy 防止被 GC
+            _keyboard: Option<wl_keyboard::WlKeyboard>,
+            _surface: Option<wl_surface::WlSurface>,
+        }        impl Default for ClientState {
+            fn default() -> Self {
+                Self {
+                    key_events: vec![],
+                    enter_count: 0,
+                    leave_count: 0,
+                    _keyboard: None,
+                    _surface: None,
+                }
+            }
+        }
+
+        impl Dispatch<wl_registry::WlRegistry, ()> for ClientState {
+            fn event(
+                state: &mut Self,
+                registry: &wl_registry::WlRegistry,
+                event: wl_registry::Event,
+                _data: &(),
+                _conn: &Connection,
+                qh: &QueueHandle<Self>,
+            ) {
+                if let wl_registry::Event::Global {
+                    name, interface, ..
+                } = event
+                {
+                    match interface.as_str() {
+                        "wl_seat" => {
+                            let seat = registry.bind::<wl_seat::WlSeat, _, _>(
+                                name, 1, qh, (),
+                            );
+                            state._keyboard = Some(seat.get_keyboard(qh, ()));
+                        }
+                        "wl_compositor" => {
+                            let compositor = registry.bind::<
+                                wl_compositor::WlCompositor,
+                                _,
+                                _,
+                            >(name, 1, qh, ());
+                            state._surface =
+                                Some(compositor.create_surface(qh, ()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        impl Dispatch<wl_keyboard::WlKeyboard, ()> for ClientState {
+            fn event(
+                state: &mut Self,
+                _keyboard: &wl_keyboard::WlKeyboard,
+                event: wl_keyboard::Event,
+                _data: &(),
+                _conn: &Connection,
+                _qh: &QueueHandle<Self>,
+            ) {
+                match event {
+                    wl_keyboard::Event::Enter { .. } => {
+                        state.enter_count += 1
+                    }
+                    wl_keyboard::Event::Leave { .. } => {
+                        state.leave_count += 1
+                    }
+                    wl_keyboard::Event::Key {
+                        key, state: ks, ..
+                    } => {
+                        // 真实事件里 state 是 WEnum 包装；测试中只会收到 Value 变体
+                        if let wayland_client::WEnum::Value(v) = ks {
+                            state.key_events.push((key, v));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        delegate_noop!(ClientState: ignore wl_seat::WlSeat);
+        delegate_noop!(ClientState: ignore wl_surface::WlSurface);
+        delegate_noop!(ClientState: ignore wl_compositor::WlCompositor);
+
+        pub struct TestClient {
+            queue: EventQueue<ClientState>,
+            pub state: ClientState,
+        }
+
+        impl TestClient {
+            pub fn connect(stream: UnixStream) -> Self {
+                let conn = Connection::from_socket(stream).unwrap();
+                let mut queue = conn.new_event_queue();
+                let qh = queue.handle();
+                conn.display().get_registry(&qh, ());
+                let state = ClientState::default();
+                Self { queue, state }
+            }
+
+            /// 发送 client 端 pending 请求（bind/get_keyboard/create_surface）
+            pub fn flush(&self) {
+                self.queue.flush().unwrap();
+            }
+
+            /// 非阻塞处理已到达的 server 事件（global 列表 / keymap / key）
+            pub fn dispatch_pending(&mut self) {
+                if let Some(guard) = self.queue.prepare_read() {
+                    // 非阻塞 socket：没有新数据时 read 返回 WouldBlock，忽略即可
+                    let _ = guard.read();
+                }
+                self.queue.dispatch_pending(&mut self.state).unwrap();
+            }
+        }
+    }
+
+    use client_side::TestClient;
+
+    /// 搭起 server + client。返回 (display, server_state, client)
+    fn setup() -> (Display<TestState>, TestState, TestClient) {
+        let mut display: Display<TestState> = Display::new().unwrap();
+        let mut handle = display.handle();
+        handle.create_global::<TestState, WlSeat, ()>(8, ());
+        handle.create_global::<TestState, WlCompositor, ()>(5, ());
+
+        let (server_stream, client_stream) = UnixStream::pair().unwrap();
+        handle
+            .insert_client(server_stream, Arc::new(TestClientData))
+            .unwrap();
+
+        let mut server_state = TestState {
+            seat: WLCSeatState::new(),
+            surfaces: vec![],
+        };
+
+        // client 连接（get_registry 已发出）
+        let mut client = TestClient::connect(client_stream);
+
+        // 握手：多轮交替驱动，直到 client 拿到 global 列表并 bind 完成
+        for _ in 0..5 {
+            client.flush();
+            display.dispatch_clients(&mut server_state).unwrap();
+            display.flush_clients().unwrap();
+            client.dispatch_pending();
+        }
+
+        (display, server_state, client)
+    }
+
+    fn drive(
+        display: &mut Display<TestState>,
+        server_state: &mut TestState,
+        client: &mut TestClient,
+    ) {
+        client.flush();
+        display.dispatch_clients(server_state).unwrap();
+        display.flush_clients().unwrap();
+        client.dispatch_pending();
+    }
+
+    #[test]
+    fn test_keyboard_key_requires_focus() {
+        let (mut display, mut server_state, mut client) = setup();
+
+        assert_eq!(server_state.seat.keyboards.len(), 1);
+        let surface = server_state.surfaces[0].clone();
+
+        // ===== 场景 1：未激活键盘（kb_active=false）→ 按键不转发 =====
+        server_state.seat.keyboard_key(30, KeyboardAction::Press);
+        drive(&mut display, &mut server_state, &mut client);
+        assert_eq!(
+            client.state.key_events.len(),
+            0,
+            "kb_active=false 时不应产生任何 key 事件"
+        );
+
+        // ===== 场景 2：激活但无 focus → 按键不转发（复现 bug！）=====
+        server_state.seat.activate_keyboard();
+        server_state.seat.keyboard_key(30, KeyboardAction::Press);
+        drive(&mut display, &mut server_state, &mut client);
+        assert_eq!(
+            client.state.key_events.len(),
+            0,
+            "激活但无 focus 时按键必须被丢弃（这正是 v0.9.1 修复的根因）"
+        );
+
+        // ===== 场景 3：focus(surface) 后 → 按键转发 =====
+        server_state.seat.keyboard_focus(surface.clone());
+        drive(&mut display, &mut server_state, &mut client);
+        assert_eq!(
+            client.state.enter_count, 1,
+            "focus 后应收到 enter"
+        );
+
+        server_state.seat.keyboard_key(30, KeyboardAction::Press);
+        drive(&mut display, &mut server_state, &mut client);
+        assert_eq!(
+            client.state.key_events.len(),
+            1,
+            "focus 后按键应转发到 client"
+        );
+        let (key, ks) = client.state.key_events[0];
+        assert_eq!(key, 22, "evdev 30 - 8 = 22 应为 wire keycode");
+        assert_eq!(
+            ks,
+            client_side::c_wl_keyboard::KeyState::Pressed,
+            "Press 动作应产生 Pressed 状态"
+        );
+
+        // ===== 场景 4：Release 语义 =====
+        server_state.seat.keyboard_key(30, KeyboardAction::Release);
+        drive(&mut display, &mut server_state, &mut client);
+        assert_eq!(client.state.key_events.len(), 2);
+        assert_eq!(
+            client.state.key_events[1].1,
+            client_side::c_wl_keyboard::KeyState::Released,
+            "Release 动作应产生 Released 状态"
+        );
+
+        // ===== 场景 5：Repeat 语义（长按） =====
+        server_state.seat.keyboard_key(30, KeyboardAction::Repeat);
+        drive(&mut display, &mut server_state, &mut client);
+        assert_eq!(client.state.key_events.len(), 3);
+        assert_eq!(
+            client.state.key_events[2].1,
+            client_side::c_wl_keyboard::KeyState::Pressed,
+            "Repeat 动作应补发 Pressed（长按保持按下）"
+        );
+
+        // ===== 场景 6：unfocus 后按键再次被丢弃 =====
+        server_state.seat.keyboard_unfocus();
+        drive(&mut display, &mut server_state, &mut client);
+        assert_eq!(client.state.leave_count, 1, "unfocus 后应收到 leave");
+
+        let before = client.state.key_events.len();
+        server_state.seat.keyboard_key(30, KeyboardAction::Press);
+        drive(&mut display, &mut server_state, &mut client);
+        assert_eq!(
+            client.state.key_events.len(),
+            before,
+            "unfocus 后按键必须再次被丢弃"
+        );
+    }
+
+    #[test]
+    fn test_keyboard_action_mapping() {
+        assert_eq!(
+            KeyboardAction::from_i32(0),
+            Some(KeyboardAction::Release)
+        );
+        assert_eq!(KeyboardAction::from_i32(1), Some(KeyboardAction::Press));
+        assert_eq!(
+            KeyboardAction::from_i32(2),
+            Some(KeyboardAction::Repeat)
+        );
+        assert_eq!(KeyboardAction::from_i32(99), None);
+        assert_eq!(KeyboardAction::from_i32(-1), None);
+
+        assert_eq!(KeyboardAction::Release.key_state(), KeyState::Released);
+        assert_eq!(KeyboardAction::Press.key_state(), KeyState::Pressed);
+        assert_eq!(KeyboardAction::Repeat.key_state(), KeyState::Pressed);
+    }
+}

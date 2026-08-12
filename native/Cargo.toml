@@ -25,6 +25,9 @@ pipewire = "0.8"
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 
+[dev-dependencies]
+wayland-client = "0.31"
+
 [profile.release]
 opt-level = "z"      # optimize for size
 lto = true           # link-time optimization
