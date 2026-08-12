@@ -364,6 +364,22 @@ public class WaylandCraft implements ClientModInitializer {
 		keyboardCaptureMode = hardCapture ? KeyboardCaptureMode.HARD_CAPTURE : KeyboardCaptureMode.CAPTURE;
 		bridge.activateKeyboard();
 		
+		// 关键：绑定后立即把键盘焦点给当前 hover 的本地窗口（或最近焦点窗口）。
+		// Rust keyboard_key 只有在有 surface 获得 focus 时才转发按键（data.focus.is_some()），
+		// 之前 G 键只 activateKeyboard() 不设焦点 → 所有按键被 Rust 丢弃 → 键盘绑定形同虚设。
+		// J 键之前"看起来能用"是因为鼠标 hover 路径（onMouseTurn）会顺手 focusSurface。
+		WLCToplevel kbFocus = null;
+		if(hoveredDisplay != null && hoveredDisplay.dist >= 0 && hoveredDisplay.target.window instanceof WLCToplevel t) {
+			kbFocus = t;
+		}
+		else {
+			kbFocus = bridge.getMostToLeastRecentFocus()
+					.filter((t) -> hasDisplayFor(t))
+					.findFirst()
+					.orElse(null);
+		}
+		if(kbFocus != null) bridge.focusSurface(kbFocus);
+		
 		// 仅 hardCapture（J）才创建 PointerCapture 锁定鼠标。
 		// 关键修复：不再用 bridge.maybeLockPointer 作为创建 pointerCapture 的前提——
 		// 那要求被控应用自己申请过 zwp_pointer_constraints 指针锁（浏览器/桌面应用都不会），
@@ -786,15 +802,20 @@ public class WaylandCraft implements ClientModInitializer {
 			if(bridge != null) this.cursorShape = controlCursor();
 			bridge.sendMotionRefocus(surface, rel.x, rel.y);
 			
-			if(keyboardCaptureMode != KeyboardCaptureMode.NONE) {
+			// 只有 HARD_CAPTURE（J）hover 到窗口才锁鼠标；CAPTURE（G）是纯键盘绑定，
+			// 鼠标必须保持自由（hover 只负责选焦点窗口，不拦截视角）。
+			if(keyboardCaptureMode == KeyboardCaptureMode.HARD_CAPTURE) {
 				// 绑定中 hover 到窗口 → 立即锁定鼠标（不再要求应用申请过指针锁）
 				PointerCapture pc = new PointerCapture(surface, rel.x, rel.y);
 				pc.relativeLocked = bridge.maybeLockPointer(surface);
 				pointerCapture = pc;
 			}
 			
-			// Focus on hover
-			if(settings.getFocusOnHover() && hoveredDisplay.target.window instanceof WLCToplevel toplevel) {
+			// Focus on hover：绑定模式（G/J）下 hover 窗口即切换键盘焦点——
+			// 这是绑定后键盘输入跟随窗口的关键（Rust keyboard_key 只转发给有 focus 的 surface）；
+			// 未捕获时才尊重 focusOnHover 设置。
+			if((keyboardCaptureMode != KeyboardCaptureMode.NONE || settings.getFocusOnHover())
+					&& hoveredDisplay.target.window instanceof WLCToplevel toplevel) {
 				bridge.focusSurface(toplevel);
 			}
 		}
