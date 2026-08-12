@@ -510,6 +510,14 @@ public class WindowLayoutManager {
 			prevMaxTop = layerMaxTop;
 			pos += count;
 		}
+		
+		// 手动偏移（Ctrl+方向键移动窗口）：在所有排布/贴地钳制之后叠加，
+		// 使手动移动的位置不被每帧重排覆盖。自由移动不受贴地约束。
+		for(WindowDisplay d : list) {
+			if(d.manualOffset.lengthSqr() > 1e-12) {
+				d.pivot = d.pivot.add(d.manualOffset);
+			}
+		}
 	}
 
 	// ==================== cube 方块模板 ====================
