@@ -1,5 +1,6 @@
 package dev.evvie.waylandcraft;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -199,6 +200,13 @@ public class WaylandCraft implements ClientModInitializer {
 			try {
 				bridge = WaylandCraftBridge.start();
 				waylandSocket = bridge.getSocket();
+				// Rust 侧 [kb-debug] 日志写入独立文件（eprintln 只进 stderr，latest.log 看不到）。
+				// 用户上传 waylandcraft-kb.log 即可定位 Rust 键盘链路（收到/焦点/发出）。
+				try {
+					bridge.setKbLogFile(new File(Minecraft.getInstance().gameDirectory, "waylandcraft-kb.log").getAbsolutePath());
+				} catch (Throwable t) {
+					WaylandCraftCommon.LOGGER.warn("[kb] setKbLogFile failed: {}", t.toString());
+				}
 				xdgManager = new XDGDesktopManager(this);
 				settingsManager = new WaylandCraftSettingsManager(this);
 				templateManager.init(Minecraft.getInstance().gameDirectory);

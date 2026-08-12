@@ -43,6 +43,16 @@ use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
 use xkbcommon::xkb::{self, Keymap};
 
+/// 键盘调试日志：同时写 stderr 和 KB_LOG_FILE（bridge::setKbLogFile 设置）。
+/// 这样用户上传 .minecraft/waylandcraft-kb.log 就能看到 Rust 侧实际行为。
+macro_rules! kb_log {
+    ($($arg:tt)*) => {{
+        let msg = format!($($arg)*);
+        crate::bridge::kb_log_write(&msg);
+        eprintln!("{msg}");
+    }};
+}
+
 pub struct WLCSeatState {
     pub pointers: Vec<WlPointer>,
     pub keyboards: Vec<WlKeyboard>,
@@ -405,7 +415,7 @@ impl WLCSeatState {
 
     pub fn keyboard_focus(&mut self, surface: WlSurface) {
         if !surface.is_alive() {
-            eprintln!("[kb-debug] keyboard_focus: surface NOT ALIVE —— 焦点设置失败！");
+            kb_log!("[kb-debug] keyboard_focus: surface NOT ALIVE —— 焦点设置失败！");
             return;
         };
         let client = surface.client().unwrap();
@@ -423,7 +433,7 @@ impl WLCSeatState {
                     keyboard.leave(serial, focus);
                     data.focus = None;
                     left_any = true;
-                    eprintln!("[kb-debug] keyboard_focus: keyboard(client {:?}) lost focus (surface 属于另一 client)", keyboard_client.id());
+                    kb_log!("[kb-debug] keyboard_focus: keyboard(client {:?}) lost focus (surface 属于另一 client)", keyboard_client.id());
                 }
                 return;
             }
@@ -453,7 +463,7 @@ impl WLCSeatState {
         });
         // 只在真正发生 enter/leave 时打（tick 每帧 focusSurface 是幂等已聚焦 → 静默）
         if entered_any || left_any {
-            eprintln!(
+            kb_log!(
                 "[kb-debug] keyboard_focus: client={:?} keyboards={} matched={} entered={} left={}",
                 client.id(),
                 self.keyboards.len(),
@@ -565,7 +575,7 @@ impl WLCSeatState {
     pub fn keyboard_key(&self, key: u32, action: KeyboardAction) {
         let wire_key = key.saturating_sub(8);
         if !self.kb_active {
-            eprintln!(
+            kb_log!(
                 "[kb-debug] keyboard_key: DROPPED —— kb_active=false (key={} wire={} action={:?})",
                 key, wire_key, action
             );
@@ -591,7 +601,7 @@ impl WLCSeatState {
         // 任何键盘有 focus → key 事件已发出；全 NO_FOCUS → 按键被丢弃（Java 侧 focusSurface 没生效）。
         let depressed = self.xkb_state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
         let locked = self.xkb_state.serialize_mods(xkb::STATE_MODS_LOCKED);
-        eprintln!(
+        kb_log!(
             "[kb-debug] keyboard_key: key={} wire={} action={:?} kb_active=true mods(depressed={} locked={}) |{}{}",
             key, wire_key, action, depressed, locked, focus_descs,
             if any_focus { " -> SENT" } else { " -> DROPPED(no focus)" }
@@ -600,7 +610,7 @@ impl WLCSeatState {
         // （"穿透不了窗口"的直接证据）。只 warn 一次避免刷屏。
         if !any_focus && !self.no_focus_warned.get() {
             self.no_focus_warned.set(true);
-            eprintln!(
+            kb_log!(
                 "[kb] WARN: kb_active=true 但无任何 keyboard focus（key={}）——按键被丢弃！Java 侧应 focusSurface 一个窗口",
                 wire_key
             );

@@ -44,7 +44,26 @@ use smithay::{
 };
 use std::ops::DerefMut;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use thiserror::Error;
+
+/// Rust 侧键盘调试日志文件（Java 通过 setKbLogFile 设置路径）。
+/// 所有 [kb-debug] 行同时写 stderr 和这个文件，用户上传即可定位
+/// Rust 侧是否真的收到/发出按键（eprintln 只进 stderr，不进 latest.log）。
+static KB_LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+/// 追加一行到 KB_LOG_FILE（若已设置），失败静默忽略。
+pub fn kb_log_write(s: &str) {
+    use std::io::Write;
+    let mut guard = match KB_LOG_FILE.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(f) = guard.as_mut() {
+        let _ = writeln!(f, "{s}");
+        let _ = f.flush();
+    }
+}
 
 #[allow(clippy::vec_box)]
 pub(crate) struct BridgeState {
@@ -290,6 +309,10 @@ bind_java_type! {
         static extern fn keyboard_update {
             sig = (instance: jlong, scancode: jint, pressed: jboolean),
             fn = keyboard_update,
+        },
+        static extern fn set_kb_log_file {
+            sig = (path: JString),
+            fn = set_kb_log_file,
         },
         static extern fn output_size {
             sig = (instance: jlong) -> jint[],
@@ -1399,8 +1422,39 @@ fn keyboard_update<'local>(
         .state
         .seat
         .keyboard_update_xkb(scancode as u32, pressed);
-
     Ok(())
+}
+
+/// setKbLogFile(path) —— 让 Rust 侧 [kb-debug] 行同时写入文件（默认只进 stderr）。
+/// Java 在 bridge 初始化后调用，路径通常是 .minecraft/waylandcraft-kb.log。
+fn set_kb_log_file<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    path: JString<'local>,
+) -> Result<(), BridgeError> {
+    let path_str: String = _env.get_string(&path)?.into();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path_str);
+    match file {
+        Ok(f) => {
+            let mut guard = match KB_LOG_FILE.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("[kb] setKbLogFile: mutex poisoned: {e}");
+                    return Ok(());
+                }
+            };
+            *guard = Some(f);
+            eprintln!("[kb] setKbLogFile: 键盘调试日志 -> {path_str}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[kb] setKbLogFile: 打开 {path_str} 失败: {e}（继续只写 stderr）");
+            Ok(())
+        }
+    }
 }
 
 fn fullscreened<'local>(

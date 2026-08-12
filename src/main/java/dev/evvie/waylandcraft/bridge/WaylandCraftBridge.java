@@ -891,6 +891,13 @@ public class WaylandCraftBridge {
 		keyboardUpdate(instance, scancode, pressed);
 	}
 	
+	/** 让 Rust 侧 [kb-debug] 日志同时写入指定文件（默认只进 stderr）。
+	 * bridge 初始化后立即调用，路径用 .minecraft/waylandcraft-kb.log，
+	 * 用户上传该文件即可定位 Rust 侧键盘链路。 */
+	public void setKbLogFile(String path) {
+		setKbLogFileNative(path);
+	}
+	
 	public void resizeToplevelInteractive(WLCToplevel toplevel, int width, int height) {
 		toplevelResize(toplevel.getHandle(), width, height, true);
 	}
@@ -1102,6 +1109,9 @@ public class WaylandCraftBridge {
 	
 	// Update internal key state
 	private static native void keyboardUpdate(long instance, int scancode, boolean pressed);
+	
+	// Set Rust-side [kb-debug] log file path (eprintln also written to this file)
+	private static native void setKbLogFileNative(String path);
 	
 	private static native int[] outputSize(long instance);
 	private static native int[] outputBounds(long instance);
