@@ -223,7 +223,18 @@ public class WindowLayoutManager {
 		int next;
 
 		switch(dir) {
-			case 0: { // 上：上一层同槽位；无上层则环绕到最底层同槽位
+			case 0: { // 上：下一层同槽位（layer index 越大 = Y 越高，见 applyLayerHeights）；最高层环绕到第一层
+				int nextStart = start + size;
+				if(nextStart >= n) {
+					int firstSize = layerSizes.isEmpty() ? 1 : layerSizes.get(0);
+					next = Math.min(slot, firstSize - 1);
+				} else {
+					int nextSize = layerSizeAt(nextStart);
+					next = nextStart + Math.min(slot, nextSize - 1);
+				}
+				break;
+			}
+			case 1: { // 下：上一层同槽位（Y 更低）；最底层环绕到最后一层
 				if(start == 0) {
 					int lastSize = layerSizes.isEmpty() ? n : layerSizes.get(layerSizes.size() - 1);
 					int lastStart = n - lastSize;
@@ -235,22 +246,11 @@ public class WindowLayoutManager {
 				}
 				break;
 			}
-			case 1: { // 下：下一层同槽位；无下层则环绕到最上层同槽位
-				int nextStart = start + size;
-				if(nextStart >= n) {
-					int firstSize = layerSizes.isEmpty() ? 1 : layerSizes.get(0);
-					next = Math.min(slot, firstSize - 1);
-				} else {
-					int nextSize = layerSizeAt(nextStart);
-					next = nextStart + Math.min(slot, nextSize - 1);
-				}
-				break;
-			}
-			case 2: // 左：同层内角度更小的窗口（逆时针相邻）；最左环绕到同层最右
-				next = findLayerNeighbor(idx, start, size, -1);
-				break;
-			default: // 右：同层内角度更大的窗口（顺时针相邻）；最右环绕到同层最左
+			case 2: // 左：angleOf 更大的窗口（逆时针/视觉左侧，玩家面向 baseYaw 时左 = 角度更大）；最左环绕到同层最右
 				next = findLayerNeighbor(idx, start, size, +1);
+				break;
+			default: // 右：angleOf 更小的窗口（顺时针/视觉右侧）；最右环绕到同层最左
+				next = findLayerNeighbor(idx, start, size, -1);
 				break;
 		}
 
@@ -288,7 +288,18 @@ public class WindowLayoutManager {
 		int next;
 
 		switch(dir) {
-			case 0: { // 上：上一层同槽位；无上层则环绕到最底层同槽位
+			case 0: { // 上：下一层同槽位（layer index 越大 = Y 越高，见 applyLayerHeights）；最高层环绕到第一层
+				int nextStart = start + size;
+				if(nextStart >= n) {
+					int firstSize = layerSizes.isEmpty() ? 1 : layerSizes.get(0);
+					next = Math.min(slot, firstSize - 1);
+				} else {
+					int nextSize = layerSizeAt(nextStart);
+					next = nextStart + Math.min(slot, nextSize - 1);
+				}
+				break;
+			}
+			case 1: { // 下：上一层同槽位（Y 更低）；最底层环绕到最后一层
 				if(start == 0) {
 					int lastSize = layerSizes.isEmpty() ? n : layerSizes.get(layerSizes.size() - 1);
 					int lastStart = n - lastSize;
@@ -300,22 +311,11 @@ public class WindowLayoutManager {
 				}
 				break;
 			}
-			case 1: { // 下：下一层同槽位；无下层则环绕到最上层同槽位
-				int nextStart = start + size;
-				if(nextStart >= n) {
-					int firstSize = layerSizes.isEmpty() ? 1 : layerSizes.get(0);
-					next = Math.min(slot, firstSize - 1);
-				} else {
-					int nextSize = layerSizeAt(nextStart);
-					next = nextStart + Math.min(slot, nextSize - 1);
-				}
-				break;
-			}
-			case 2: // 左：同层内角度更小的窗口（逆时针相邻）；最左环绕到同层最右
-				next = findLayerNeighbor(idx, start, size, -1);
-				break;
-			default: // 右：同层内角度更大的窗口（顺时针相邻）；最右环绕到同层最左
+			case 2: // 左：angleOf 更大的窗口（逆时针/视觉左侧，玩家面向 baseYaw 时左 = 角度更大）；最左环绕到同层最右
 				next = findLayerNeighbor(idx, start, size, +1);
+				break;
+			default: // 右：angleOf 更小的窗口（顺时针/视觉右侧）；最右环绕到同层最左
+				next = findLayerNeighbor(idx, start, size, -1);
 				break;
 		}
 

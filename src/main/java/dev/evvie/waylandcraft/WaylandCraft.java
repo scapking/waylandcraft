@@ -1049,8 +1049,9 @@ public class WaylandCraft implements ClientModInitializer {
 	// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
 	public boolean onKeyPress(long windowHandle, int key, int scancode, int action, int modifiers) {
 		// J 键：进入"游戏模式"（绑定键盘+鼠标，鼠标事件全部进窗口、隐藏鼠标）。
-		// 用户需求：J 默认进入绑定，**按 ESC 之前不退出**——已在绑定中时再按 J 不解除，
-		// 只提示按 ESC 退出。
+		// 用户需求：J 默认进入绑定，**按 ESC 之前不退出**——已在绑定中时再按 J 不解除。
+		// 修复：G 纯键盘绑定（CAPTURE）下按 J **作为普通键转发给窗口**（G 模式按键全部
+		// 归窗口，J 也不例外），绝不触发/升级绑定；仅 HARD_CAPTURE 下按 J 提示一次。
 		if(key == GLFW.GLFW_KEY_J) {
 			if(action == 0) return true;
 
@@ -1060,11 +1061,17 @@ public class WaylandCraft implements ClientModInitializer {
 					return true;
 				}
 				enableKeyboardCapture(true);
+				return true;
 			}
-			else {
-				Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 已在绑定模式，按 ESC 退出"), false);
+
+			// 已绑定：仅 HARD_CAPTURE（J 模式）提示"按 ESC 退出"（仅 PRESS 一次，REPEAT 静默）；
+			// CAPTURE（G 模式）不拦截、不提示，J 键落入下方转发路径 → 作为普通键进窗口。
+			if(keyboardCaptureMode == KeyboardCaptureMode.HARD_CAPTURE) {
+				if(action == GLFW.GLFW_PRESS) {
+					Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 已在绑定模式，按 ESC 退出"), false);
+				}
+				return true;
 			}
-			return true;
 		}
 
 		// ESC：任何捕获模式下都退出绑定（键盘+鼠标全部解绑），
