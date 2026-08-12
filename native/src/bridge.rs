@@ -312,6 +312,7 @@ bind_java_type! {
         },
         static extern fn set_kb_log_file {
             sig = (path: JString),
+            name = "setKbLogFileNative",
             fn = set_kb_log_file,
         },
         static extern fn output_size {
