@@ -10,7 +10,6 @@
 // PipeWire 层面无法细分到窗口，这是粒度极限。
 
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,10 +44,10 @@ pub struct AudioCaptureState {
     pub total_bytes: u64,
     /// 全链路状态（JSON 字符串，供 Java audioCaptureStatus 查询）
     pub pid: u32,
-    pub target_node: u32,
-    pub target_port: u32,
+    /// 方案A：捕获目标 = 系统默认 sink（monitor 全捕获）
+    pub sink_node: u32,
+    pub sink_name: String,
     pub stream_node: u32,
-    pub stream_port: u32,
     pub linked: bool,
     pub last_error: Option<String>,
 }
@@ -78,13 +77,11 @@ fn mainloop_quit(ml: MainLoopPtr) {
     }
 }
 
-/// 枚举 PipeWire registry 中所有 node / port 的信息
+/// 枚举 PipeWire registry 中所有 node 的信息
 #[derive(Default, Clone)]
 struct PwTopology {
     /// node_id -> (media_class, app_pid, node_name, app_process_name)
     pub nodes: HashMap<u32, (String, u32, String, String)>,
-    /// port_id -> (parent_node_id, is_output)
-    pub ports: HashMap<u32, (u32, bool)>,
 }
 
 /// 通过 registry 枚举一次 PipeWire 拓扑（起线程跑 mainloop，主线程等 collect_ms 后 quit）
@@ -134,20 +131,6 @@ fn enumerate_topology(collect_ms: u64) -> Result<PwTopology, String> {
                         );
                     }
                 }
-                pw::types::ObjectType::Port => {
-                    if let Some(parent_id) = global
-                        .props
-                        .and_then(|p| p.get("node.id"))
-                        .and_then(|s| s.parse::<u32>().ok())
-                    {
-                        let is_output = global
-                            .props
-                            .and_then(|p| p.get("port.direction"))
-                            .map(|d| d == "output")
-                            .unwrap_or(false);
-                        t.ports.insert(global.id, (parent_id, is_output));
-                    }
-                }
                 _ => {}
             }
         })
@@ -169,146 +152,73 @@ fn enumerate_topology(collect_ms: u64) -> Result<PwTopology, String> {
     Ok(t.clone())
 }
 
-/// 收集 pid 及其所有后代进程（/proc/<pid>/task/*/children）。
-/// 多进程应用（Firefox/Chrome 等）的音频输出在 content/渲染子进程里，
-/// 窗口 PID 是主进程 —— 只按主进程 PID 精确匹配会永远抓不到声音。
-fn collect_process_tree(pid: u32) -> Vec<u32> {
-    use std::collections::HashSet;
-    let mut result = vec![pid];
-    let mut seen = HashSet::new();
-    seen.insert(pid);
-    let mut queue = vec![pid];
-
-    while let Some(p) = queue.pop() {
-        let task_dir = format!("/proc/{}/task", p);
-        let Ok(entries) = std::fs::read_dir(&task_dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let tid = entry.file_name().to_string_lossy().to_string();
-            let children_path = format!("/proc/{}/task/{}/children", p, tid);
-            let Ok(children) = std::fs::read_to_string(children_path) else {
-                continue;
-            };
-            for child in children.split_whitespace() {
-                let Ok(cpid) = child.parse::<u32>() else {
-                    continue;
-                };
-                if seen.insert(cpid) {
-                    result.push(cpid);
-                    queue.push(cpid);
-                }
-            }
-        }
-    }
-    result
-}
-
-/// 窗口进程的可执行文件名（/proc/<pid>/exe basename），用于进程名级匹配。
-fn process_exe_name(pid: u32) -> Option<String> {
-    let exe = std::fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
-    exe.file_name().map(|n| n.to_string_lossy().to_string())
-}
-
-/// 找目标进程的音频输出节点 + 它的 output 端口。
+/// 找系统默认输出 sink（方案A：monitor 全捕获，不再按 PID 匹配应用节点）。
 ///
-/// 匹配策略（由松到严，全部走 PipeWire 节点属性）：
-/// 1. app.process.id ∈ 窗口进程树（窗口 PID 本身 + 所有后代，覆盖 Firefox 多进程）；
-/// 2. app.process.name == 窗口进程 exe basename（pipewire 的 app.process.name 取自
-///    进程 exe，content 进程与主进程同名；兜底匹配）。
-fn find_process_audio(pid: u32, topo: &PwTopology) -> Result<(u32, u32), String> {
-    let tree = collect_process_tree(pid);
-    let exe_name = process_exe_name(pid);
+/// 捕获目标 = sink 的 monitor 端口：PipeWire 每个输出设备（Audio/Sink）自带一个
+/// monitor，能录到"所有正在往该设备播放的声音"。设置 target.object 指向 sink 后，
+/// capture stream 用 AUTOCONNECT 自动连 monitor，无需 pw-link 手动连接。
+///
+/// 多 sink 时（HDMI + 耳机）选第一个；全部 dump 到日志便于核对。
+fn find_default_sink(topo: &PwTopology) -> Result<(u32, String), String> {
+    let mut sinks: Vec<(u32, String)> = topo
+        .nodes
+        .iter()
+        .filter(|(_, (media_class, _, _, _))| media_class == "Audio/Sink")
+        .map(|(id, (_, _, name, _))| (*id, name.clone()))
+        .collect();
 
-    // 优先 Stream/Output/Audio（普通应用输出流）；其次 Audio/Sink（某些应用自建 sink）
-    let mut best_node = None;
-    let mut best_score = 0i32;
-
-    for (node_id, (media_class, app_pid, _name, proc_name)) in &topo.nodes {
-        let pid_ok = tree.iter().any(|p| p == app_pid);
-        let name_ok = !pid_ok
-            && exe_name.is_some()
-            && !proc_name.is_empty()
-            && proc_name.eq_ignore_ascii_case(exe_name.as_deref().unwrap_or(""));
-        if !pid_ok && !name_ok {
-            continue;
-        }
-        let mut score = if media_class.contains("Stream/Output/Audio") {
-            2
-        } else if media_class == "Audio/Sink" {
-            1
-        } else {
-            0
-        };
-        if pid_ok {
-            score += 10; // 进程树精确命中优先于进程名兜底
-        }
-        if score > best_score {
-            best_score = score;
-            best_node = Some(*node_id);
-        }
+    // 精确 "Audio/Sink" 匹配不到时，兜底用 contains（某些版本可能带后缀）
+    if sinks.is_empty() {
+        sinks = topo
+            .nodes
+            .iter()
+            .filter(|(_, (media_class, _, _, _))| media_class.contains("Audio/Sink"))
+            .map(|(id, (_, _, name, _))| (*id, name.clone()))
+            .collect();
     }
 
-    let node_id = best_node.ok_or_else(|| {
-        // 失败时列出所有候选节点，方便直接看 key 是否又对不上
-        let mut candidates = Vec::new();
-        for (node_id, (media_class, app_pid, _name, proc_name)) in &topo.nodes {
-            candidates.push(format!(
-                "  node {}: class={} pid={} proc={}",
-                node_id, media_class, app_pid, proc_name
-            ));
-        }
-        format!(
-            "no PipeWire audio node found for pid={} (tree={} nodes, exe={:?}) — app may be silent or audio not on PipeWire\ncandidates:\n{}",
-            pid,
-            tree.len(),
-            exe_name,
-            candidates.join("\n")
-        )
-    })?;
-
-    // 找该节点的 output 端口（对 Stream/Output/Audio，输出端口是接 sink 的那个）
-    let mut port_id = None;
-    for (port_id_, (parent, is_output)) in &topo.ports {
-        if *parent == node_id && *is_output {
-            port_id = Some(*port_id_);
-            break;
-        }
+    for (id, name) in &sinks {
+        audio_log!("[audio] candidate sink: id={} name={}", id, name);
     }
-    let out_port = port_id.ok_or_else(|| format!("node {} has no output port", node_id))?;
 
-    Ok((node_id, out_port))
+    if sinks.is_empty() {
+        return Err("no Audio/Sink node found — PipeWire 可能没在跑，或没有音频输出设备".to_string());
+    }
+
+    // 选第一个（通常即默认输出）；如需精确默认 sink 可后续读 metadata default.audio.sink
+    let (id, name) = sinks.remove(0);
+    Ok((id, name))
 }
 
-/// 启动音频捕获：匹配 pid 的音频节点 → capture stream → pw-link 强制连接
+/// 启动音频捕获（方案A）：捕获系统默认 sink 的 monitor（全系统音频），
+/// 不再按 PID 匹配应用节点。窗口 pid 仅作日志记录。
 pub fn start_audio_capture(pid: u32) -> Result<(), String> {
     // 确保没有正在运行的捕获
     stop_audio_capture();
 
-    audio_log!("[audio] ===== start_audio_capture pid={} =====", pid);
-    audio_log!("[audio] stage 1/6: 枚举 PipeWire 拓扑（节点/端口）...");
+    audio_log!("[audio] ===== start_audio_capture (方案A: monitor 全捕获, 窗口 pid={}) =====", pid);
+    audio_log!("[audio] stage 1/4: 枚举 PipeWire 拓扑（节点）...");
     let topo = enumerate_topology(500).map_err(|e| {
         let msg = format!("[audio] 拓扑枚举失败: {}", e);
         audio_log!("{}", msg);
         msg
     })?;
     audio_log!(
-        "[audio] stage 1/6: OK — {} nodes, {} ports",
-        topo.nodes.len(),
-        topo.ports.len()
+        "[audio] stage 1/4: OK — {} nodes",
+        topo.nodes.len()
     );
-    audio_log!("[audio] stage 2/6: 匹配 pid={} 的音频输出节点...", pid);
-    let (target_node, target_port) = find_process_audio(pid, &topo).map_err(|e| {
-        let msg = format!("[audio] 节点匹配失败: {}", e);
+    audio_log!("[audio] stage 2/4: 选默认 sink（monitor 捕获目标）...");
+    let (sink_node, sink_name) = find_default_sink(&topo).map_err(|e| {
+        let msg = format!("[audio] 找不到默认 sink: {}", e);
         audio_log!("{}", msg);
         msg
     })?;
     audio_log!(
-        "[audio] stage 2/6: OK — target node={} (output port {}) for pid={}",
-        target_node, target_port, pid
+        "[audio] stage 2/4: OK — sink node={} name={}",
+        sink_node, sink_name
     );
 
-    audio_log!("[audio] stage 3/6: 创建 capture stream...");
+    audio_log!("[audio] stage 3/4: 创建 capture stream (target={})...", sink_name);
     pw::init();
     let mainloop = pw::main_loop::MainLoop::new(None).map_err(|e| format!("mainloop: {}", e))?;
     let context = pw::context::Context::new(&mainloop).map_err(|e| format!("context: {}", e))?;
@@ -325,10 +235,9 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         capture_events: 0,
         total_bytes: 0,
         pid,
-        target_node,
-        target_port,
+        sink_node,
+        sink_name: sink_name.clone(),
         stream_node: 0,
-        stream_port: 0,
         linked: false,
         last_error: None,
     }));
@@ -340,6 +249,9 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
             *pw::keys::MEDIA_TYPE => "Audio",
             *pw::keys::MEDIA_CATEGORY => "Capture",
             *pw::keys::MEDIA_ROLE => "Communication",
+            // 方案A：target.object 指向默认 sink → PipeWire 自动连它的 monitor
+            // （配合 AUTOCONNECT，无需 pw-link 手动连接）
+            "target.object" => sink_name,
         },
     )
     .map_err(|e| format!("stream: {}", e))?;
@@ -365,7 +277,7 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
                                     s.capture_events += 1;
                                     if s.capture_events == 1 {
                                         log_line = Some(format!(
-                                            "[audio] stage 5/6: FIRST capture — {} bytes (process 回调 LIVE)",
+                                            "[audio] FIRST capture — {} bytes (process 回调 LIVE)",
                                             src.len()
                                         ));
                                     } else if s.capture_events % 2000 == 0 {
@@ -432,50 +344,17 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         .connect(
             pw::spa::utils::Direction::Input,
             None,
-            pw::stream::StreamFlags::MAP_BUFFERS,
+            pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
             &mut params,
         )
         .map_err(|e| format!("connect: {}", e))?;
 
-    // 等 stream 的 node/port global 出现在 registry 上
+    // 等 stream 的 node global 出现在 registry 上，拿 node_id 用于诊断
     std::thread::sleep(Duration::from_millis(400));
-    audio_log!("[audio] stage 4/6: 定位 capture stream 的 input 端口...");
-    let topo2 = enumerate_topology(400)?;
     let stream_node = stream.node_id();
-    audio_log!("[audio] capture stream node={}", stream_node);
-
-    // 找 stream 的 input 端口
-    let mut stream_port = None;
-    for (port_id, (parent, is_output)) in &topo2.ports {
-        if *parent == stream_node && !*is_output {
-            stream_port = Some(*port_id);
-            break;
-        }
-    }
-    let stream_port =
-        stream_port.ok_or_else(|| format!("capture stream {} has no input port", stream_node))?;
     audio_log!(
-        "[audio] stage 4/6: OK — stream input port={}",
-        stream_port
-    );
-
-    // 用 pw-link 强制连接：目标节点 output 端口 → capture stream input 端口
-    // （目标端口可能已连 sink，pw-link 允许一个 output 端口多路 fan-out）
-    audio_log!("[audio] stage 5/6: pw-link 连接 {} -> {} ...", target_port, stream_port);
-    let output = Command::new("pw-link")
-        .args(&[&target_port.to_string(), &stream_port.to_string()])
-        .output()
-        .map_err(|e| format!("pw-link: {} (install pipewire-utils)", e))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let msg = format!("[audio] pw-link failed: {}", stderr.trim());
-        audio_log!("{}", msg);
-        return Err(msg);
-    }
-    audio_log!(
-        "[audio] stage 5/6: OK — linked {} -> {} (node {} -> stream {})",
-        target_port, stream_port, target_node, stream_node
+        "[audio] stage 4/4: capture stream node={}（AUTOCONNECT 已连 sink monitor）",
+        stream_node
     );
 
     // 保存全局状态（含保活 stream + mainloop）；后台线程跑 mainloop
@@ -489,7 +368,6 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
             s._mainloop = Some(mainloop);
             s._listener = Some(listener);
             s.stream_node = stream_node;
-            s.stream_port = stream_port;
             s.linked = true;
         }
         *guard = Some(state.clone());
@@ -502,7 +380,7 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         })
         .map_err(|e| format!("spawn: {}", e))?;
 
-    audio_log!("[audio] stage 6/6: OK — 捕获会话已启动，等待 process 回调产出 PCM");
+    audio_log!("[audio] stage 4/4: OK — 捕获会话已启动（monitor 全捕获），等待 process 回调产出 PCM");
     Ok(())
 }
 
@@ -566,17 +444,16 @@ pub fn get_audio_capture_status() -> String {
 
     format!(
         concat!(
-            r#"{{"active":{},"stage":"{}","pid":{},"target_node":{},"target_port":{},"#,
-            r#""stream_node":{},"stream_port":{},"linked":{},"capture_events":{},"#,
+            r#"{{"active":{},"stage":"{}","mode":"monitor","pid":{},"sink_node":{},"#,
+            r#""sink_name":"{}","stream_node":{},"linked":{},"capture_events":{},"#,
             r#""total_bytes":{},"sample_rate":{},"channels":{},"last_error":{}}}"#
         ),
         s.active,
         stage,
         s.pid,
-        s.target_node,
-        s.target_port,
+        s.sink_node,
+        s.sink_name.replace('"', "'"),
         s.stream_node,
-        s.stream_port,
         s.linked,
         s.capture_events,
         s.total_bytes,
