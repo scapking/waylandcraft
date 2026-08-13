@@ -40,15 +40,32 @@ public class SharedWindowServerHandler {
 			return;
 		}
 		
+		// 定向共享：解析目标玩家名 → UUID（找不到或离线则回退为公开共享，避免静默失效）
+		UUID targetUUID = null;
+		String targetName = payload.targetPlayer();
+		if(targetName != null && !targetName.isBlank()) {
+			var server = WaylandCraftCommon.instance.server;
+			if(server != null) {
+				ServerPlayer target = server.getPlayerList().getPlayerByName(targetName);
+				if(target != null) {
+					targetUUID = target.getUUID();
+				} else {
+					LOGGER.warn("Player {} requested targeted share to unknown/offline player '{}', falling back to public",
+						playerUUID, targetName);
+				}
+			}
+		}
+		
 		// 注册窗口
 		SharedWindowEntry entry = manager.registerWindow(
 			payload.windowHandle(),
 			playerUUID,
-			payload.windowTitle()
+			payload.windowTitle(),
+			targetUUID
 		);
 		
-		LOGGER.info("Player {} registered window 0x{}: {}", 
-			playerUUID, Long.toHexString(payload.windowHandle()), payload.windowTitle());
+		LOGGER.info("Player {} registered window 0x{}: {} (targeted={})", 
+			playerUUID, Long.toHexString(payload.windowHandle()), payload.windowTitle(), targetUUID != null);
 		
 		// 广播窗口列表给所有玩家
 		broadcastWindowListToAll(manager);
@@ -204,6 +221,82 @@ public class SharedWindowServerHandler {
 		return p != null ? p.getName().getString() : uuid.toString().substring(0, 8);
 	}
 	
+	/**
+	 * 处理窗口所有者（owner）的授权管理命令（定向授权 / 去除共享 / 列授权）。
+	 * 按窗口走 owner 权威校验：非 owner 一律拒绝。
+	 */
+	public static void handleWindowPermCommand(SharedWindowPermCommandPayload payload, ServerPlayer player) {
+		UUID playerUUID = player.getUUID();
+		SharedWindowManager manager = WaylandCraftCommon.instance.sharedWindowManager;
+		SharedWindowEntry entry = manager.getWindow(payload.windowHandle());
+
+		if(entry == null) {
+			sendPermResponse(player, "Window not found: 0x" + Long.toHexString(payload.windowHandle()));
+			return;
+		}
+		if(!entry.getOwnerUUID().equals(playerUUID)) {
+			LOGGER.warn("Player {} denied perm command on window 0x{} (not owner)", playerUUID, Long.toHexString(payload.windowHandle()));
+			sendPermResponse(player, "Only the window owner can manage its sharing");
+			return;
+		}
+
+		switch(payload.action()) {
+			case SharedWindowPermCommandPayload.ACTION_GRANT -> {
+				String targetName = payload.targetName();
+				ServerPlayer target = WaylandCraftCommon.instance.server.getPlayerList().getPlayerByName(targetName);
+				if(target == null) {
+					sendPermResponse(player, "Player not found: " + targetName);
+					return;
+				}
+				if(target.getUUID().equals(entry.getOwnerUUID())) {
+					sendPermResponse(player, "Owner already has full control");
+					return;
+				}
+				manager.updatePermission(payload.windowHandle(), target.getUUID(), WindowPermission.VIEW, playerUUID);
+				sendPermResponse(player, "Granted VIEW to " + targetName + " on 0x" + Long.toHexString(payload.windowHandle()));
+				notifyPermissionChange(payload.windowHandle(), target.getUUID(), WindowPermission.VIEW);
+				broadcastWindowListToAll(manager);
+			}
+			case SharedWindowPermCommandPayload.ACTION_REVOKE -> {
+				String targetName = payload.targetName();
+				ServerPlayer target = WaylandCraftCommon.instance.server.getPlayerList().getPlayerByName(targetName);
+				if(target == null) {
+					sendPermResponse(player, "Player not found: " + targetName);
+					return;
+				}
+				manager.updatePermission(payload.windowHandle(), target.getUUID(), WindowPermission.NONE, playerUUID);
+				sendPermResponse(player, "Revoked access for " + targetName + " on 0x" + Long.toHexString(payload.windowHandle()));
+				notifyPermissionChange(payload.windowHandle(), target.getUUID(), WindowPermission.NONE);
+				broadcastWindowListToAll(manager);
+			}
+			case SharedWindowPermCommandPayload.ACTION_LIST -> {
+				StringBuilder sb = new StringBuilder("=== Window 0x" + Long.toHexString(payload.windowHandle()) + " permissions ===\n");
+				sb.append("Owner: ").append(resolveName(player, entry.getOwnerUUID())).append(" (CONTROL)\n");
+				sb.append("Mode: ").append(entry.isTargeted() ? "targeted" : "public").append("\n");
+				boolean any = false;
+				for(Map.Entry<UUID, WindowPermission> e : entry.getAllPermissions().entrySet()) {
+					if(e.getKey().equals(entry.getOwnerUUID())) continue;
+					sb.append("  ").append(resolveName(player, e.getKey())).append(": ").append(e.getValue().name()).append("\n");
+					any = true;
+				}
+				if(!any) sb.append("  (no other players)\n");
+				for(String line : sb.toString().split("\\n")) {
+					player.sendSystemMessage(Component.literal(line));
+				}
+			}
+			default -> sendPermResponse(player, "Unknown action: " + payload.action());
+		}
+	}
+
+	/** 给目标玩家发送权限变更通知（用于客户端即时刷新其窗口列表/显示） */
+	private static void notifyPermissionChange(long windowHandle, UUID targetUUID, WindowPermission permission) {
+		ServerPlayer targetPlayer = WaylandCraftCommon.instance.server.getPlayerList().getPlayer(targetUUID);
+		if(targetPlayer != null) {
+			SharedWindowPermissionPayload permissionPayload = new SharedWindowPermissionPayload(windowHandle, targetUUID, permission);
+			ServerPlayNetworking.send(targetPlayer, permissionPayload);
+		}
+	}
+
 	/**
 	 * 处理权限更新请求
 	 */

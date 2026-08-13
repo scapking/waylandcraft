@@ -207,6 +207,12 @@ public class WaylandCraft implements ClientModInitializer {
 				} catch (Throwable t) {
 					WaylandCraftCommon.LOGGER.warn("[kb] setKbLogFile failed: {}", t.toString());
 				}
+				// Rust 侧 [audio] 全链路日志写入独立文件（PID→拓扑→节点→link→回调）。
+				try {
+					bridge.setAudioLogFile(new File(Minecraft.getInstance().gameDirectory, "waylandcraft-audio.log").getAbsolutePath());
+				} catch (Throwable t) {
+					WaylandCraftCommon.LOGGER.warn("[audio] setAudioLogFile failed: {}", t.toString());
+				}
 				xdgManager = new XDGDesktopManager(this);
 				settingsManager = new WaylandCraftSettingsManager(this);
 				templateManager.init(Minecraft.getInstance().gameDirectory);

@@ -42,6 +42,9 @@ public class WaylandCraftNetworking {
 		PayloadTypeRegistry.serverboundPlay().register(PermissionCommandPayload.TYPE, PermissionCommandPayload.CODEC);
 		PayloadTypeRegistry.clientboundPlay().register(PermissionResponsePayload.TYPE, PermissionResponsePayload.CODEC);
 		
+		// 窗口所有者（owner）授权管理命令
+		PayloadTypeRegistry.serverboundPlay().register(SharedWindowPermCommandPayload.TYPE, SharedWindowPermCommandPayload.CODEC);
+		
 		ServerPlayNetworking.registerGlobalReceiver(ServerboundGiveItemsPayload.TYPE, (payload, ctx) -> {
 			IMyServerPlayer plr = (IMyServerPlayer) ctx.player();
 			if(plr.getItemGiveCooldown() > 0) return;
@@ -83,6 +86,13 @@ public class WaylandCraftNetworking {
 		ServerPlayNetworking.registerGlobalReceiver(PermissionCommandPayload.TYPE, (payload, ctx) -> {
 			ctx.server().execute(() -> {
 				SharedWindowServerHandler.handlePermissionCommand(payload, ctx.player());
+			});
+		});
+		
+		// 处理窗口所有者授权管理命令
+		ServerPlayNetworking.registerGlobalReceiver(SharedWindowPermCommandPayload.TYPE, (payload, ctx) -> {
+			ctx.server().execute(() -> {
+				SharedWindowServerHandler.handleWindowPermCommand(payload, ctx.player());
 			});
 		});
 		

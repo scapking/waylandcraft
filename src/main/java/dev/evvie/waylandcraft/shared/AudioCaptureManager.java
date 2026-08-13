@@ -44,6 +44,13 @@ public class AudioCaptureManager {
 	private boolean firstAudioLogged = false;
 	private long totalAudioBytes = 0;
 	private long nextAudioLogBytes = 1_000_000;
+
+	// 全链路状态追踪（供 /wl audio status 查询）
+	private volatile int resolvedPid = -1;        // 来源：窗口 → PID
+	private volatile String sourceStage = "idle"; // 来源解析方式（wayland / x11 / none）
+	private volatile String lastError = null;     // 最近一次失败原因
+	private volatile long sentPackets = 0;        // 接口：已发送的音频包数
+	private volatile long startedAt = 0;          // 捕获启动时间戳
 	
 	public AudioCaptureManager(WaylandCraft clientMod) {
 		this.clientMod = clientMod;
@@ -64,25 +71,32 @@ public class AudioCaptureManager {
 		
 		int pid = findPidForWindow(windowHandle, title, appId);
 		if(pid <= 0) {
+			lastError = "cannot resolve PID for window (no wayland client pid & no X11 _NET_WM_PID match)";
+			sourceStage = "none";
 			LOGGER.warn("Audio capture: cannot resolve PID for window '{}' (appId={}) — audio sharing unavailable for this window",
 				title, appId);
 			return false;
 		}
+		resolvedPid = pid;
 		
 		try {
 			clientMod.bridge.audioCaptureStart(pid);
 		} catch(Throwable t) {
+			lastError = "audioCaptureStart failed: " + t.toString();
 			LOGGER.error("Audio capture start failed: {}", t.toString());
 			return false;
 		}
 		
 		started = true;
+		startedAt = System.currentTimeMillis();
 		seqCounter = 0;
 		lastPollTime = 0;
 		firstAudioLogged = false;
 		totalAudioBytes = 0;
+		sentPackets = 0;
 		nextAudioLogBytes = 1_000_000;
-		LOGGER.info("Audio capture started for window '{}' (pid={})", title, pid);
+		lastError = null;
+		LOGGER.info("Audio capture started for window '{}' (pid={}, source={})", title, pid, sourceStage);
 		return true;
 	}
 	
@@ -133,6 +147,7 @@ public class AudioCaptureManager {
 			SharedWindowAudioPayload payload = new SharedWindowAudioPayload(
 				windowHandle(), seqCounter++, sampleRate, channels, chunk);
 			ClientPlayNetworking.send(payload);
+			sentPackets++;
 		}
 	}
 	
@@ -149,11 +164,42 @@ public class AudioCaptureManager {
 				LOGGER.warn("Audio capture stop failed", t);
 			}
 		}
-		LOGGER.info("Audio capture stopped");
+		LOGGER.info("Audio capture stopped (total {} bytes, {} packets)", totalAudioBytes, sentPackets);
 	}
 	
 	public boolean isStarted() {
 		return started;
+	}
+	
+	/**
+	 * 发送端全链路状态（供 /wl audio status 展示）。
+	 * 覆盖：来源(PID) → 捕获(是否已启动 native) → 接口(已发字节/包数) + native 侧状态。
+	 */
+	public String getStatusSummary() {
+		StringBuilder sb = new StringBuilder();
+		sb.append("发送端 (capture):\n");
+		sb.append("  started: ").append(started).append("\n");
+		sb.append("  pid: ").append(resolvedPid > 0 ? resolvedPid : "N/A").append("\n");
+		sb.append("  pid source: ").append(sourceStage).append("\n");
+		sb.append("  window: 0x").append(Long.toHexString(activeWindowHandle)).append("\n");
+		sb.append("  bytes streamed: ").append(totalAudioBytes).append("\n");
+		sb.append("  packets sent: ").append(sentPackets).append("\n");
+		if(startedAt > 0) {
+			sb.append("  uptime: ").append((System.currentTimeMillis() - startedAt) / 1000).append("s\n");
+		}
+		if(lastError != null) {
+			sb.append("  last error: ").append(lastError).append("\n");
+		}
+		// native 侧链路状态（JSON）
+		if(clientMod != null && clientMod.bridge != null) {
+			try {
+				String nativeStatus = clientMod.bridge.audioCaptureStatus();
+				sb.append("  native: ").append(nativeStatus).append("\n");
+			} catch(Throwable t) {
+				sb.append("  native: unavailable (").append(t.toString()).append(")\n");
+			}
+		}
+		return sb.toString();
 	}
 	
 	/**
@@ -178,6 +224,7 @@ public class AudioCaptureManager {
 			try {
 				int pid = clientMod.bridge.toplevelPid(windowHandle);
 				if(pid > 0) {
+					sourceStage = "wayland(SO_PEERCRED)";
 					LOGGER.info("Audio capture: wayland client pid={} for window '{}'", pid, title);
 					return pid;
 				}
@@ -223,6 +270,7 @@ public class AudioCaptureManager {
 			LOGGER.debug("No X11 window matches '{}' / '{}' ({} windows listed)", title, appId, windows.size());
 			return 0;
 		}
+		sourceStage = "x11(_NET_WM_PID)";
 		return best.pid;
 	}
 	

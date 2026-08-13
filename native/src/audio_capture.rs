@@ -17,6 +17,13 @@ use std::time::Duration;
 use pipewire as pw;
 use pw::prelude::*;
 
+/// [audio] 日志宏：同时写 stderr 和 audio 日志文件（bridge::audio_log_write）。
+macro_rules! audio_log {
+    ($($arg:tt)*) => {
+        crate::bridge::audio_log_write(&format!($($arg)*))
+    };
+}
+
 /// 全局捕获状态（native 侧单例，一次只允许一个音频捕获会话）
 static AUDIO_CAPTURE: Mutex<Option<Arc<Mutex<AudioCaptureState>>>> = Mutex::new(None);
 
@@ -36,6 +43,14 @@ pub struct AudioCaptureState {
     /// 诊断计数：process 回调触发次数 / 累计捕获字节
     pub capture_events: u64,
     pub total_bytes: u64,
+    /// 全链路状态（JSON 字符串，供 Java audioCaptureStatus 查询）
+    pub pid: u32,
+    pub target_node: u32,
+    pub target_port: u32,
+    pub stream_node: u32,
+    pub stream_port: u32,
+    pub linked: bool,
+    pub last_error: Option<String>,
 }
 
 // libpipewire 的 pw_stream / pw_core 内部自带线程安全（有锁），Rust 绑定
@@ -270,18 +285,30 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
     // 确保没有正在运行的捕获
     stop_audio_capture();
 
-    let topo = enumerate_topology(500)?;
-    eprintln!(
-        "[audio] enumerated {} nodes, {} ports",
+    audio_log!("[audio] ===== start_audio_capture pid={} =====", pid);
+    audio_log!("[audio] stage 1/6: 枚举 PipeWire 拓扑（节点/端口）...");
+    let topo = enumerate_topology(500).map_err(|e| {
+        let msg = format!("[audio] 拓扑枚举失败: {}", e);
+        audio_log!("{}", msg);
+        msg
+    })?;
+    audio_log!(
+        "[audio] stage 1/6: OK — {} nodes, {} ports",
         topo.nodes.len(),
         topo.ports.len()
     );
-    let (target_node, target_port) = find_process_audio(pid, &topo)?;
-    eprintln!(
-        "[audio] target node={} (output port {}) for pid={}",
+    audio_log!("[audio] stage 2/6: 匹配 pid={} 的音频输出节点...", pid);
+    let (target_node, target_port) = find_process_audio(pid, &topo).map_err(|e| {
+        let msg = format!("[audio] 节点匹配失败: {}", e);
+        audio_log!("{}", msg);
+        msg
+    })?;
+    audio_log!(
+        "[audio] stage 2/6: OK — target node={} (output port {}) for pid={}",
         target_node, target_port, pid
     );
 
+    audio_log!("[audio] stage 3/6: 创建 capture stream...");
     pw::init();
     let mainloop = pw::main_loop::MainLoop::new(None).map_err(|e| format!("mainloop: {}", e))?;
     let context = pw::context::Context::new(&mainloop).map_err(|e| format!("context: {}", e))?;
@@ -297,6 +324,13 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         _listener: None,
         capture_events: 0,
         total_bytes: 0,
+        pid,
+        target_node,
+        target_port,
+        stream_node: 0,
+        stream_port: 0,
+        linked: false,
+        last_error: None,
     }));
 
     let stream = pw::stream::Stream::new(
@@ -331,7 +365,7 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
                                     s.capture_events += 1;
                                     if s.capture_events == 1 {
                                         log_line = Some(format!(
-                                            "[audio] FIRST capture: {} bytes (capture stream LIVE)",
+                                            "[audio] stage 5/6: FIRST capture — {} bytes (process 回调 LIVE)",
                                             src.len()
                                         ));
                                     } else if s.capture_events % 2000 == 0 {
@@ -343,7 +377,7 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
                                 }
                             }
                             if let Some(line) = log_line {
-                                eprintln!("{line}");
+                                audio_log!("{}", line);
                             }
                         }
                     }
@@ -405,9 +439,10 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
 
     // 等 stream 的 node/port global 出现在 registry 上
     std::thread::sleep(Duration::from_millis(400));
+    audio_log!("[audio] stage 4/6: 定位 capture stream 的 input 端口...");
     let topo2 = enumerate_topology(400)?;
     let stream_node = stream.node_id();
-    eprintln!("[audio] capture stream node={}", stream_node);
+    audio_log!("[audio] capture stream node={}", stream_node);
 
     // 找 stream 的 input 端口
     let mut stream_port = None;
@@ -419,9 +454,14 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
     }
     let stream_port =
         stream_port.ok_or_else(|| format!("capture stream {} has no input port", stream_node))?;
+    audio_log!(
+        "[audio] stage 4/6: OK — stream input port={}",
+        stream_port
+    );
 
     // 用 pw-link 强制连接：目标节点 output 端口 → capture stream input 端口
     // （目标端口可能已连 sink，pw-link 允许一个 output 端口多路 fan-out）
+    audio_log!("[audio] stage 5/6: pw-link 连接 {} -> {} ...", target_port, stream_port);
     let output = Command::new("pw-link")
         .args(&[&target_port.to_string(), &stream_port.to_string()])
         .output()
@@ -429,10 +469,12 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("pw-link failed: {}", stderr.trim()));
+        let msg = format!("[audio] pw-link failed: {}", stderr.trim());
+        audio_log!("{}", msg);
+        return Err(msg);
     }
-    eprintln!(
-        "[audio] linked port {} -> {} (node {} -> stream {})",
+    audio_log!(
+        "[audio] stage 5/6: OK — linked {} -> {} (node {} -> stream {})",
         target_port, stream_port, target_node, stream_node
     );
 
@@ -446,6 +488,9 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
             s._stream = Some(stream);
             s._mainloop = Some(mainloop);
             s._listener = Some(listener);
+            s.stream_node = stream_node;
+            s.stream_port = stream_port;
+            s.linked = true;
         }
         *guard = Some(state.clone());
     }
@@ -457,6 +502,7 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         })
         .map_err(|e| format!("spawn: {}", e))?;
 
+    audio_log!("[audio] stage 6/6: OK — 捕获会话已启动，等待 process 回调产出 PCM");
     Ok(())
 }
 
@@ -492,5 +538,53 @@ pub fn stop_audio_capture() {
         std::thread::sleep(Duration::from_millis(100));
         s._stream = None;
     }
-    eprintln!("[audio] capture stopped");
+    audio_log!("[audio] capture stopped");
+}
+
+/// 返回当前音频捕获链路状态（JSON 字符串），供 Java /wl audio status 查询。
+/// 覆盖全链路：是否有会话 → PID → 拓扑节点/端口 → 目标节点 → 是否已 link → 回调/字节统计。
+pub fn get_audio_capture_status() -> String {
+    let guard = match AUDIO_CAPTURE.lock() {
+        Ok(g) => g,
+        Err(e) => e.into_inner(),
+    };
+    let Some(state) = guard.as_ref() else {
+        return r#"{"active":false,"stage":"idle","note":"no capture session"}"#.to_string();
+    };
+    let s = match state.lock() {
+        Ok(s) => s,
+        Err(e) => e.into_inner(),
+    };
+
+    let stage = if !s.active {
+        "stopped"
+    } else if s.capture_events == 0 {
+        "linked_waiting_for_callback"
+    } else {
+        "streaming"
+    };
+
+    format!(
+        concat!(
+            r#"{{"active":{},"stage":"{}","pid":{},"target_node":{},"target_port":{},"#,
+            r#""stream_node":{},"stream_port":{},"linked":{},"capture_events":{},"#,
+            r#""total_bytes":{},"sample_rate":{},"channels":{},"last_error":{}}}"#
+        ),
+        s.active,
+        stage,
+        s.pid,
+        s.target_node,
+        s.target_port,
+        s.stream_node,
+        s.stream_port,
+        s.linked,
+        s.capture_events,
+        s.total_bytes,
+        s.sample_rate,
+        s.channels,
+        match &s.last_error {
+            Some(e) => format!("\"{}\"", e.replace('"', "'")),
+            None => "null".to_string(),
+        }
+    )
 }

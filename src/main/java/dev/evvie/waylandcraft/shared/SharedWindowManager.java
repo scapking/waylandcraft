@@ -25,12 +25,25 @@ public class SharedWindowManager {
 	}
 
 	public SharedWindowEntry registerWindow(long windowHandle, UUID ownerUUID, String windowTitle) {
-		SharedWindowEntry entry = new SharedWindowEntry(windowHandle, ownerUUID, windowTitle);
+		return registerWindow(windowHandle, ownerUUID, windowTitle, null);
+	}
+
+	/**
+	 * 注册共享窗口。
+	 *
+	 * @param targetPlayerUUID 定向共享目标（null = 公开共享给所有人）
+	 */
+	public SharedWindowEntry registerWindow(long windowHandle, UUID ownerUUID, String windowTitle, @Nullable UUID targetPlayerUUID) {
+		SharedWindowEntry entry = new SharedWindowEntry(windowHandle, ownerUUID, windowTitle, targetPlayerUUID);
 		windowRegistry.put(windowHandle, entry);
 
 		subscribePlayer(ownerUUID, windowHandle);
+		if (targetPlayerUUID != null && !targetPlayerUUID.equals(ownerUUID)) {
+			subscribePlayer(targetPlayerUUID, windowHandle);
+		}
 
-		LOGGER.info("Window registered: 0x{} by {}", Long.toHexString(windowHandle), ownerUUID);
+		LOGGER.info("Window registered: 0x{} by {} (targeted={})",
+			Long.toHexString(windowHandle), ownerUUID, targetPlayerUUID != null);
 		return entry;
 	}
 
@@ -95,8 +108,11 @@ public class SharedWindowManager {
 		SharedWindowEntry entry = windowRegistry.get(windowHandle);
 		if (entry == null) return false;
 
-		if (!entry.hasPermission(requesterUUID, WindowPermission.CONTROL)) {
-			LOGGER.warn("Player {} denied permission update for window 0x{}", requesterUUID, Long.toHexString(windowHandle));
+		// owner 权威：只有窗口所有者能改权限（管理员/其他 CONTROL 持有者一律拒绝）。
+		// 原实现按 hasPermission(CONTROL) 判断，任何被授予 CONTROL 的玩家都能越权改权限，
+		// 违背"谁共享谁管理"的安全模型。
+		if (!entry.getOwnerUUID().equals(requesterUUID)) {
+			LOGGER.warn("Player {} denied permission update for window 0x{} (not owner)", requesterUUID, Long.toHexString(windowHandle));
 			return false;
 		}
 
@@ -105,6 +121,8 @@ public class SharedWindowManager {
 
 		if (permission == WindowPermission.NONE) {
 			unsubscribePlayer(targetUUID, windowHandle);
+		} else {
+			subscribePlayer(targetUUID, windowHandle);
 		}
 
 		return true;
@@ -132,15 +150,19 @@ public class SharedWindowManager {
 	}
 
 	/**
-	 * 给新加入的玩家授予所有已注册窗口的VIEW权限
+	 * 给新加入的玩家授予"公开共享"窗口的 VIEW 权限。
+	 * 定向共享的窗口（targetPlayerUUID != null）不自动授权 —— 只有被 owner 指定的玩家可见。
 	 */
 	public void grantViewToNewPlayer(UUID playerUUID) {
+		int granted = 0;
 		for (SharedWindowEntry entry : windowRegistry.values()) {
+			if (entry.isTargeted()) continue; // 定向共享：不自动授权
 			if (!entry.getOwnerUUID().equals(playerUUID)) {
 				entry.setPermission(playerUUID, WindowPermission.VIEW);
+				granted++;
 			}
 		}
-		LOGGER.info("Granted VIEW permission to new player {} for {} windows", playerUUID, windowRegistry.size());
+		LOGGER.info("Granted VIEW permission to new player {} for {} public windows", playerUUID, granted);
 	}
 
 	public int getWindowCount() {

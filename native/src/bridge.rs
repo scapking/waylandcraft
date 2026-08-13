@@ -65,6 +65,25 @@ pub fn kb_log_write(s: &str) {
     }
 }
 
+/// Rust 侧音频捕获日志文件（Java 通过 setAudioLogFile 设置路径）。
+/// 全链路：PID → 拓扑枚举 → 节点匹配 → stream 建连 → pw-link → process 回调。
+/// 所有 [audio] 行同时写 stderr 和此文件（eprintln 只进 stderr，不进 latest.log）。
+static AUDIO_LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+/// 追加一行到 AUDIO_LOG_FILE（若已设置），失败静默忽略。同时写 stderr。
+pub fn audio_log_write(s: &str) {
+    eprintln!("{s}");
+    use std::io::Write;
+    let mut guard = match AUDIO_LOG_FILE.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(f) = guard.as_mut() {
+        let _ = writeln!(f, "{s}");
+        let _ = f.flush();
+    }
+}
+
 #[allow(clippy::vec_box)]
 pub(crate) struct BridgeState {
     /* Handle collections */
@@ -314,6 +333,16 @@ bind_java_type! {
             sig = (path: JString),
             name = "setKbLogFileNative",
             fn = set_kb_log_file,
+        },
+        static extern fn set_audio_log_file {
+            sig = (path: JString),
+            name = "setAudioLogFileNative",
+            fn = set_audio_log_file,
+        },
+        static extern fn audio_capture_status {
+            sig = (instance: jlong) -> JString,
+            name = "audioCaptureStatusNative",
+            fn = audio_capture_status,
         },
         static extern fn output_size {
             sig = (instance: jlong) -> jint[],
@@ -1458,6 +1487,50 @@ fn set_kb_log_file<'local>(
             Ok(())
         }
     }
+}
+
+/// setAudioLogFile(path) —— 让 Rust 侧 [audio] 行同时写入文件（默认只进 stderr）。
+fn set_audio_log_file<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    path: JString<'local>,
+) -> Result<(), BridgeError> {
+    let path_str: String = env.get_string(&path)?.into();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path_str);
+    match file {
+        Ok(f) => {
+            let mut guard = match AUDIO_LOG_FILE.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("[audio] setAudioLogFile: mutex poisoned: {e}");
+                    return Ok(());
+                }
+            };
+            *guard = Some(f);
+            eprintln!("[audio] setAudioLogFile: 音频全链路日志 -> {path_str}");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[audio] setAudioLogFile: 打开 {path_str} 失败: {e}（继续只写 stderr）");
+            Ok(())
+        }
+    }
+}
+
+/// audioCaptureStatus() —— 返回当前音频捕获链路状态（JSON），供 Java /wl audio status 查询。
+/// 每段链路（PID → 拓扑 → 节点 → 连接 → 回调 → 数据）都有明确状态，哪里断一眼可见。
+fn audio_capture_status<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let status = crate::audio_capture::get_audio_capture_status();
+    let status: String = status.into();
+    env.new_string(status)
+        .map_err(|e| BridgeError::JniError(e))
 }
 
 fn fullscreened<'local>(

@@ -299,13 +299,21 @@ public class SharedWindowClientHandler {
 	
 	/**
 	 * 请求注册共享窗口
+	 * @param targetPlayer 定向共享目标玩家名（null/空 = 公开共享给所有人）
 	 */
-	public static void requestWindowRegister(long windowHandle, String windowTitle) {
-		SharedWindowRegisterPayload payload = new SharedWindowRegisterPayload(windowHandle, windowTitle);
+	public static void requestWindowRegister(long windowHandle, String windowTitle, String targetPlayer) {
+		SharedWindowRegisterPayload payload = new SharedWindowRegisterPayload(windowHandle, windowTitle, targetPlayer == null ? "" : targetPlayer);
 		ClientPlayNetworking.send(payload);
 		
-		LOGGER.info("Requested window registration: 0x{} - {}",
-			Long.toHexString(windowHandle), windowTitle);
+		LOGGER.info("Requested window registration: 0x{} - {} (targeted={})",
+			Long.toHexString(windowHandle), windowTitle, targetPlayer != null && !targetPlayer.isBlank());
+	}
+
+	/**
+	 * 请求注册共享窗口（公开共享给所有人）
+	 */
+	public static void requestWindowRegister(long windowHandle, String windowTitle) {
+		requestWindowRegister(windowHandle, windowTitle, null);
 	}
 	
 	/**
@@ -317,6 +325,16 @@ public class SharedWindowClientHandler {
 		LOGGER.info("Requested window unregistration: 0x{}", Long.toHexString(windowHandle));
 	}
 	
+	/**
+	 * 发送窗口所有者授权管理命令（grant / revoke / list）
+	 */
+	public static void sendWindowPermCommand(long windowHandle, byte action, String targetName) {
+		SharedWindowPermCommandPayload payload = new SharedWindowPermCommandPayload(windowHandle, action, targetName);
+		ClientPlayNetworking.send(payload);
+		LOGGER.info("Sent window perm command: action={} target={} window=0x{}",
+			action, targetName, Long.toHexString(windowHandle));
+	}
+
 	/**
 	 * 发送交互事件
 	 */

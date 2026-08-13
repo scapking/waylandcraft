@@ -22,6 +22,7 @@ import dev.evvie.waylandcraft.grabs.WindowGrab;
 import dev.evvie.waylandcraft.gui.WindowManagerScreen;
 import dev.evvie.waylandcraft.network.PermissionCommandPayload;
 import dev.evvie.waylandcraft.network.SharedWindowClientHandler;
+import dev.evvie.waylandcraft.network.SharedWindowPermCommandPayload;
 import dev.evvie.waylandcraft.settings.WaylandCraftSettings;
 import dev.evvie.waylandcraft.shared.ImageCapture;
 import dev.evvie.waylandcraft.shared.WindowPermission;
@@ -136,11 +137,33 @@ public class WaylandCraftCommand {
 					.then(ClientCommands.literal("start")
 						.then(ClientCommands.argument("handle", StringArgumentType.word())
 							.executes(WaylandCraftCommand::shareWindow)
+							.then(ClientCommands.argument("player", StringArgumentType.word())
+								.executes(WaylandCraftCommand::shareWindowToPlayer)
+							)
 						)
 					)
 					.then(ClientCommands.literal("stop")
 						.then(ClientCommands.argument("handle", StringArgumentType.word())
 							.executes(WaylandCraftCommand::unshareWindow)
+						)
+					)
+					.then(ClientCommands.literal("grant")
+						.then(ClientCommands.argument("handle", StringArgumentType.word())
+							.then(ClientCommands.argument("player", StringArgumentType.word())
+								.executes(WaylandCraftCommand::shareGrant)
+							)
+						)
+					)
+					.then(ClientCommands.literal("revoke")
+						.then(ClientCommands.argument("handle", StringArgumentType.word())
+							.then(ClientCommands.argument("player", StringArgumentType.word())
+								.executes(WaylandCraftCommand::shareRevoke)
+							)
+						)
+					)
+					.then(ClientCommands.literal("perms")
+						.then(ClientCommands.argument("handle", StringArgumentType.word())
+							.executes(WaylandCraftCommand::sharePerms)
 						)
 					)
 					.then(ClientCommands.literal("quality")
@@ -216,6 +239,9 @@ public class WaylandCraftCommand {
 					.then(ClientCommands.literal("share")
 						.then(ClientCommands.argument("index", IntegerArgumentType.integer(1))
 							.executes(WaylandCraftCommand::x11Share)
+							.then(ClientCommands.argument("player", StringArgumentType.word())
+								.executes(WaylandCraftCommand::x11Share)
+							)
 						)
 					)
 					.then(ClientCommands.literal("stop")
@@ -258,6 +284,12 @@ public class WaylandCraftCommand {
 						.then(ClientCommands.argument("player", StringArgumentType.word())
 							.executes(WaylandCraftCommand::permRemove)
 						)
+					)
+				)
+				// 音频全链路状态诊断
+				.then(ClientCommands.literal("audio")
+					.then(ClientCommands.literal("status")
+						.executes(WaylandCraftCommand::audioStatus)
 					)
 				)
 				.then(ClientCommands.literal("pos")
@@ -1904,6 +1936,19 @@ public class WaylandCraftCommand {
 	}
 
 	private static int shareWindow(CommandContext<FabricClientCommandSource> context) {
+		return shareWindowInternal(context, null);
+	}
+
+	private static int shareWindowToPlayer(CommandContext<FabricClientCommandSource> context) {
+		String player = StringArgumentType.getString(context, "player");
+		return shareWindowInternal(context, player);
+	}
+
+	/**
+	 * 共享窗口核心逻辑。
+	 * @param targetPlayer 定向共享目标（null = 公开共享给所有人）
+	 */
+	private static int shareWindowInternal(CommandContext<FabricClientCommandSource> context, String targetPlayer) {
 		FabricClientCommandSource source = context.getSource();
 		String handleStr = StringArgumentType.getString(context, "handle");
 
@@ -1924,14 +1969,15 @@ public class WaylandCraftCommand {
 				String displayName = getWindowDisplayName(toplevel);
 				boolean ok;
 				if(wlc.windowShareManager != null) {
-					ok = wlc.windowShareManager.startSharing(toplevel.getHandle(), displayName);
+					ok = wlc.windowShareManager.startSharing(toplevel.getHandle(), displayName, targetPlayer);
 				} else {
-					SharedWindowClientHandler.requestWindowRegister(toplevel.getHandle(), displayName);
+					SharedWindowClientHandler.requestWindowRegister(toplevel.getHandle(), displayName, targetPlayer);
 					ok = true;
 				}
 				if(ok) shared++; else skipped++;
 			}
-			source.sendFeedback(Component.literal("§a✔ 已共享 §f" + shared + "§a 个窗口" + (skipped > 0 ? "（§7跳过 " + skipped + " 个已共享/失败§a）" : "") + "§r"));
+			String mode = targetPlayer != null ? "（定向 §f" + targetPlayer + "§a）" : "";
+			source.sendFeedback(Component.literal("§a✔ 已共享 §f" + shared + "§a 个窗口" + mode + (skipped > 0 ? "（§7跳过 " + skipped + " 个已共享/失败§a）" : "") + "§r"));
 			return shared > 0 ? 1 : 0;
 		}
 
@@ -1941,11 +1987,43 @@ public class WaylandCraftCommand {
 		String displayName = getWindowDisplayName(toplevel);
 		WaylandCraft wlc = WaylandCraft.instance;
 		if(wlc != null && wlc.windowShareManager != null) {
-			wlc.windowShareManager.startSharing(toplevel.getHandle(), displayName);
+			wlc.windowShareManager.startSharing(toplevel.getHandle(), displayName, targetPlayer);
 		} else {
-			SharedWindowClientHandler.requestWindowRegister(toplevel.getHandle(), displayName);
+			SharedWindowClientHandler.requestWindowRegister(toplevel.getHandle(), displayName, targetPlayer);
 		}
-		source.sendFeedback(Component.literal("§a✔ Shared: §f" + displayName + "§r §e" + shortHex(toplevel.getHandle()) + "§r"));
+		String mode = targetPlayer != null ? "§a → §f" + targetPlayer : "§a → §fall";
+		source.sendFeedback(Component.literal("§a✔ Shared: §f" + displayName + "§r §e" + shortHex(toplevel.getHandle()) + "§r" + mode + "§r"));
+		return 1;
+	}
+
+	private static int shareGrant(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		String handleStr = StringArgumentType.getString(context, "handle");
+		String player = StringArgumentType.getString(context, "player");
+		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
+		if(toplevel == null) return 0;
+		SharedWindowClientHandler.sendWindowPermCommand(toplevel.getHandle(), SharedWindowPermCommandPayload.ACTION_GRANT, player);
+		source.sendFeedback(Component.literal("§a✔ 已请求授权 §f" + player + "§a 查看 §f" + getWindowDisplayName(toplevel) + "§r"));
+		return 1;
+	}
+
+	private static int shareRevoke(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		String handleStr = StringArgumentType.getString(context, "handle");
+		String player = StringArgumentType.getString(context, "player");
+		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
+		if(toplevel == null) return 0;
+		SharedWindowClientHandler.sendWindowPermCommand(toplevel.getHandle(), SharedWindowPermCommandPayload.ACTION_REVOKE, player);
+		source.sendFeedback(Component.literal("§a✔ 已请求撤销 §f" + player + "§a 对 §f" + getWindowDisplayName(toplevel) + "§a 的查看权限§r"));
+		return 1;
+	}
+
+	private static int sharePerms(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		String handleStr = StringArgumentType.getString(context, "handle");
+		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
+		if(toplevel == null) return 0;
+		SharedWindowClientHandler.sendWindowPermCommand(toplevel.getHandle(), SharedWindowPermCommandPayload.ACTION_LIST, "");
 		return 1;
 	}
 
@@ -2306,6 +2384,11 @@ public class WaylandCraftCommand {
 
 		int index = IntegerArgumentType.getInteger(context, "index");
 		String display = getX11DisplayArg(context, getSatelliteDisplayOrDefault());
+		String targetPlayer = null;
+		try {
+			String p = StringArgumentType.getString(context, "player");
+			if(p != null && !p.isBlank()) targetPlayer = p;
+		} catch(IllegalArgumentException ignored) {}
 
 		java.util.List<dev.evvie.waylandcraft.utils.X11WindowLister.WindowInfo> windows =
 			dev.evvie.waylandcraft.utils.X11WindowLister.getDesktopWindows(display);
@@ -2323,9 +2406,10 @@ public class WaylandCraftCommand {
 			return 0;
 		}
 
-		boolean ok = wlc.windowShareManager.startX11Sharing(xid, info.title, display, info.appId, info.pid);
+		boolean ok = wlc.windowShareManager.startX11Sharing(xid, info.title, display, info.appId, info.pid, targetPlayer);
 		if(ok) {
-			source.sendFeedback(Component.literal("§a✔ Sharing X11 window §f" + info.title + "§a (§e0x" + info.hash + "§a)§r"));
+			String mode = targetPlayer != null ? "§a → §f" + targetPlayer : "§a → §fall";
+			source.sendFeedback(Component.literal("§a✔ Sharing X11 window §f" + info.title + "§a (§e0x" + info.hash + "§a)" + mode + "§r"));
 			source.sendFeedback(Component.literal(" §7Remote players can see it in world (origin). Audio follows window PID §e" + info.pid + "§7 if available§r"));
 		} else {
 			source.sendError(Component.literal("§c✘ Failed to share X11 window (already shared or inaccessible?)§r"));
@@ -2411,5 +2495,42 @@ public class WaylandCraftCommand {
 			source.sendError(Component.literal("§c✘ Invalid permission: " + permStr + " (NONE/VIEW/INTERACT/CONTROL)§r"));
 			return null;
 		}
+	}
+
+	// ===== 音频全链路状态 =====
+
+	private static int audioStatus(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal("§6 §lAudio Pipeline Status §7(来源→捕获→接口→转发→播放)§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+
+		// 发送端
+		if(wlc.audioCaptureManager != null) {
+			for(String line : wlc.audioCaptureManager.getStatusSummary().split("\\n")) {
+				source.sendFeedback(Component.literal(" §7" + line + "§r"));
+			}
+		} else {
+			source.sendFeedback(Component.literal(" §7发送端: 未初始化§r"));
+		}
+
+		// 接收端
+		if(wlc.audioPlaybackManager != null) {
+			for(String line : wlc.audioPlaybackManager.getStatusSummary().split("\\n")) {
+				source.sendFeedback(Component.literal(" §7" + line + "§r"));
+			}
+		} else {
+			source.sendFeedback(Component.literal(" §7接收端: 未初始化§r"));
+		}
+
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal(" §7Rust 侧全链路日志文件: §ewaylandcraft-audio.log§r"));
+		return 1;
 	}
 }

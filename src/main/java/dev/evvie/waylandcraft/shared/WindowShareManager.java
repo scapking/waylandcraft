@@ -116,6 +116,14 @@ public class WindowShareManager {
 	private long audioWindowHandle = 0;
 	
 	public boolean startSharing(long windowHandle, String windowTitle) {
+		return startSharing(windowHandle, windowTitle, null);
+	}
+
+	/**
+	 * 开始共享窗口。
+	 * @param targetPlayer 定向共享目标玩家名（null/空 = 公开共享给所有人）
+	 */
+	public boolean startSharing(long windowHandle, String windowTitle, String targetPlayer) {
 		if(clientMod == null) {
 			LOGGER.warn("Cannot start sharing on server side");
 			return false;
@@ -129,7 +137,7 @@ public class WindowShareManager {
 		ShareState state = new ShareState(windowHandle, windowTitle);
 		shareStates.put(windowHandle, state);
 		
-		SharedWindowClientHandler.requestWindowRegister(windowHandle, windowTitle);
+		SharedWindowClientHandler.requestWindowRegister(windowHandle, windowTitle, targetPlayer);
 		
 		// 音频捕获：跟随最近共享的窗口（native 单例，一次一个）
 		if(WaylandCraft.instance != null && WaylandCraft.instance.audioCaptureManager != null) {
@@ -160,6 +168,22 @@ public class WindowShareManager {
 	 * @param pid 窗口进程 PID（_NET_WM_PID）
 	 */
 	public boolean startX11Sharing(long xid, String title, String displayName, String appId, int pid) {
+		return startX11Sharing(xid, title, displayName, appId, pid, null);
+	}
+
+	/**
+	 * 开始共享一个 X11 窗口（XGetImage 抓帧）。
+	 * 用于微信等 X11-only 应用：它们不在 xdg toplevel 列表里，
+	 * 没有 wayland framebuffer，必须直接从 X server 抓像素。
+	 *
+	 * @param xid X window id（也作为共享 handle 使用）
+	 * @param title 窗口标题
+	 * @param displayName X display（如 ":2"，null = 默认 DISPLAY）
+	 * @param appId 应用 ID（WM_CLASS 实例名），用于音频 PID 匹配
+	 * @param pid 窗口进程 PID（_NET_WM_PID）
+	 * @param targetPlayer 定向共享目标玩家名（null/空 = 公开共享给所有人）
+	 */
+	public boolean startX11Sharing(long xid, String title, String displayName, String appId, int pid, String targetPlayer) {
 		if(clientMod == null) {
 			LOGGER.warn("Cannot start sharing on server side");
 			return false;
@@ -187,7 +211,7 @@ public class WindowShareManager {
 		state.x11Pid = pid;
 		shareStates.put(xid, state);
 
-		SharedWindowClientHandler.requestWindowRegister(xid, title);
+		SharedWindowClientHandler.requestWindowRegister(xid, title, targetPlayer);
 
 		// 音频捕获：X11 窗口有 _NET_WM_PID，直接复用按 PID 捕获的链路
 		if(WaylandCraft.instance != null && WaylandCraft.instance.audioCaptureManager != null) {

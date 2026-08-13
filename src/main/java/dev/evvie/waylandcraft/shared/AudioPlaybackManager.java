@@ -41,12 +41,14 @@ public class AudioPlaybackManager {
 	private boolean firstAudioLogged = false;
 	private long totalAudioBytes = 0;
 	private long nextAudioLogBytes = 1_000_000;
+	private long receivedPackets = 0;
 	
 	/**
 	 * 网络线程调用：入队到主线程播放。
 	 */
 	public void enqueue(long windowHandle, int sampleRate, int channels, byte[] pcm) {
 		if(!alAvailable) return;
+		receivedPackets++;
 		
 		if(!firstAudioLogged) {
 			LOGGER.info("Audio playback: first packet received ({} bytes, {} Hz, {} ch, window {})",
@@ -145,6 +147,27 @@ public class AudioPlaybackManager {
 			close(handle);
 		}
 		streams.clear();
+	}
+	
+	/**
+	 * 接收端全链路状态（供 /wl audio status 展示）。
+	 * 覆盖：接口(收到包数/字节) → 播放(OpenAL 是否可用、活跃流数、每流积压 buffer)。
+	 */
+	public String getStatusSummary() {
+		StringBuilder sb = new StringBuilder();
+		sb.append("接收端 (playback):\n");
+		sb.append("  OpenAL: ").append(alAvailable ? "available" : "UNAVAILABLE (degraded)").append("\n");
+		sb.append("  packets received: ").append(receivedPackets).append("\n");
+		sb.append("  bytes received: ").append(totalAudioBytes).append("\n");
+		sb.append("  active streams: ").append(streams.size()).append("\n");
+		for(Map.Entry<Long, StreamHandle> e : streams.entrySet()) {
+			StreamHandle h = e.getValue();
+			sb.append("    window 0x").append(Long.toHexString(e.getKey()))
+				.append(": ").append(h.sampleRate).append("Hz/").append(h.channels)
+				.append("ch, queued buffers=").append(h.buffers.size())
+				.append("/").append(MAX_QUEUED_BUFFERS).append("\n");
+		}
+		return sb.toString();
 	}
 	
 	private static class StreamHandle {

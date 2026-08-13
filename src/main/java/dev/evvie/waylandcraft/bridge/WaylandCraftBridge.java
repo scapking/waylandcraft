@@ -898,6 +898,18 @@ public class WaylandCraftBridge {
 		setKbLogFileNative(path);
 	}
 	
+	/** 让 Rust 侧 [audio] 全链路日志同时写入指定文件（默认只进 stderr）。
+	 * bridge 初始化后立即调用，路径用 .minecraft/waylandcraft-audio.log。
+	 * 覆盖：PID→拓扑枚举→节点匹配→stream 建连→pw-link→process 回调。 */
+	public void setAudioLogFile(String path) {
+		setAudioLogFileNative(path);
+	}
+	
+	/** 查询 Rust 侧音频捕获链路状态（JSON 字符串），供 /wl audio status 展示。 */
+	public String audioCaptureStatus() {
+		return audioCaptureStatusNative(instance);
+	}
+	
 	public void resizeToplevelInteractive(WLCToplevel toplevel, int width, int height) {
 		toplevelResize(toplevel.getHandle(), width, height, true);
 	}
@@ -1112,6 +1124,12 @@ public class WaylandCraftBridge {
 	
 	// Set Rust-side [kb-debug] log file path (eprintln also written to this file)
 	private static native void setKbLogFileNative(String path);
+	
+	// Set Rust-side [audio] log file path (eprintln also written to this file)
+	private static native void setAudioLogFileNative(String path);
+	
+	// Query Rust-side audio capture pipeline status (JSON string)
+	private static native String audioCaptureStatusNative(long instance);
 	
 	private static native int[] outputSize(long instance);
 	private static native int[] outputBounds(long instance);
