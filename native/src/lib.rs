@@ -48,6 +48,7 @@ use std::time::Duration;
 mod bridge;
 mod ddm;
 mod desktop_windows;
+mod h264_encoder;
 mod portal_capture;
 mod audio_capture;
 mod egl;

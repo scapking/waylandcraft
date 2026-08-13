@@ -446,6 +446,25 @@ bind_java_type! {
             sig = (instance: jlong) -> void,
             fn = audio_capture_stop,
         },
+
+        static extern fn h264_encode {
+            sig = (
+                instance: jlong,
+                window_handle: jlong,
+                rgba: byte[],
+                width: jint,
+                height: jint,
+                force_keyframe: jboolean,
+                flip_y: jboolean
+            ) -> byte[],
+            name = "h264Encode",
+            fn = h264_encode,
+        },
+        static extern fn h264_destroy_encoder {
+            sig = (instance: jlong, window_handle: jlong) -> void,
+            name = "h264DestroyEncoder",
+            fn = h264_destroy_encoder,
+        },
     },
 }
 
@@ -2209,6 +2228,59 @@ fn audio_capture_stop<'local>(
     _instance: jlong,
 ) -> Result<(), BridgeError> {
     crate::audio_capture::stop_audio_capture();
+    Ok(())
+}
+
+fn h264_encode<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+    window_handle: jlong,
+    rgba: JByteArray<'local>,
+    width: jint,
+    height: jint,
+    force_keyframe: jboolean,
+    flip_y: jboolean,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    // 参数校验：尺寸非法直接返回空（Java 侧据此跳帧）
+    if width <= 0 || height <= 0 {
+        eprintln!("[h264] invalid dims {}x{}", width, height);
+        return Ok(env.byte_array_from_slice(&[])?);
+    }
+
+    // 读取 RGBA 字节（get_region 安全拷贝，后续可优化为 direct buffer 零拷贝）
+    let len = rgba.len(env)?;
+    let mut buf: Vec<jbyte> = vec![0; len];
+    rgba.get_region(env, 0, &mut buf)?;
+
+    // jbyte(i8) → u8 位重解释（RGBA 原始字节 0x00..0xFF）
+    let rgba_u8: &[u8] =
+        unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
+
+    match crate::h264_encoder::encode_rgba(
+        window_handle as u64,
+        rgba_u8,
+        width as u32,
+        height as u32,
+        force_keyframe,
+        flip_y,
+    ) {
+        Ok(nal) => Ok(env.byte_array_from_slice(&nal)?),
+        Err(e) => {
+            // 编码失败（分辨率超限/内存不足等）：记录并返回空，Java 侧跳帧
+            eprintln!("{}", e);
+            Ok(env.byte_array_from_slice(&[])?)
+        }
+    }
+}
+
+fn h264_destroy_encoder<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+    window_handle: jlong,
+) -> Result<(), BridgeError> {
+    crate::h264_encoder::destroy(window_handle as u64);
     Ok(())
 }
 

@@ -1176,4 +1176,18 @@ public class WaylandCraftBridge {
 	/** 停止音频捕获 */
 	public void audioCaptureStop() { audioCaptureStop(this.instance); }
 	
+	// H.264 视频编码 (方案A视频): 每窗口一个 native 编码器，RGBA → H.264 Annex-B NAL 字节流
+	private static native byte[] h264Encode(long instance, long windowHandle, byte[] rgba, int width, int height, boolean forceKeyframe);
+	private static native void h264DestroyEncoder(long instance, long windowHandle);
+	
+	/**
+	 * 编码一帧 RGBA 为 H.264 Annex-B NAL 字节流（发送端/共享者调用）。
+	 * 返回空数组表示编码失败或非法尺寸，调用方应跳过该帧。
+	 */
+	public byte[] h264Encode(long windowHandle, byte[] rgba, int width, int height, boolean forceKeyframe) {
+		return h264Encode(this.instance, windowHandle, rgba, width, height, forceKeyframe);
+	}
+	/** 销毁窗口的 H.264 编码器（停止共享时调用） */
+	public void h264DestroyEncoder(long windowHandle) { h264DestroyEncoder(this.instance, windowHandle); }
+	
 }

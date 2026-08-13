@@ -24,6 +24,10 @@ pipewire = "0.8"
 # Wayland client for wlr-foreign-toplevel-management
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# H.264 encoding (screen capture → NAL stream). `source` feature compiles
+# OpenH264 from source (no system lib needed); x86_64 uses NASM or pure-C
+# fallback, aarch64 uses .S NEON assembly — all Android/linux targets covered.
+openh264 = "0.9"
 
 [dev-dependencies]
 wayland-client = "0.31"

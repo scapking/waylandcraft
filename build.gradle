@@ -53,6 +53,9 @@ dependencies {
 	implementation "net.java.dev.jna:jna:5.14.0"
 	implementation "net.java.dev.jna:jna-platform:5.14.0"
 	
+	// JCodec: H.264 解码（接收端纯 Java 软解，跨平台无 native 依赖）
+	implementation "org.jcodec:jcodec:0.2.5"
+	
 	testImplementation "org.junit.jupiter:junit-jupiter:5.10.2"
 	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
 	
