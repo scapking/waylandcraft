@@ -1,8 +1,11 @@
 //! 系统桌面输入法穿透（text-input-v3 客户端侧）。
 //!
 //! waylandcraft 本身是一个 Wayland 合成器（服务端），但这里它反过来充当
-//! 系统合成器的一个 **客户端**：复用 Minecraft/GLFW 已经建立的 `wl_display`
-//! 连接（guest 模式），在上面注册一个 `zwp_text_input_v3` 文本输入。
+//! 系统合成器的一个 **客户端**：注册一个 `zwp_text_input_v3` 文本输入。
+//!
+//! 连接方式二选一：
+//!   1. Minecraft 以 Wayland 后端跑 → 复用 GLFW 已建立的 `wl_display`；
+//!   2. Minecraft 跑 X11/XWayland → 自己 `connect_to_env()` 连 `WAYLAND_DISPLAY`。
 //!
 //! 这样，当 Minecraft 窗口在系统里拥有键盘焦点时，系统合成器会把文本输入
 //! 焦点路由给我们，从而激活系统输入法（ibus/fcitx）；系统输入法 commit 的
@@ -13,8 +16,9 @@
 //!   waylandcraft(客户端, 本模块) ⇄ 系统合成器 ⇄ 系统输入法(input-method-v2)
 //!
 //! 关键点：get_text_input 不需要 surface 参数，surface 由合成器在 enter 事件里
-//! 给出；焦点路由由「text-input 落在 GLFW 的 wl_display 连接上」这一事实决定。
-//! 因此只需要复用 `wl_display`，不需要复用 `wl_surface`。
+//! 给出；焦点路由由「text-input 落在 seat 上、而 Minecraft 窗口拥有键盘焦点」
+//! 这一事实决定。因此只需要拿到系统 `wl_display`（复用或自连均可），不需要
+//! 复用 `wl_surface`。
 
 use wayland_client::{
     backend::Backend,
@@ -190,17 +194,25 @@ pub struct SystemIme {
 }
 
 impl SystemIme {
-    /// 复用 GLFW 的 `wl_display` 指针建立一个 guest 客户端连接，并注册
-    /// text-input-v3。失败（非 Wayland 后端 / 无 text-input 协议）返回 None。
+    /// 建立到系统合成器的 guest 客户端连接并注册 text-input-v3。
+    ///
+    /// 优先复用 GLFW 的 `wl_display`（Minecraft 以 Wayland 后端跑时）；
+    /// 拿不到（Minecraft 跑 X11/XWayland 后端）则自己 `connect_to_env()`
+    /// 连 `WAYLAND_DISPLAY`——text-input-v3 是 seat 级协议，不依赖
+    /// surface/连接来源，只要 Minecraft 窗口在系统合成器里有键盘焦点，
+    /// 合成器就会给本连接的 text_input 发 enter。
+    /// 失败（桌面无 Wayland / 合成器无 text-input-v3）返回 None。
     pub fn new(wl_display_ptr: usize) -> Option<Self> {
-        if wl_display_ptr == 0 {
-            return None;
-        }
-
-        let backend = unsafe {
-            Backend::from_foreign_display(wl_display_ptr as *mut _)
+        let conn = if wl_display_ptr != 0 {
+            // Minecraft Wayland 后端：复用 GLFW 已建立的连接。
+            let backend = unsafe {
+                Backend::from_foreign_display(wl_display_ptr as *mut _)
+            };
+            Connection::from_backend(backend)
+        } else {
+            // Minecraft X11/XWayland 后端：自己连系统 Wayland 桌面。
+            Connection::connect_to_env().ok()?
         };
-        let conn = Connection::from_backend(backend);
 
         let mut queue = conn.new_event_queue::<SystemImeData>();
         let qh = queue.handle();
