@@ -560,6 +560,44 @@ impl WLCSeatState {
         );
     }
 
+    /// 只读：序列化当前修饰键状态为 (depressed, latched, locked, group)，
+    /// 供 text-input-v3 / input-method-v2 的 `modifiers` 事件使用。
+    /// 与 `send_modifiers` 完全一致，不改变任何状态。
+    pub fn modifiers_tuple(&self) -> (u32, u32, u32, u32) {
+        if !self.kb_active {
+            return (
+                0,
+                0,
+                0,
+                self.xkb_state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+            );
+        }
+        (
+            self.xkb_state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            self.xkb_state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            self.xkb_state.serialize_mods(xkb::STATE_MODS_LOCKED),
+            self.xkb_state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+        )
+    }
+
+    /// 把输入法产生的按键（xkb keycode = evdev+8）原样转发给聚焦的 wl_keyboard 客户端，
+    /// 并紧跟 modifiers。**只转发、不改状态**（不碰 xkb_state / pressed_keys），
+    /// 因此不会影响现有键盘快捷键/CapsLock 路径。
+    pub fn forward_key(&self, key: u32, state: KeyState) -> u32 {
+        let serial = new_serial();
+        let wire_key = key.saturating_sub(8);
+        if !self.kb_active {
+            return serial;
+        }
+        self.for_all_keyboards(|keyboard, data| {
+            if data.focus.is_some() {
+                keyboard.key(serial, get_time(), wire_key, state);
+                self.send_modifiers(keyboard, serial);
+            }
+        });
+        serial
+    }
+
     pub fn keyboard_unfocus(&mut self) {
         let serial = new_serial();
         self.for_all_keyboards(|keyboard, data| {

@@ -1367,8 +1367,14 @@ fn keyboard_focus<'local>(
     instance.state.data.update_clipboard_client(client);
 
     match surface {
-        Some(s) => instance.state.seat.keyboard_focus(s),
-        None => instance.state.seat.keyboard_unfocus(),
+        Some(s) => {
+            instance.state.ime.set_focus(&s);
+            instance.state.seat.keyboard_focus(s);
+        }
+        None => {
+            instance.state.ime.clear_focus();
+            instance.state.seat.keyboard_unfocus();
+        }
     };
 
     instance
@@ -1437,7 +1443,15 @@ fn keyboard_input<'local>(
     let action = KeyboardAction::from_i32(action)
         .ok_or(BridgeError::UnknownKeyboardState(action))?;
 
-    instance.state.seat.keyboard_key(scancode as u32, action);
+    // 输入法已 grab 键盘 → 按键先发给 IME；IME 未 grab 时才走普通键盘路径。
+    let mods = instance.state.seat.modifiers_tuple();
+    let handled = instance
+        .state
+        .ime
+        .handle_key(scancode as u32, action, mods);
+    if !handled {
+        instance.state.seat.keyboard_key(scancode as u32, action);
+    }
 
     Ok(())
 }

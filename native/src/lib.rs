@@ -1,6 +1,7 @@
 use crate::bridge::BridgeState;
 use crate::ddm::WLCDataState;
 use crate::egl::EGLHelper;
+use crate::ime::ImeState;
 use crate::output::WLCOutput;
 use crate::satellite::SatelliteState;
 use crate::seat::WLCSeatState;
@@ -51,6 +52,7 @@ mod desktop_windows;
 mod portal_capture;
 mod audio_capture;
 mod egl;
+mod ime;
 mod java_types;
 mod output;
 mod process;
@@ -81,6 +83,7 @@ pub struct WLCState {
     pub dmabuf_global: DmabufGlobal,
     pub requests: WindowRequests,
     pub seat: WLCSeatState,
+    pub ime: ImeState,
     pub data: WLCDataState,
     pub output: WLCOutput,
 }
@@ -111,6 +114,9 @@ impl WLCState {
         let seat = WLCSeatState::new();
         seat.create_globals(&disp);
 
+        let ime = ImeState::default();
+        ime.create_globals(&disp);
+
         let data = WLCDataState::new(&disp);
         data.create_global();
 
@@ -130,6 +136,7 @@ impl WLCState {
             dmabuf_global,
             requests: WindowRequests::default(),
             seat,
+            ime,
             data,
             output,
         }
