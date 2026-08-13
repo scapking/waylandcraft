@@ -457,6 +457,8 @@ enum BridgeError {
     Init(Box<dyn std::error::Error>),
     #[error("{0}")]
     Null(&'static str),
+    #[error("audio capture failed: {0}")]
+    AudioCapture(String),
     #[error("Null WLC instance handle given. Function: {0}")]
     NullInstancePtr(&'static str),
     #[error("Null wayland surface handle given. Function: {0}")]
@@ -2183,7 +2185,7 @@ fn audio_capture_start<'local>(
     crate::audio_capture::start_audio_capture(pid as u32)
         .map_err(|e| {
             eprintln!("[audio] start failed: {}", e);
-            BridgeError::Null("audio_capture_failed")
+            BridgeError::AudioCapture(e)
         })?;
     Ok(())
 }

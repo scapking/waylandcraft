@@ -38,12 +38,27 @@ public class AudioPlaybackManager {
 	private final Map<Long, StreamHandle> streams = new ConcurrentHashMap<>();
 	
 	private boolean alAvailable = true;
+	private boolean firstAudioLogged = false;
+	private long totalAudioBytes = 0;
+	private long nextAudioLogBytes = 1_000_000;
 	
 	/**
 	 * 网络线程调用：入队到主线程播放。
 	 */
 	public void enqueue(long windowHandle, int sampleRate, int channels, byte[] pcm) {
 		if(!alAvailable) return;
+		
+		if(!firstAudioLogged) {
+			LOGGER.info("Audio playback: first packet received ({} bytes, {} Hz, {} ch, window {})",
+				pcm.length, sampleRate, channels, Long.toHexString(windowHandle));
+			firstAudioLogged = true;
+		}
+		totalAudioBytes += pcm.length;
+		if(totalAudioBytes >= nextAudioLogBytes) {
+			LOGGER.info("Audio playback: {} bytes received so far", totalAudioBytes);
+			nextAudioLogBytes += 1_000_000;
+		}
+		
 		Minecraft mc = Minecraft.getInstance();
 		if(mc == null) return;
 		

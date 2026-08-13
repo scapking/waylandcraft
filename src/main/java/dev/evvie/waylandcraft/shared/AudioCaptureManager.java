@@ -41,6 +41,9 @@ public class AudioCaptureManager {
 	private long lastPollTime = 0;
 	private int seqCounter = 0;
 	private boolean started = false;
+	private boolean firstAudioLogged = false;
+	private long totalAudioBytes = 0;
+	private long nextAudioLogBytes = 1_000_000;
 	
 	public AudioCaptureManager(WaylandCraft clientMod) {
 		this.clientMod = clientMod;
@@ -69,13 +72,16 @@ public class AudioCaptureManager {
 		try {
 			clientMod.bridge.audioCaptureStart(pid);
 		} catch(Throwable t) {
-			LOGGER.error("Audio capture start failed", t);
+			LOGGER.error("Audio capture start failed: {}", t.toString());
 			return false;
 		}
 		
 		started = true;
 		seqCounter = 0;
 		lastPollTime = 0;
+		firstAudioLogged = false;
+		totalAudioBytes = 0;
+		nextAudioLogBytes = 1_000_000;
 		LOGGER.info("Audio capture started for window '{}' (pid={})", title, pid);
 		return true;
 	}
@@ -106,6 +112,17 @@ public class AudioCaptureManager {
 		System.arraycopy(data, 8, pcm, 0, pcm.length);
 		
 		if(sampleRate <= 0 || channels <= 0 || pcm.length == 0) return;
+		
+		if(!firstAudioLogged) {
+			LOGGER.info("Audio capture: first PCM received ({} bytes, {} Hz, {} ch) — capture pipeline LIVE",
+				pcm.length, sampleRate, channels);
+			firstAudioLogged = true;
+		}
+		totalAudioBytes += pcm.length;
+		if(totalAudioBytes >= nextAudioLogBytes) {
+			LOGGER.info("Audio capture: {} bytes streamed so far ({} Hz, {} ch)", totalAudioBytes, sampleRate, channels);
+			nextAudioLogBytes += 1_000_000;
+		}
 		
 		// 分包发送
 		for(int offset = 0; offset < pcm.length; offset += MAX_PACKET_BYTES) {

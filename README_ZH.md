@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.16-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.17-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -428,6 +428,7 @@ cd .. && ./gradlew clean build
 
 **近期亮点：**
 
+- **v0.9.17** — 修复共享窗口音频「实际不可用」的根因：PipeWire 捕获流的 `process` 回调注册句柄（`StreamListener`）是函数局部变量，返回即被 drop 导致回调注销、PCM 永远捕获不到；现已随捕获状态保活。补齐全链路音频日志（native 首次捕获、各阶段错误经 JNI 把真实原因传到 Java 日志、收发端首包/字节数日志）。
 - **v0.9.16** — 新增 `/wl show all` / `/wl hide all`（也支持 `*`）一键显示/隐藏全部窗口；`hide all` 一并解除钉住。
 - **v0.9.15** — 布局排序在窗口关闭/新增后实时更新：序号紧凑重排填补空洞。
 - **v0.9.14** — Ctrl+方向键改为与相邻窗口交换位置（swapCore），并修正左右方向对调。

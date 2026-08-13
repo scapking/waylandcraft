@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.16-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.17-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -428,6 +428,7 @@ cd .. && ./gradlew clean build
 
 **最近のハイライト：**
 
+- **v0.9.17** — 共有ウィンドウ音声が実質使えない根本原因を修正：PipeWire キャプチャストリームの `process` コールバック登録ハンドル（`StreamListener`）が関数ローカル変数で、return 時に drop されコールバックが解除され PCM が一切取得できなかった。キャプチャ状態と共に保持するよう修正。音声パイプライン全体のログも追加。
 - **v0.9.16** — `/wl show all` / `/wl hide all`（`*` も可）で全ウィンドウを一括表示/非表示；`hide all` はピン留めも解除。
 - **v0.9.15** — ウィンドウの開閉に応じてレイアウト順序をリアルタイム更新：番号を詰め直して隙間を埋める。
 - **v0.9.14** — Ctrl+矢印を隣接ウィンドウとの位置交換（swapCore）に変更し、左右方向の反転も修正。

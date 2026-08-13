@@ -30,6 +30,12 @@ pub struct AudioCaptureState {
     pub _stream: Option<pw::stream::Stream>,
     /// 保活 mainloop：后台线程跑 run()，stop 时先 quit 再随 state drop
     pub _mainloop: Option<pw::main_loop::MainLoop>,
+    /// 保活 process 回调注册句柄：drop 会 unregister，process 不再被调用。
+    /// 这是音频"实际不可用"的根因——之前是函数局部变量，返回即失效。
+    pub _listener: Option<pw::stream::StreamListener<()>>,
+    /// 诊断计数：process 回调触发次数 / 累计捕获字节
+    pub capture_events: u64,
+    pub total_bytes: u64,
 }
 
 // libpipewire 的 pw_stream / pw_core 内部自带线程安全（有锁），Rust 绑定
@@ -288,6 +294,9 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         active: true,
         _stream: None,
         _mainloop: None,
+        _listener: None,
+        capture_events: 0,
+        total_bytes: 0,
     }));
 
     let stream = pw::stream::Stream::new(
@@ -302,9 +311,8 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
     .map_err(|e| format!("stream: {}", e))?;
 
     let state_ref = state.clone();
-    let mut unit = ();
-    let _listener = stream
-        .add_local_listener_with_user_data(&mut unit)
+    let listener = stream
+        .add_local_listener::<()>()
         .process(move |stream, _| {
             if let Some(mut buffer) = stream.dequeue_buffer() {
                 let datas = buffer.datas_mut();
@@ -314,9 +322,28 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
                     if size > 0 {
                         if let Some(slice) = data.data() {
                             let src = &slice[..size.min(slice.len())];
-                            let mut s = state_ref.lock().unwrap();
-                            if s.active {
-                                s.pcm.extend_from_slice(src);
+                            let mut log_line = None;
+                            {
+                                let mut s = state_ref.lock().unwrap();
+                                if s.active {
+                                    s.pcm.extend_from_slice(src);
+                                    s.total_bytes += src.len() as u64;
+                                    s.capture_events += 1;
+                                    if s.capture_events == 1 {
+                                        log_line = Some(format!(
+                                            "[audio] FIRST capture: {} bytes (capture stream LIVE)",
+                                            src.len()
+                                        ));
+                                    } else if s.capture_events % 2000 == 0 {
+                                        log_line = Some(format!(
+                                            "[audio] capture ongoing: {} events, {} bytes",
+                                            s.capture_events, s.total_bytes
+                                        ));
+                                    }
+                                }
+                            }
+                            if let Some(line) = log_line {
+                                eprintln!("{line}");
                             }
                         }
                     }
@@ -418,6 +445,7 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
             let mut s = state.lock().map_err(|e| format!("state lock: {}", e))?;
             s._stream = Some(stream);
             s._mainloop = Some(mainloop);
+            s._listener = Some(listener);
         }
         *guard = Some(state.clone());
     }
@@ -455,8 +483,9 @@ pub fn stop_audio_capture() {
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.active = false;
         s.pcm.clear();
-        // 先 quit mainloop（后台 pw_main_loop_run 返回后线程退出），
-        // 再 drop stream → PipeWire 节点消失 → link 断开
+        // 先注销 process 回调，再 quit mainloop（后台 pw_main_loop_run 返回后线程退出），
+        // 最后 drop stream → PipeWire 节点消失 → link 断开
+        s._listener = None;
         if let Some(ml) = s._mainloop.take() {
             ml.quit();
         }

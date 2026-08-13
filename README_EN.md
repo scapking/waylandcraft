@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.16-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.17-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -434,6 +434,7 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
 
 **Recent highlights:**
 
+- **v0.9.17** — Fixed shared-window audio being effectively unusable: the PipeWire capture stream's `process` callback handle (`StreamListener`) was a function-local variable dropped on return, which unregistered the callback — so no PCM was ever captured. It is now kept alive in capture state. Added full audio-pipeline logging (native first-capture, per-stage errors now reach the Java log with the real reason, send/receive-side first-packet & byte-count logs).
 - **v0.9.16** — Added `/wl show all` / `/wl hide all` (also `*`) to show/hide every window in one command; `hide all` also unpins.
 - **v0.9.15** — Layout order now updates in real time as windows close/open — slots are compactly renumbered to fill gaps.
 - **v0.9.14** — Ctrl+arrow now swaps positions with the adjacent window (swapCore); fixed inverted left/right direction.
