@@ -14,7 +14,7 @@ public class SharedWindowConfig {
 	// 默认配置
 	private static final float DEFAULT_SCALE = 0.5f;
 	private static final float DEFAULT_QUALITY = 0.7f;
-	private static final int DEFAULT_MAX_FPS = 20;
+	private static final int DEFAULT_MAX_FPS = 24;
 	private static final boolean DEFAULT_SHARING_ENABLED = true;
 	private static final boolean DEFAULT_AUTO_SHARE = false;
 	private static final int DEFAULT_MAX_SHARED_WINDOWS = 10;
@@ -94,7 +94,8 @@ public class SharedWindowConfig {
 	 * 设置最大帧率
 	 */
 	public void setMaxFps(int maxFps) {
-		this.maxFps = Math.max(5, Math.min(60, maxFps));
+		// 0 = 无限制（跟随性能上限）；>0 为硬上限（最高 240）
+		this.maxFps = Math.max(0, Math.min(240, maxFps));
 		LOGGER.info("Max FPS set to {}", this.maxFps);
 	}
 	

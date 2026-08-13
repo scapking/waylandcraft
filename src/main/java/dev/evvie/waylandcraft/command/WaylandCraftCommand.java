@@ -147,7 +147,7 @@ public class WaylandCraftCommand {
 						.then(ClientCommands.argument("handle", StringArgumentType.word())
 							.then(ClientCommands.argument("scale", FloatArgumentType.floatArg(0.1f, 1.0f))
 								.then(ClientCommands.argument("quality", FloatArgumentType.floatArg(0.1f, 1.0f))
-									.then(ClientCommands.argument("fps", IntegerArgumentType.integer(5, 120))
+									.then(ClientCommands.argument("fps", IntegerArgumentType.integer(0, 240))
 										.executes(WaylandCraftCommand::setShareQuality)
 									)
 								)
@@ -2007,7 +2007,7 @@ public class WaylandCraftCommand {
 		wlc.windowShareManager.setPerWindowConfig(handle, config);
 
 		source.sendFeedback(Component.literal("§a✔ Quality set for §f" + getWindowDisplayName(toplevel) + "§r"));
-		source.sendFeedback(Component.literal(" §7Scale: §e" + scale + "§7 Quality: §e" + quality + "§7 FPS: §e" + fps + "§r"));
+		source.sendFeedback(Component.literal(" §7Scale: §e" + scale + "§7 Quality: §e" + quality + "§7 FPS: §e" + (fps == 0 ? "unlimited" : String.valueOf(fps)) + "§r"));
 		return 1;
 	}
 
@@ -2055,7 +2055,14 @@ public class WaylandCraftCommand {
 			switch(param) {
 				case "scale" -> config.scale = Float.parseFloat(value);
 				case "quality" -> config.quality = Float.parseFloat(value);
-				case "fps" -> config.maxFps = Integer.parseInt(value);
+				case "fps" -> {
+					int fps = Integer.parseInt(value);
+					if(fps < 0 || fps > 240) {
+						source.sendError(Component.literal("§c✘ FPS must be 0 (unlimited) or 1-240§r"));
+						return 0;
+					}
+					config.maxFps = fps;
+				}
 				case "diff" -> config.diffUpdate = Boolean.parseBoolean(value);
 				case "bitrate" -> config.maxBitrate = Integer.parseInt(value);
 				case "buffer" -> config.frameBuffer = Integer.parseInt(value);
@@ -2135,7 +2142,7 @@ public class WaylandCraftCommand {
 		if(config != null) {
 			source.sendFeedback(Component.literal(" §7Scale: §e" + config.scale + "§r"));
 			source.sendFeedback(Component.literal(" §7Quality: §e" + config.quality + "§r"));
-			source.sendFeedback(Component.literal(" §7FPS: §e" + config.maxFps + "§r"));
+			source.sendFeedback(Component.literal(" §7FPS: §e" + (config.maxFps == 0 ? "unlimited" : String.valueOf(config.maxFps)) + "§r"));
 			source.sendFeedback(Component.literal(" §7Diff Update: §e" + config.diffUpdate + "§r"));
 			source.sendFeedback(Component.literal(" §7Bitrate: §e" + (config.maxBitrate > 0 ? config.maxBitrate + "kbps" : "unlimited") + "§r"));
 			source.sendFeedback(Component.literal(" §7Buffer: §e" + config.frameBuffer + " frames§r"));
@@ -2226,7 +2233,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §7Total: §e" + (state.totalBytes / 1024) + "KB§7 in §e" + uptime + "s§r"));
 		source.sendFeedback(Component.literal(" §7Avg Frame: §e" + avgSize + "§7, Avg FPS: §e" + String.format("%.1f", avgFps) + "§r"));
 		source.sendFeedback(Component.literal(" §7Current FPS: §e" + state.currentFps + "§7, Bitrate: §e" + state.currentBitrate + "kbps§r"));
-		source.sendFeedback(Component.literal(" §7Adaptive Scale: §e" + String.format("%.2f", wlc.windowShareManager.getAdaptiveScaleMultiplier()) + "§r"));
+		source.sendFeedback(Component.literal(" §7Adaptive FPS Factor: §e" + String.format("%.2f", wlc.windowShareManager.getAdaptiveFpsFactor()) + "§r"));
 		source.sendFeedback(Component.literal(" §7Bandwidth Util: §e" + String.format("%.1f%%", wlc.windowShareManager.getBitrateUtilization() * 100) + "§r"));
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
 		return 1;

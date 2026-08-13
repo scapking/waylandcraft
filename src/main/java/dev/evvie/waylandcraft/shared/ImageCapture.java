@@ -932,12 +932,14 @@ public class ImageCapture {
 	}
 	
 	public static CaptureConfig getRecommendedConfig(int width, int height) {
+		// scale 一律 1.0：远程跟本地渲染一致是底线，绝不缩放。
+		// 差异化只体现在 fps（大窗口低帧率、小窗口高帧率）与 quality。
 		if(width * height > 1920 * 1080) {
-			return new CaptureConfig(0.25f, 0.5f, 10);
+			return new CaptureConfig(1.0f, 0.5f, 15);
 		} else if(width * height > 1280 * 720) {
-			return new CaptureConfig(0.5f, 0.6f, 15);
+			return new CaptureConfig(1.0f, 0.6f, 24);
 		} else {
-			return new CaptureConfig(0.75f, 0.7f, 20);
+			return new CaptureConfig(1.0f, 0.7f, 30);
 		}
 	}
 	
@@ -1003,7 +1005,8 @@ public class ImageCapture {
 				int latencyComp, boolean prediction, String compression, float diffThreshold) {
 			this.scale = Math.max(0.1f, Math.min(1.0f, scale));
 			this.quality = Math.max(0.1f, Math.min(1.0f, quality));
-			this.maxFps = Math.max(5, Math.min(120, maxFps));
+			// maxFps=0 表示无限制（跟随渲染帧率/编码能力）；>0 为硬上限（最高 240）
+			this.maxFps = Math.max(0, Math.min(240, maxFps));
 			this.diffUpdate = diffUpdate;
 			this.maxBitrate = Math.max(0, maxBitrate);
 			this.frameBuffer = Math.max(1, Math.min(10, frameBuffer));
@@ -1038,19 +1041,20 @@ public class ImageCapture {
 		}
 		
 		public static CaptureConfig highPerformance() {
-			return new CaptureConfig(0.25f, 0.5f, 60, true, 1000, 2, 50, true, "jpeg", 0.03f);
+			// scale=1.0：性能靠高帧率 + 低画质体现，不靠缩放（底线）
+			return new CaptureConfig(1.0f, 0.5f, 60, true, 1000, 2, 50, true, "jpeg", 0.03f);
 		}
 		
 		public static CaptureConfig highQuality() {
-			return new CaptureConfig(1.0f, 1.0f, 30, true, 0, 5, 0, false, "jpeg", 0.01f);
+			return new CaptureConfig(1.0f, 1.0f, 24, true, 0, 5, 0, false, "jpeg", 0.01f);
 		}
 		
 		public static CaptureConfig balanced() {
-			return new CaptureConfig(0.5f, 0.7f, 30, true, 2000, 3, 20, false, "jpeg", 0.02f);
+			return new CaptureConfig(1.0f, 0.85f, 24, true, 2000, 3, 20, false, "jpeg", 0.02f);
 		}
 		
 		public static CaptureConfig lowLatency() {
-			return new CaptureConfig(0.35f, 0.6f, 60, true, 1500, 1, 0, true, "jpeg", 0.05f);
+			return new CaptureConfig(1.0f, 0.6f, 60, true, 1500, 1, 0, true, "jpeg", 0.05f);
 		}
 		
 		public String getSummary() {

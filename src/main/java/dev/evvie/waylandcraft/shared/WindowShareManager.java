@@ -45,16 +45,18 @@ public class WindowShareManager {
 	private long bytesSentThisSecond = 0;
 	private long currentSecondStart = 0;
 	
-	// === 自适应质量 ===
-	private float adaptiveScaleMultiplier = 1.0f; // 乘以config.scale得到实际scale
+	// === 自适应（带宽不足时降 fps，而非降 scale）===
+	// v0.9.18：原自适应是降 scale（缩放窗口 UI），违反"远程跟本地渲染一致"底线。
+	// 改为动态帧率因子：带宽超限时下调实际 fps（保 scale=1.0 不变），充足时恢复。
+	private float adaptiveFpsFactor = 1.0f; // 乘以 maxFps 得到实际帧率上限
 	private int adaptiveEvalCounter = 0;
 	private int adaptiveOverLimitCount = 0;    // 连续超限帧数
 	private int adaptiveUnderUtilCount = 0;    // 连续低利用帧数
 	private static final int ADAPTIVE_EVAL_INTERVAL = 60; // 每60帧评估一次
-	private static final float ADAPTIVE_SCALE_MIN = 0.1f;
-	private static final float ADAPTIVE_SCALE_MAX = 1.0f;
-	private static final float ADAPTIVE_SCALE_DOWN = 0.9f;  // 超限时降低10%
-	private static final float ADAPTIVE_SCALE_UP = 1.1f;    // 低利用时提高10%
+	private static final float ADAPTIVE_FPS_MIN = 0.25f;  // 最低降到目标帧率的 25%
+	private static final float ADAPTIVE_FPS_MAX = 1.0f;
+	private static final float ADAPTIVE_FPS_DOWN = 0.9f;  // 超限时降 10%
+	private static final float ADAPTIVE_FPS_UP = 1.1f;    // 低利用时提 10%
 	
 	// === 帧间统计 ===
 	private long adaptiveFrameBytes = 0; // 当前评估周期内的总字节
@@ -71,14 +73,16 @@ public class WindowShareManager {
 	public WindowShareManager(WaylandCraft clientMod) {
 		this.clientMod = clientMod;
 		this.serverMod = null;
-		// 默认全分辨率 + 高质量（scale=1.0, quality=0.85, fps=10）：
+		// 默认全分辨率 + 高质量（scale=1.0, quality=0.85, fps=24）：
 		// - scale=1.0：UI 大小与共享端完全一致（底线，绝不动）。
 		// - quality=0.85：内容画质足够（0.85 vs 1.0 视觉几乎无差），
 		//   单帧体积约 300-350KB（quality=1.0 时 450KB+），显著降低
 		//   服务端/查看端的 GC 与解码压力（v0.2.30 实测弱服务器被大帧拖垮）。
-		// - fps=10：丢帧在底线允许范围内；弱服务器 + 手机端解码都更从容。
+		// - fps=24：电影级流畅（v0.9.18 起从 10 提升）；24fps 对窗口内容
+		//   （文本/UI/视频）已足够顺滑，且比 60fps 对弱服务器/手机端解码压力小。
+		//   可自定义：fps>0 为上限、fps=0 无限制（跟随性能上限）。
 		// maxBitrate=0（不限速）→ evaluateAdaptiveQuality 自动禁用。
-		this.captureConfig = new ImageCapture.CaptureConfig(1.0f, 0.85f, 10);
+		this.captureConfig = new ImageCapture.CaptureConfig(1.0f, 0.85f, 24);
 		this.frameRateController = new FrameRateController();
 		this.diffUpdateManager = new DiffUpdateManager();
 		
@@ -255,8 +259,10 @@ public class WindowShareManager {
 
 		ImageCapture.CaptureConfig effectiveConfig = state.getEffectiveConfig(captureConfig);
 		
-		// 帧率限制
-		if(!frameRateController.shouldUpdate(state.windowHandle, effectiveConfig.maxFps)) {
+		// 帧率限制（maxFps<=0 无限制；带宽不足时按 adaptiveFpsFactor 动态下调）
+		int effectiveFps = effectiveConfig.maxFps <= 0 ? 0
+			: Math.max(1, Math.round(effectiveConfig.maxFps * adaptiveFpsFactor));
+		if(!frameRateController.shouldUpdate(state.windowHandle, effectiveFps)) {
 			return;
 		}
 		
@@ -266,9 +272,8 @@ public class WindowShareManager {
 			return;
 		}
 		
-		// 计算实际使用的scale（自适应 × 配置）
-		float effectiveScale = effectiveConfig.scale * adaptiveScaleMultiplier;
-		effectiveScale = Math.max(0.1f, Math.min(1.0f, effectiveScale));
+		// scale 锁死为配置值（不再动态缩放 —— 远程跟本地渲染一致是底线）
+		float effectiveScale = effectiveConfig.scale;
 		
 		// === 像素差异检测 ===
 		if(effectiveConfig.diffUpdate) {
@@ -399,8 +404,10 @@ public class WindowShareManager {
 	private void updateSharedWindowX11(ShareState state) {
 		ImageCapture.CaptureConfig effectiveConfig = state.getEffectiveConfig(captureConfig);
 
-		// 帧率限制
-		if(!frameRateController.shouldUpdate(state.windowHandle, effectiveConfig.maxFps)) {
+		// 帧率限制（maxFps<=0 无限制；带宽不足时按 adaptiveFpsFactor 动态下调）
+		int effectiveFps = effectiveConfig.maxFps <= 0 ? 0
+			: Math.max(1, Math.round(effectiveConfig.maxFps * adaptiveFpsFactor));
+		if(!frameRateController.shouldUpdate(state.windowHandle, effectiveFps)) {
 			return;
 		}
 
@@ -423,9 +430,8 @@ public class WindowShareManager {
 			return;
 		}
 
-		// 计算实际使用的scale（自适应 × 配置）
-		float effectiveScale = effectiveConfig.scale * adaptiveScaleMultiplier;
-		effectiveScale = Math.max(0.1f, Math.min(1.0f, effectiveScale));
+		// scale 锁死为配置值（不再动态缩放 —— 远程跟本地渲染一致是底线）
+		float effectiveScale = effectiveConfig.scale;
 
 		int targetW = Math.max(1, Math.round(srcW * effectiveScale));
 		int targetH = Math.max(1, Math.round(srcH * effectiveScale));
@@ -676,8 +682,8 @@ public class WindowShareManager {
 	}
 	
 	/**
-	 * 评估自适应质量
-	 * 超限 → 降低scale，低利用 → 提高scale
+	 * 评估自适应帧率
+	 * 带宽超限 → 降 fps（保 scale=1.0 不变），低利用 → 恢复 fps
 	 */
 	private void evaluateAdaptiveQuality(ImageCapture.CaptureConfig config) {
 		if(config.maxBitrate <= 0) return; // 无码率限制时不做自适应
@@ -686,14 +692,14 @@ public class WindowShareManager {
 		float utilization = maxBytesPerSecond > 0 ? (float)adaptiveFrameBytes / (maxBytesPerSecond * ADAPTIVE_EVAL_INTERVAL / 20) : 0;
 		
 		if(adaptiveOverLimitCount >= ADAPTIVE_EVAL_INTERVAL / 2) {
-			// 超过一半帧数都超限 → 降低质量
-			adaptiveScaleMultiplier = Math.max(ADAPTIVE_SCALE_MIN, adaptiveScaleMultiplier * ADAPTIVE_SCALE_DOWN);
-			LOGGER.info("[ADAPTIVE] Scale decreased to {} (over limit: {} frames)", String.format("%.2f", adaptiveScaleMultiplier), adaptiveOverLimitCount);
+			// 超过一半帧数都超限 → 降 fps（绝不降 scale，避免缩放窗口 UI）
+			adaptiveFpsFactor = Math.max(ADAPTIVE_FPS_MIN, adaptiveFpsFactor * ADAPTIVE_FPS_DOWN);
+			LOGGER.info("[ADAPTIVE] FPS factor decreased to {} (over limit: {} frames)", String.format("%.2f", adaptiveFpsFactor), adaptiveOverLimitCount);
 			adaptiveOverLimitCount = 0;
-		} else if(utilization < 0.5f && adaptiveScaleMultiplier < ADAPTIVE_SCALE_MAX) {
-			// 利用率低于50% → 提高质量
-			adaptiveScaleMultiplier = Math.min(ADAPTIVE_SCALE_MAX, adaptiveScaleMultiplier * ADAPTIVE_SCALE_UP);
-			LOGGER.info("[ADAPTIVE] Scale increased to {} (utilization: {}%)", String.format("%.2f", adaptiveScaleMultiplier), String.format("%.1f", utilization * 100));
+		} else if(utilization < 0.5f && adaptiveFpsFactor < ADAPTIVE_FPS_MAX) {
+			// 利用率低于50% → 恢复 fps（逐步回到目标帧率）
+			adaptiveFpsFactor = Math.min(ADAPTIVE_FPS_MAX, adaptiveFpsFactor * ADAPTIVE_FPS_UP);
+			LOGGER.info("[ADAPTIVE] FPS factor increased to {} (utilization: {}%)", String.format("%.2f", adaptiveFpsFactor), String.format("%.1f", utilization * 100));
 			adaptiveUnderUtilCount = 0;
 		}
 	}
@@ -710,7 +716,7 @@ public class WindowShareManager {
 		shareStates.clear();
 		diffUpdateManager.clear();
 		frameRateController.clear();
-		adaptiveScaleMultiplier = 1.0f;
+		adaptiveFpsFactor = 1.0f;
 		bytesSentThisSecond = 0;
 		ImageCapture.clearAllDiffCaches();
 		ImageCapture.cleanupAllWindowResources();
@@ -764,10 +770,10 @@ public class WindowShareManager {
 	}
 	
 	/**
-	 * 获取自适应缩放乘数（供stats命令使用）
+	 * 获取自适应帧率因子（供stats命令使用；1.0 = 满目标帧率）
 	 */
-	public float getAdaptiveScaleMultiplier() {
-		return adaptiveScaleMultiplier;
+	public float getAdaptiveFpsFactor() {
+		return adaptiveFpsFactor;
 	}
 	
 	/**
@@ -787,9 +793,9 @@ public class WindowShareManager {
 		long totalDegraded = shareStates.values().stream().mapToLong(s -> s.degradedFrames).sum();
 		long totalSizeDropped = shareStates.values().stream().mapToLong(s -> s.sizeDroppedFrames).sum();
 		
-		return String.format("Windows: %d, Frames: %d, Skipped: %d, RateLimited: %d, Degraded: %d, SizeDropped: %d, Bytes: %d, Adaptive: %.2f, Utilization: %.1f%%", 
+		return String.format("Windows: %d, Frames: %d, Skipped: %d, RateLimited: %d, Degraded: %d, SizeDropped: %d, Bytes: %d, FpsFactor: %.2f, Utilization: %.1f%%", 
 			shareStates.size(), totalFrames, totalSkipped, totalRateLimited, totalDegraded, totalSizeDropped, totalBytes,
-			adaptiveScaleMultiplier, getBitrateUtilization() * 100);
+			adaptiveFpsFactor, getBitrateUtilization() * 100);
 	}
 	
 	/**

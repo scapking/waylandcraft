@@ -20,11 +20,11 @@ public class FrameRateController {
 	// 默认最大帧率
 	private static final int DEFAULT_MAX_FPS = 30;
 	
-	// 最小帧率
+	// 最小帧率（仅用于 getRecommendedFps/adjustFpsByDiff 的动态档位下限）
 	private static final int MIN_FPS = 5;
 	
-	// 最大帧率
-	private static final int MAX_FPS = 60;
+	// 硬上限（可自定义帧率的上限；0 表示无限制，由调用方特殊处理）
+	private static final int MAX_FPS = 240;
 	
 	/**
 	 * 检查是否应该更新指定窗口
@@ -42,10 +42,16 @@ public class FrameRateController {
 	 * @return true如果应该更新
 	 */
 	public boolean shouldUpdate(long windowHandle, int maxFps) {
+		// maxFps <= 0：无限制 —— 跟随渲染帧率与编码能力，每帧都允许更新。
+		// 实际吞吐仍受 diff 检测 + 码率限速自然节流，不会无脑每帧发。
+		if(maxFps <= 0) {
+			return true;
+		}
+		
 		long now = System.currentTimeMillis();
 		FrameData data = frameDataMap.computeIfAbsent(windowHandle, k -> new FrameData());
 		
-		long minInterval = 1000 / Math.max(MIN_FPS, Math.min(MAX_FPS, maxFps));
+		long minInterval = 1000L / Math.max(MIN_FPS, Math.min(MAX_FPS, maxFps));
 		
 		if(now - data.lastUpdateTime < minInterval) {
 			return false;
