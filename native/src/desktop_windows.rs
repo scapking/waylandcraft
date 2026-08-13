@@ -14,11 +14,12 @@ pub struct DesktopWindow {
 
 /// 获取桌面窗口列表（带退避重试，多方案回退）
 pub fn get_desktop_windows() -> Vec<DesktopWindow> {
-    let methods: Vec<(&str, fn() -> Option<Vec<DesktopWindow>>)> = vec![
+    let mut methods: Vec<(&str, fn() -> Option<Vec<DesktopWindow>>)> = vec![
         ("waylandcraft-extension", try_waylandcraft_extension),
         ("wmctrl-xauth", try_wmctrl_with_xauth),
-        ("wlr-foreign-toplevel", try_wlr_foreign_toplevel),
     ];
+    #[cfg(target_os = "linux")]
+    methods.push(("wlr-foreign-toplevel", wlr_toplevel::try_wlr_foreign_toplevel));
 
     for (name, method) in &methods {
         eprintln!("[desktop_windows] === Trying {} ===", name);
@@ -241,16 +242,21 @@ fn find_xauth_files() -> Vec<String> {
 
 // ═══════════════════════════════════════════════════════
 // 方案3: wlr-foreign-toplevel（wlroots 系合成器）
+// 仅 Linux 桌面：经 dlopen 加载 libwayland-client，Android 无此库会在
+// 首次调用时 panic（release 为 abort），故整个方案在非 Linux 裁剪。
 // ═══════════════════════════════════════════════════════
+#[cfg(target_os = "linux")]
+mod wlr_toplevel {
+    use super::*;
 
-use wayland_client::{
-    Connection, Dispatch, QueueHandle,
-    protocol::wl_registry,
-};
-use wayland_protocols_wlr::foreign_toplevel::v1::client::{
-    zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
-    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
-};
+    use wayland_client::{
+        Connection, Dispatch, QueueHandle,
+        protocol::wl_registry,
+    };
+    use wayland_protocols_wlr::foreign_toplevel::v1::client::{
+        zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
+        zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
+    };
 
 struct ToplevelEnumerator {
     manager: Option<ZwlrForeignToplevelManagerV1>,
@@ -327,7 +333,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for ToplevelEnumerator {
     }
 }
 
-fn try_wlr_foreign_toplevel() -> Option<Vec<DesktopWindow>> {
+    pub fn try_wlr_foreign_toplevel() -> Option<Vec<DesktopWindow>> {
     eprintln!("[wlr] Connecting to Wayland compositor...");
     let conn = retry_with_backoff(|| {
         Connection::connect_to_env().map_err(|e| e.to_string())
@@ -371,6 +377,7 @@ fn try_wlr_foreign_toplevel() -> Option<Vec<DesktopWindow>> {
 
     Some(windows)
 }
+} // end mod wlr_toplevel
 
 // ═══════════════════════════════════════════════════════
 // 回退: /proc 进程列表

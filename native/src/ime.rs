@@ -181,6 +181,37 @@ impl ImeState {
         true
     }
 
+    /// 游戏内应用当前是否有 active 的 text-input（用于穿透桥接的焦点同步）。
+    pub fn text_input_active(&self) -> bool {
+        self.ti3_active.is_some()
+    }
+
+    /// 把系统输入法 commit 的文字转发给游戏内 active 的 text-input。
+    pub fn deliver_commit_string(&mut self, text: &str) {
+        if let Some(ti) = &self.ti3_active {
+            ti.commit_string(Some(text.to_string()));
+        }
+    }
+
+    /// 把系统输入法 preedit 转发给游戏内 active 的 text-input。
+    pub fn deliver_preedit_string(
+        &mut self,
+        text: &str,
+        cursor_begin: i32,
+        cursor_end: i32,
+    ) {
+        if let Some(ti) = &self.ti3_active {
+            ti.preedit_string(Some(text.to_string()), cursor_begin, cursor_end);
+        }
+    }
+
+    /// 把系统输入法请求的环绕文本删除转发给游戏内 active 的 text-input。
+    pub fn deliver_delete_surrounding(&mut self, before: u32, after: u32) {
+        if let Some(ti) = &self.ti3_active {
+            ti.delete_surrounding_text(before, after);
+        }
+    }
+
     // ── text-input-v3 内部逻辑 ──
 
     fn ti3_commit(&mut self, ti: &ZwpTextInputV3) {

@@ -59,6 +59,7 @@ mod process;
 mod satellite;
 mod seat;
 mod svg;
+mod system_ime;
 mod utils;
 mod xdg_spec;
 
@@ -68,6 +69,7 @@ pub(crate) struct WaylandCraft<'a> {
     pub bridge: BridgeState,
     pub egl: EGLHelper,
     pub xdg: XDGSpecHelper,
+    pub system_ime: Option<crate::system_ime::SystemIme>,
 }
 
 pub struct WLCState {
@@ -301,6 +303,7 @@ impl ClientData for WLCClient {
 
 pub(crate) fn wlc_init(
     egl: EGLHelper,
+    wayland_display: usize,
 ) -> Result<WaylandCraft<'static>, Box<dyn std::error::Error>> {
     let event_loop: EventLoop<WLCState> = EventLoop::try_new()?;
     let display: Display<WLCState> = Display::new()?;
@@ -308,6 +311,10 @@ pub(crate) fn wlc_init(
 
     let mut state = WLCState::new(display.handle(), &egl);
     state.socket = socket.socket_name().to_os_string();
+
+    // 系统桌面输入法穿透：复用 GLFW 的 wl_display（Wayland 后端下才可用）。
+    // 探测失败（X11/XWayland 后端，或合成器不支持 text-input-v3）返回 None。
+    let system_ime = crate::system_ime::SystemIme::new(wayland_display);
 
     // Start xwayland-satellite to provide an X11 display for X11-only apps
     match satellite::start_satellite(&state.socket) {
@@ -352,12 +359,36 @@ pub(crate) fn wlc_init(
         bridge: BridgeState::new(),
         egl,
         xdg,
+        system_ime,
     };
     Ok(instance)
 }
 
 impl<'a> WaylandCraft<'a> {
     pub fn update(&mut self) {
+        // ── 系统桌面输入法穿透桥接 ──
+        // 1. 游戏内 text-input 焦点 → 系统 text-input enable/disable
+        // 2. 系统输入法 commit/preedit/delete → 游戏内 active text-input
+        if let Some(si) = &mut self.system_ime {
+            let active = self.state.ime.text_input_active();
+            si.set_active(active);
+            si.poll();
+
+            let committed = si.take_committed();
+            let preedit = si.take_preedit();
+            let delete = si.take_delete();
+
+            for text in committed {
+                self.state.ime.deliver_commit_string(&text);
+            }
+            if let Some((text, b, e)) = preedit {
+                self.state.ime.deliver_preedit_string(&text, b, e);
+            }
+            if let Some((b, a)) = delete {
+                self.state.ime.deliver_delete_surrounding(b, a);
+            }
+        }
+
         let state = &mut self.state;
         let event_loop = &mut self.event_loop;
         event_loop.dispatch(Some(Duration::ZERO), state).unwrap();

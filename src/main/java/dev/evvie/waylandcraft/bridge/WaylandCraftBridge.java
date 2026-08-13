@@ -19,6 +19,7 @@ import org.apache.commons.lang3.ArrayUtils;
 import org.jetbrains.annotations.Nullable;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWNativeEGL;
+import org.lwjgl.glfw.GLFWNativeWayland;
 import org.lwjgl.system.Platform;
 
 import dev.evvie.waylandcraft.WaylandCraftCommon;
@@ -385,8 +386,12 @@ public class WaylandCraftBridge {
 		if(eglDisplay == 0) {
 			throw new RuntimeException("Failed to get EGL display!");
 		}
-		
-		long handle = init(GLFW.Functions.GetProcAddress, eglDisplay);
+
+		// Wayland 后端下拿到 wl_display 指针，供 native 做系统输入法穿透；
+		// X11/XWayland 后端返回 0，穿透自动禁用（graceful fallback）。
+		long waylandDisplay = GLFWNativeWayland.glfwGetWaylandDisplay();
+
+		long handle = init(GLFW.Functions.GetProcAddress, eglDisplay, waylandDisplay);
 		return new WaylandCraftBridge(handle);
 	}
 	
@@ -1021,7 +1026,7 @@ public class WaylandCraftBridge {
 	
 	public static record ResizeRequest(int serial, int edges) {}
 	
-	private static native long init(long glfwGetProcAddress, long eglDisplay);
+	private static native long init(long glfwGetProcAddress, long eglDisplay, long waylandDisplay);
 	private static native void update(long instance);
 	private static native String socket(long instance);
 	private static native String getSatelliteDisplay(long instance);

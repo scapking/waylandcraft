@@ -137,7 +137,7 @@ bind_java_type! {
 
     native_methods {
         static extern fn init {
-            sig = (glfw_get_proc_address: jlong, egl_display: jlong) -> jlong,
+            sig = (glfw_get_proc_address: jlong, egl_display: jlong, wayland_display: jlong) -> jlong,
             fn = init,
         },
         static extern fn update {
@@ -551,11 +551,13 @@ fn init<'local>(
     _class: JClass<'local>,
     glfw_get_proc_address: jlong,
     egl_display: jlong,
+    wayland_display: jlong,
 ) -> Result<jlong, BridgeError> {
     let dpy: EGLDisplay = (egl_display as usize) as EGLDisplay;
     let egl = EGLHelper::new(dpy, glfw_get_proc_address as usize);
 
-    let instance = wlc_init(egl).map_err(BridgeError::Init)?;
+    let instance = wlc_init(egl, wayland_display as usize)
+        .map_err(BridgeError::Init)?;
     let instance_box = Box::new(instance);
     let ptr = Box::into_raw(instance_box);
 

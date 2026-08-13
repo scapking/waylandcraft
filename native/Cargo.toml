@@ -24,6 +24,12 @@ pipewire = "0.8"
 # Wayland client for wlr-foreign-toplevel-management
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+# System IME passthrough: reuse Minecraft's wl_display/wl_surface as a
+# text-input-v3 *client* (guest connection). Needs the sys (libwayland) client
+# backend to receive foreign `*mut wl_display`/`*mut wl_proxy` pointers;
+# `dlopen` keeps Android cross-builds linkable (no bionic libwayland-client).
+wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
+wayland-protocols = { version = "0.32", features = ["client"] }
 
 [dev-dependencies]
 wayland-client = "0.31"
