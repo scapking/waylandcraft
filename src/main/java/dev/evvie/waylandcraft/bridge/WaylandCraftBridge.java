@@ -911,6 +911,20 @@ public class WaylandCraftBridge {
 		setAudioLogFileNative(path);
 	}
 	
+	/** 让 Rust 侧 [system_ime] 全链路日志同时写入指定文件（默认只进 stderr）。
+	 * bridge 初始化后立即调用，路径用 .minecraft/waylandcraft-ime.log。
+	 * 覆盖：probe→connect→registry/globals→enter/leave→enable 状态机→
+	 * commit/preedit→错误。任何一步失败都能从该文件瞬间定位。 */
+	public void setImeLogFile(String path) {
+		setImeLogFileNative(path);
+	}
+	
+	/** 静态版：必须在 WaylandCraftBridge.start()（native 初始化）之前调用，
+	 * 这样 SystemIme::new 的 BUILD/PHASE 初始化日志也能写入日志文件。 */
+	public static void setImeLogFileStatic(String path) {
+		setImeLogFileNative(path);
+	}
+	
 	/** 查询 Rust 侧音频捕获链路状态（JSON 字符串），供 /wl audio status 展示。 */
 	public String audioCaptureStatus() {
 		return audioCaptureStatusNative(instance);
@@ -1133,6 +1147,9 @@ public class WaylandCraftBridge {
 	
 	// Set Rust-side [audio] log file path (eprintln also written to this file)
 	private static native void setAudioLogFileNative(String path);
+	
+	// Set Rust-side [system_ime] log file path (eprintln also written to this file)
+	private static native void setImeLogFileNative(String path);
 	
 	// Query Rust-side audio capture pipeline status (JSON string)
 	private static native String audioCaptureStatusNative(long instance);

@@ -198,6 +198,13 @@ public class WaylandCraft implements ClientModInitializer {
 	public void update() {
 		if(bridge == null && !nativeDisabled) {
 			try {
+				// Rust 侧 [system_ime] 日志文件必须在 native start()（含 SystemIme 初始化）
+				// 之前设置，否则 BUILD/PHASE 初始化日志进不了文件（eprintln 只进 stderr）。
+				try {
+					WaylandCraftBridge.setImeLogFileStatic(new File(Minecraft.getInstance().gameDirectory, "waylandcraft-ime.log").getAbsolutePath());
+				} catch (Throwable t) {
+					WaylandCraftCommon.LOGGER.warn("[system_ime] setImeLogFileStatic failed: {}", t.toString());
+				}
 				bridge = WaylandCraftBridge.start();
 				waylandSocket = bridge.getSocket();
 				// Rust 侧 [kb-debug] 日志写入独立文件（eprintln 只进 stderr，latest.log 看不到）。
@@ -212,6 +219,13 @@ public class WaylandCraft implements ClientModInitializer {
 					bridge.setAudioLogFile(new File(Minecraft.getInstance().gameDirectory, "waylandcraft-audio.log").getAbsolutePath());
 				} catch (Throwable t) {
 					WaylandCraftCommon.LOGGER.warn("[audio] setAudioLogFile failed: {}", t.toString());
+				}
+				// Rust 侧 [system_ime] 全链路日志写入独立文件
+				// （probe→connect→registry→enter→enable→commit→错误）。
+				try {
+					bridge.setImeLogFile(new File(Minecraft.getInstance().gameDirectory, "waylandcraft-ime.log").getAbsolutePath());
+				} catch (Throwable t) {
+					WaylandCraftCommon.LOGGER.warn("[system_ime] setImeLogFile failed: {}", t.toString());
 				}
 				xdgManager = new XDGDesktopManager(this);
 				settingsManager = new WaylandCraftSettingsManager(this);

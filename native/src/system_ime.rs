@@ -30,6 +30,15 @@ use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_v3::{self, ZwpTextInputV3},
 };
 
+/// [system_ime] 日志宏：同时写 stderr 和 IME_LOG_FILE
+/// （Java setImeLogFile 设置的 waylandcraft-ime.log）。
+/// eprintln 只进 stderr 不进 latest.log，诊断必须靠这个文件。
+macro_rules! ime_log {
+    ($($arg:tt)*) => {
+        crate::bridge::ime_log_write(&format!($($arg)*))
+    };
+}
+
 /// EventQueue 的 dispatch state：持有 proxy、处理事件、缓存待转发数据。
 struct SystemImeData {
     manager: Option<ZwpTextInputManagerV3>,
@@ -85,7 +94,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for SystemImeData {
             version,
         } = event
         {
-            eprintln!(
+            ime_log!(
                 "[waylandcraft][system_ime] global: {} v{} (name={})",
                 interface, version, name
             );
@@ -98,7 +107,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for SystemImeData {
                         (),
                     );
                     state.manager = Some(manager);
-                    eprintln!(
+                    ime_log!(
                         "[waylandcraft][system_ime] bound zwp_text_input_manager_v3"
                     );
                 }
@@ -110,7 +119,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for SystemImeData {
                         (),
                     );
                     state.seat = Some(seat);
-                    eprintln!(
+                    ime_log!(
                         "[waylandcraft][system_ime] bound wl_seat (name={})",
                         name
                     );
@@ -125,7 +134,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for SystemImeData {
                 {
                     let ti = manager.get_text_input(seat, qh, ());
                     state.text_input = Some(ti);
-                    eprintln!(
+                    ime_log!(
                         "[waylandcraft][system_ime] created text_input (seat name={})",
                         name
                     );
@@ -176,20 +185,20 @@ impl Dispatch<ZwpTextInputV3, ()> for SystemImeData {
                 // enter 后必须重新 enable（协议：enter 使 enable 状态失效）。
                 state.enabled = false;
                 let sid = surface.id();
-                eprintln!(
+                ime_log!(
                     "[waylandcraft][system_ime] ENTER: text-input focus -> surface id={sid:?} (entered=true)"
                 );
             }
             zwp_text_input_v3::Event::Leave { .. } => {
                 state.entered = false;
                 state.enabled = false;
-                eprintln!(
+                ime_log!(
                     "[waylandcraft][system_ime] LEAVE: text-input focus lost (entered=false)"
                 );
             }
             zwp_text_input_v3::Event::CommitString { text } => {
                 let t = text.unwrap_or_default();
-                eprintln!(
+                ime_log!(
                     "[waylandcraft][system_ime] commit_string: {:?}",
                     t
                 );
@@ -201,7 +210,7 @@ impl Dispatch<ZwpTextInputV3, ()> for SystemImeData {
                 cursor_end,
             } => {
                 let t = text.unwrap_or_default();
-                eprintln!(
+                ime_log!(
                     "[waylandcraft][system_ime] preedit_string: {:?} cursor=({cursor_begin},{cursor_end})",
                     t
                 );
@@ -211,7 +220,7 @@ impl Dispatch<ZwpTextInputV3, ()> for SystemImeData {
                 before_length,
                 after_length,
             } => {
-                eprintln!(
+                ime_log!(
                     "[waylandcraft][system_ime] delete_surrounding: before={before_length} after={after_length}"
                 );
                 state.delete_surrounding =
@@ -220,7 +229,7 @@ impl Dispatch<ZwpTextInputV3, ()> for SystemImeData {
             zwp_text_input_v3::Event::Done { serial } => {
                 // 合成器确认状态变更（含 enable 生效）都会回一个 done；
                 // serial 不断增长 = 合成器正在响应，可用于确认 enable 已生效。
-                eprintln!(
+                ime_log!(
                     "[waylandcraft][system_ime][EVENT] done serial={serial}"
                 );
             }
@@ -255,17 +264,17 @@ impl SystemIme {
     /// surface/连接来源，只要 Minecraft 窗口在系统合成器里有键盘焦点，
     /// 合成器就会给本连接的 text_input 发 enter。
     pub fn new(wl_display_ptr: usize) -> ImeInit {
-        eprintln!(
+        ime_log!(
             "[waylandcraft][system_ime][BUILD] log-v3 (全流程检查点+自动重试)"
         );
-        eprintln!(
+        ime_log!(
             "[waylandcraft][system_ime][PHASE=probe] wl_display_ptr=0x{:x} (0x0 => Minecraft X11/XWayland 后端)",
             wl_display_ptr
         );
 
         let conn = if wl_display_ptr != 0 {
             // Minecraft Wayland 后端：复用 GLFW 已建立的连接。
-            eprintln!(
+            ime_log!(
                 "[waylandcraft][system_ime][PHASE=connect] 复用 GLFW wl_display (guest mode)"
             );
             let backend = unsafe {
@@ -275,13 +284,13 @@ impl SystemIme {
         } else {
             // Minecraft X11/XWayland 后端：自己连系统 Wayland 桌面。
             let env = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
-            eprintln!(
+            ime_log!(
                 "[waylandcraft][system_ime][PHASE=connect] connect_to_env() WAYLAND_DISPLAY={:?}",
                 env
             );
             match Connection::connect_to_env() {
                 Ok(c) => {
-                    eprintln!(
+                    ime_log!(
                         "[waylandcraft][system_ime][PHASE=connect] OK: 已连上系统 Wayland 合成器"
                     );
                     c
@@ -290,7 +299,7 @@ impl SystemIme {
                     let msg = format!(
                         "connect_to_env FAILED: {e} (Minecraft 进程拿不到 WAYLAND_DISPLAY, 启动器未继承)"
                     );
-                    eprintln!(
+                    ime_log!(
                         "[waylandcraft][system_ime][PHASE=connect][ERROR] {msg}"
                     );
                     return ImeInit::Transient(msg);
@@ -304,20 +313,20 @@ impl SystemIme {
         // 请求 registry，随后 roundtrip 收集 globals 并 bind manager/seat。
         conn.display().get_registry(&qh, ());
         let mut data = SystemImeData::default();
-        eprintln!(
+        ime_log!(
             "[waylandcraft][system_ime][PHASE=registry] 请求 globals... (roundtrip)"
         );
         if let Err(e) = queue.roundtrip(&mut data) {
             let msg = format!(
                 "registry roundtrip FAILED: {e} (合成器断开/协议错误)"
             );
-            eprintln!(
+            ime_log!(
                 "[waylandcraft][system_ime][PHASE=registry][ERROR] {msg}"
             );
             return ImeInit::Transient(msg);
         }
 
-        eprintln!(
+        ime_log!(
             "[waylandcraft][system_ime][PHASE=registry] done: manager={}, seat={}, text_input={}",
             data.manager.is_some(),
             data.seat.is_some(),
@@ -326,27 +335,27 @@ impl SystemIme {
 
         if data.manager.is_none() {
             let msg = "合成器未暴露 zwp_text_input_manager_v3 (KWin<6.6 / 无 text-input 支持)".to_string();
-            eprintln!(
+            ime_log!(
                 "[waylandcraft][system_ime][PHASE=registry][ERROR] {msg}"
             );
             return ImeInit::Unsupported(msg);
         }
         if data.seat.is_none() {
             let msg = "合成器未暴露 wl_seat".to_string();
-            eprintln!(
+            ime_log!(
                 "[waylandcraft][system_ime][PHASE=registry][ERROR] {msg}"
             );
             return ImeInit::Unsupported(msg);
         }
         if data.text_input.is_none() {
             let msg = "manager/seat 就绪但未创建 text_input".to_string();
-            eprintln!(
+            ime_log!(
                 "[waylandcraft][system_ime][PHASE=registry][ERROR] {msg}"
             );
             return ImeInit::Unsupported(msg);
         }
 
-        eprintln!(
+        ime_log!(
             "[waylandcraft][system_ime][PHASE=init] OK -> passthrough ready"
         );
         ImeInit::Ready(Self { conn, queue, data })
@@ -355,7 +364,7 @@ impl SystemIme {
     /// 游戏内应用是否有 active text-input（由 ime 状态驱动）。
     pub fn set_active(&mut self, active: bool) {
         if self.data.want_enabled != active {
-            eprintln!(
+            ime_log!(
                 "[waylandcraft][system_ime] set_active: {} -> {}",
                 self.data.want_enabled, active
             );
@@ -375,14 +384,14 @@ impl SystemIme {
                         if io.kind() == std::io::ErrorKind::WouldBlock
                 );
                 if !is_wouldblock {
-                    eprintln!(
+                    ime_log!(
                         "[waylandcraft][system_ime][PHASE=poll][ERROR] read FAILED: {e}"
                     );
                 }
             }
         }
         if let Err(e) = self.queue.dispatch_pending(&mut self.data) {
-            eprintln!(
+            ime_log!(
                 "[waylandcraft][system_ime][PHASE=poll][ERROR] dispatch_pending FAILED: {e} (合成器协议错误/断开)"
             );
         }
@@ -391,14 +400,14 @@ impl SystemIme {
         if let Some(ti) = &self.data.text_input {
             if self.data.entered {
                 if self.data.want_enabled && !self.data.enabled {
-                    eprintln!(
+                    ime_log!(
                         "[waylandcraft][system_ime] state: entered=true want_enabled=true enabled=false -> ENABLE+commit"
                     );
                     ti.enable();
                     ti.commit();
                     self.data.enabled = true;
                 } else if !self.data.want_enabled && self.data.enabled {
-                    eprintln!(
+                    ime_log!(
                         "[waylandcraft][system_ime] state: want_enabled=false enabled=true -> DISABLE+commit"
                     );
                     ti.disable();
@@ -414,7 +423,7 @@ impl SystemIme {
                     .map(|t| now.duration_since(t).as_secs() >= 5)
                     .unwrap_or(true);
                 if due {
-                    eprintln!(
+                    ime_log!(
                         "[waylandcraft][system_ime] BLOCKED: want_enabled=true but entered=false (compositor never sent ENTER)"
                     );
                     self.data.last_blocked_log = Some(now);
@@ -422,7 +431,7 @@ impl SystemIme {
             }
         }
         if let Err(e) = self.queue.flush() {
-            eprintln!(
+            ime_log!(
                 "[waylandcraft][system_ime] flush ERROR: {e}"
             );
         }

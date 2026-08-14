@@ -84,6 +84,26 @@ pub fn audio_log_write(s: &str) {
     }
 }
 
+/// Rust 侧系统输入法穿透日志文件（Java 通过 setImeLogFile 设置路径）。
+/// 全链路：probe → connect → registry/globals → enter/leave → enable 状态机 →
+/// commit/preedit → 错误。所有 [system_ime] 行同时写 stderr 和此文件
+/// （eprintln 只进 stderr，不进 latest.log——诊断必须靠这个文件）。
+static IME_LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+/// 追加一行到 IME_LOG_FILE（若已设置），失败静默忽略。同时写 stderr。
+pub fn ime_log_write(s: &str) {
+    eprintln!("{s}");
+    use std::io::Write;
+    let mut guard = match IME_LOG_FILE.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(f) = guard.as_mut() {
+        let _ = writeln!(f, "{s}");
+        let _ = f.flush();
+    }
+}
+
 #[allow(clippy::vec_box)]
 pub(crate) struct BridgeState {
     /* Handle collections */
@@ -338,6 +358,11 @@ bind_java_type! {
             sig = (path: JString),
             name = "setAudioLogFileNative",
             fn = set_audio_log_file,
+        },
+        static extern fn set_ime_log_file {
+            sig = (path: JString),
+            name = "setImeLogFileNative",
+            fn = set_ime_log_file,
         },
         static extern fn audio_capture_status {
             sig = (instance: jlong) -> JString,
@@ -1531,6 +1556,42 @@ fn set_audio_log_file<'local>(
         }
         Err(e) => {
             eprintln!("[audio] setAudioLogFile: 打开 {path_str} 失败: {e}（继续只写 stderr）");
+            Ok(())
+        }
+    }
+}
+
+/// setImeLogFile(path) —— 让 Rust 侧 [system_ime] 行同时写入文件（默认只进 stderr）。
+/// Java 在 bridge 初始化后调用，路径通常是 .minecraft/waylandcraft-ime.log。
+fn set_ime_log_file<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    path: JString<'local>,
+) -> Result<(), BridgeError> {
+    let path_str: String = env.get_string(&path)?.into();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path_str);
+    match file {
+        Ok(f) => {
+            let mut guard = match IME_LOG_FILE.lock() {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("[system_ime] setImeLogFile: mutex poisoned: {e}");
+                    return Ok(());
+                }
+            };
+            *guard = Some(f);
+            eprintln!(
+                "[system_ime] setImeLogFile: 输入法穿透全链路日志 -> {path_str}"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!(
+                "[system_ime] setImeLogFile: 打开 {path_str} 失败: {e}（继续只写 stderr）"
+            );
             Ok(())
         }
     }
