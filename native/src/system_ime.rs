@@ -217,10 +217,26 @@ impl Dispatch<ZwpTextInputV3, ()> for SystemImeData {
                 state.delete_surrounding =
                     Some((before_length, after_length));
             }
-            zwp_text_input_v3::Event::Done { .. } => {}
+            zwp_text_input_v3::Event::Done { serial } => {
+                // 合成器确认状态变更（含 enable 生效）都会回一个 done；
+                // serial 不断增长 = 合成器正在响应，可用于确认 enable 已生效。
+                eprintln!(
+                    "[waylandcraft][system_ime][EVENT] done serial={serial}"
+                );
+            }
             _ => {}
         }
     }
+}
+
+/// 初始化结果：区分「可重试的环境问题」和「重试无意义的协议缺失」。
+pub enum ImeInit {
+    /// 初始化成功。
+    Ready(SystemIme),
+    /// 暂时性失败（WAYLAND_DISPLAY 缺失/连接失败等），稍后可自动重试。
+    Transient(String),
+    /// 合成器不支持（无 text-input-v3 / 无 seat），重试无意义。
+    Unsupported(String),
 }
 
 /// 穿透桥接的对外句柄。挂在 `WaylandCraft` 上，在 `update()` 里驱动。
@@ -238,17 +254,19 @@ impl SystemIme {
     /// 连 `WAYLAND_DISPLAY`——text-input-v3 是 seat 级协议，不依赖
     /// surface/连接来源，只要 Minecraft 窗口在系统合成器里有键盘焦点，
     /// 合成器就会给本连接的 text_input 发 enter。
-    /// 失败（桌面无 Wayland / 合成器无 text-input-v3）返回 None。
-    pub fn new(wl_display_ptr: usize) -> Option<Self> {
+    pub fn new(wl_display_ptr: usize) -> ImeInit {
         eprintln!(
-            "[waylandcraft][system_ime] init: wl_display_ptr=0x{:x}",
+            "[waylandcraft][system_ime][BUILD] log-v3 (全流程检查点+自动重试)"
+        );
+        eprintln!(
+            "[waylandcraft][system_ime][PHASE=probe] wl_display_ptr=0x{:x} (0x0 => Minecraft X11/XWayland 后端)",
             wl_display_ptr
         );
 
         let conn = if wl_display_ptr != 0 {
             // Minecraft Wayland 后端：复用 GLFW 已建立的连接。
             eprintln!(
-                "[waylandcraft][system_ime] connection: reuse GLFW wl_display (guest mode)"
+                "[waylandcraft][system_ime][PHASE=connect] 复用 GLFW wl_display (guest mode)"
             );
             let backend = unsafe {
                 Backend::from_foreign_display(wl_display_ptr as *mut _)
@@ -258,16 +276,24 @@ impl SystemIme {
             // Minecraft X11/XWayland 后端：自己连系统 Wayland 桌面。
             let env = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
             eprintln!(
-                "[waylandcraft][system_ime] connection: connect_to_env() (WAYLAND_DISPLAY={:?})",
+                "[waylandcraft][system_ime][PHASE=connect] connect_to_env() WAYLAND_DISPLAY={:?}",
                 env
             );
             match Connection::connect_to_env() {
-                Ok(c) => c,
-                Err(e) => {
+                Ok(c) => {
                     eprintln!(
-                        "[waylandcraft][system_ime] connect_to_env FAILED: {e}"
+                        "[waylandcraft][system_ime][PHASE=connect] OK: 已连上系统 Wayland 合成器"
                     );
-                    return None;
+                    c
+                }
+                Err(e) => {
+                    let msg = format!(
+                        "connect_to_env FAILED: {e} (Minecraft 进程拿不到 WAYLAND_DISPLAY, 启动器未继承)"
+                    );
+                    eprintln!(
+                        "[waylandcraft][system_ime][PHASE=connect][ERROR] {msg}"
+                    );
+                    return ImeInit::Transient(msg);
                 }
             }
         };
@@ -278,29 +304,52 @@ impl SystemIme {
         // 请求 registry，随后 roundtrip 收集 globals 并 bind manager/seat。
         conn.display().get_registry(&qh, ());
         let mut data = SystemImeData::default();
+        eprintln!(
+            "[waylandcraft][system_ime][PHASE=registry] 请求 globals... (roundtrip)"
+        );
         if let Err(e) = queue.roundtrip(&mut data) {
-            eprintln!(
-                "[waylandcraft][system_ime] registry roundtrip FAILED: {e}"
+            let msg = format!(
+                "registry roundtrip FAILED: {e} (合成器断开/协议错误)"
             );
-            return None;
+            eprintln!(
+                "[waylandcraft][system_ime][PHASE=registry][ERROR] {msg}"
+            );
+            return ImeInit::Transient(msg);
         }
 
         eprintln!(
-            "[waylandcraft][system_ime] globals done: manager={}, seat={}, text_input={}",
+            "[waylandcraft][system_ime][PHASE=registry] done: manager={}, seat={}, text_input={}",
             data.manager.is_some(),
             data.seat.is_some(),
             data.text_input.is_some(),
         );
 
-        if data.text_input.is_none() {
+        if data.manager.is_none() {
+            let msg = "合成器未暴露 zwp_text_input_manager_v3 (KWin<6.6 / 无 text-input 支持)".to_string();
             eprintln!(
-                "[waylandcraft] system IME: no zwp_text_input_v3 support"
+                "[waylandcraft][system_ime][PHASE=registry][ERROR] {msg}"
             );
-            return None;
+            return ImeInit::Unsupported(msg);
+        }
+        if data.seat.is_none() {
+            let msg = "合成器未暴露 wl_seat".to_string();
+            eprintln!(
+                "[waylandcraft][system_ime][PHASE=registry][ERROR] {msg}"
+            );
+            return ImeInit::Unsupported(msg);
+        }
+        if data.text_input.is_none() {
+            let msg = "manager/seat 就绪但未创建 text_input".to_string();
+            eprintln!(
+                "[waylandcraft][system_ime][PHASE=registry][ERROR] {msg}"
+            );
+            return ImeInit::Unsupported(msg);
         }
 
-        eprintln!("[waylandcraft] system IME passthrough: ready");
-        Some(Self { conn, queue, data })
+        eprintln!(
+            "[waylandcraft][system_ime][PHASE=init] OK -> passthrough ready"
+        );
+        ImeInit::Ready(Self { conn, queue, data })
     }
 
     /// 游戏内应用是否有 active text-input（由 ime 状态驱动）。
@@ -317,12 +366,24 @@ impl SystemIme {
     /// 每帧非阻塞地收发系统端事件，并应用 enable/disable 状态机。
     pub fn poll(&mut self) {
         if let Some(guard) = self.queue.prepare_read() {
-            // 非阻塞读：无新数据时返回 WouldBlock，忽略即可。
-            let _ = guard.read();
+            // 非阻塞读：WouldBlock 表示暂无新数据（正常，忽略），
+            // 其余错误必须打出来，否则会静默丢事件。
+            if let Err(e) = guard.read() {
+                let is_wouldblock = matches!(
+                    &e,
+                    wayland_client::backend::WaylandError::Io(io)
+                        if io.kind() == std::io::ErrorKind::WouldBlock
+                );
+                if !is_wouldblock {
+                    eprintln!(
+                        "[waylandcraft][system_ime][PHASE=poll][ERROR] read FAILED: {e}"
+                    );
+                }
+            }
         }
         if let Err(e) = self.queue.dispatch_pending(&mut self.data) {
             eprintln!(
-                "[waylandcraft][system_ime] dispatch_pending ERROR: {e}"
+                "[waylandcraft][system_ime][PHASE=poll][ERROR] dispatch_pending FAILED: {e} (合成器协议错误/断开)"
             );
         }
 

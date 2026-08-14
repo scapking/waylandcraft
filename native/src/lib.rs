@@ -70,6 +70,12 @@ pub(crate) struct WaylandCraft<'a> {
     pub egl: EGLHelper,
     pub xdg: XDGSpecHelper,
     pub system_ime: Option<crate::system_ime::SystemIme>,
+    /// 初始探测用的 wl_display 指针，供惰性重试时复用。
+    pub wayland_display: usize,
+    /// 穿透初始化失败后是否继续自动重试（Unsupported 后置 false）。
+    pub ime_retry: bool,
+    /// 上次重试时间（节流：每 5 秒最多一次）。
+    pub last_ime_retry: Option<std::time::Instant>,
 }
 
 pub struct WLCState {
@@ -312,14 +318,29 @@ pub(crate) fn wlc_init(
     let mut state = WLCState::new(display.handle(), &egl);
     state.socket = socket.socket_name().to_os_string();
 
-    // 系统桌面输入法穿透：复用 GLFW 的 wl_display（Wayland 后端下才可用）。
-    // 探测失败（X11/XWayland 后端，或合成器不支持 text-input-v3）返回 None。
-    let system_ime = crate::system_ime::SystemIme::new(wayland_display);
-    if system_ime.is_none() {
-        eprintln!(
-            "[waylandcraft][system_ime] NOT available -> passthrough DISABLED (see [system_ime] logs above)"
-        );
-    }
+    // 系统桌面输入法穿透：复用 GLFW 的 wl_display（Wayland 后端下才可用），
+    // 或 X11/XWayland 后端自连 WAYLAND_DISPLAY。
+    // 暂时性失败（连接问题）会在 update() 里自动重试，不永久跳过。
+    let mut ime_retry = false;
+    let system_ime = match crate::system_ime::SystemIme::new(wayland_display) {
+        crate::system_ime::ImeInit::Ready(si) => {
+            eprintln!("[waylandcraft][system_ime] passthrough ENABLED");
+            Some(si)
+        }
+        crate::system_ime::ImeInit::Transient(msg) => {
+            ime_retry = true;
+            eprintln!(
+                "[waylandcraft][system_ime] TRANSIENT: {msg} -> 将自动重试"
+            );
+            None
+        }
+        crate::system_ime::ImeInit::Unsupported(msg) => {
+            eprintln!(
+                "[waylandcraft][system_ime] UNSUPPORTED: {msg} -> 不再重试"
+            );
+            None
+        }
+    };
 
     // Start xwayland-satellite to provide an X11 display for X11-only apps
     match satellite::start_satellite(&state.socket) {
@@ -365,6 +386,9 @@ pub(crate) fn wlc_init(
         egl,
         xdg,
         system_ime,
+        wayland_display,
+        ime_retry,
+        last_ime_retry: None,
     };
     Ok(instance)
 }
@@ -374,6 +398,41 @@ impl<'a> WaylandCraft<'a> {
         // ── 系统桌面输入法穿透桥接 ──
         // 1. 游戏内 text-input 焦点 → 系统 text-input enable/disable
         // 2. 系统输入法 commit/preedit/delete → 游戏内 active text-input
+        // 3. 穿透未就绪时惰性重试（每 5 秒一次，TRANSIENT 才重试），
+        //    避免启动时 WAYLAND_DISPLAY 未就绪就永久跳过。
+        if self.system_ime.is_none() && self.ime_retry {
+            let now = std::time::Instant::now();
+            let due = self
+                .last_ime_retry
+                .map(|t| now.duration_since(t).as_secs() >= 5)
+                .unwrap_or(true);
+            if due {
+                self.last_ime_retry = Some(now);
+                eprintln!(
+                    "[waylandcraft][system_ime][RETRY] 重新初始化..."
+                );
+                match crate::system_ime::SystemIme::new(self.wayland_display)
+                {
+                    crate::system_ime::ImeInit::Ready(si) => {
+                        self.system_ime = Some(si);
+                        eprintln!(
+                            "[waylandcraft][system_ime][RETRY] OK -> passthrough ENABLED"
+                        );
+                    }
+                    crate::system_ime::ImeInit::Transient(msg) => {
+                        eprintln!(
+                            "[waylandcraft][system_ime][RETRY] 仍不可用: {msg}"
+                        );
+                    }
+                    crate::system_ime::ImeInit::Unsupported(msg) => {
+                        eprintln!(
+                            "[waylandcraft][system_ime][RETRY] 不再重试: {msg}"
+                        );
+                        self.ime_retry = false;
+                    }
+                }
+            }
+        }
         if let Some(si) = &mut self.system_ime {
             let active = self.state.ime.text_input_active();
             si.set_active(active);

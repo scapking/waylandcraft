@@ -1,7 +1,7 @@
 {
 	"schemaVersion": 1,
 	"id": "waylandcraft",
-	"version": "1.1.42",
+	"version": "1.1.43",
 	"name": "WaylandCraft",
 	"description": "Wayland Compositor in Minecraft",
 	"authors": [
