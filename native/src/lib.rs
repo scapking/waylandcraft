@@ -315,6 +315,11 @@ pub(crate) fn wlc_init(
     // 系统桌面输入法穿透：复用 GLFW 的 wl_display（Wayland 后端下才可用）。
     // 探测失败（X11/XWayland 后端，或合成器不支持 text-input-v3）返回 None。
     let system_ime = crate::system_ime::SystemIme::new(wayland_display);
+    if system_ime.is_none() {
+        eprintln!(
+            "[waylandcraft][system_ime] NOT available -> passthrough DISABLED (see [system_ime] logs above)"
+        );
+    }
 
     // Start xwayland-satellite to provide an X11 display for X11-only apps
     match satellite::start_satellite(&state.socket) {

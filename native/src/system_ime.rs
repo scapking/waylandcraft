@@ -23,7 +23,7 @@
 use wayland_client::{
     backend::Backend,
     protocol::{wl_registry, wl_seat},
-    Connection, Dispatch, EventQueue, QueueHandle,
+    Connection, Dispatch, EventQueue, Proxy, QueueHandle,
 };
 use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_manager_v3::{self, ZwpTextInputManagerV3},
@@ -49,6 +49,8 @@ struct SystemImeData {
     preedit: Option<(String, i32, i32)>,
     /// 系统输入法请求删除的环绕文本，待转发。
     delete_surrounding: Option<(u32, u32)>,
+    /// 上次打印 BLOCKED 提示的时间（节流用，避免每帧刷屏）。
+    last_blocked_log: Option<std::time::Instant>,
 }
 
 impl Default for SystemImeData {
@@ -63,6 +65,7 @@ impl Default for SystemImeData {
             committed: Vec::new(),
             preedit: None,
             delete_surrounding: None,
+            last_blocked_log: None,
         }
     }
 }
@@ -82,6 +85,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for SystemImeData {
             version,
         } = event
         {
+            eprintln!(
+                "[waylandcraft][system_ime] global: {} v{} (name={})",
+                interface, version, name
+            );
             match interface.as_str() {
                 "zwp_text_input_manager_v3" => {
                     let manager = registry.bind::<ZwpTextInputManagerV3, _, _>(
@@ -91,6 +98,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for SystemImeData {
                         (),
                     );
                     state.manager = Some(manager);
+                    eprintln!(
+                        "[waylandcraft][system_ime] bound zwp_text_input_manager_v3"
+                    );
                 }
                 "wl_seat" => {
                     let seat = registry.bind::<wl_seat::WlSeat, _, _>(
@@ -100,6 +110,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for SystemImeData {
                         (),
                     );
                     state.seat = Some(seat);
+                    eprintln!(
+                        "[waylandcraft][system_ime] bound wl_seat (name={})",
+                        name
+                    );
                 }
                 _ => {}
             }
@@ -111,6 +125,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for SystemImeData {
                 {
                     let ti = manager.get_text_input(seat, qh, ());
                     state.text_input = Some(ti);
+                    eprintln!(
+                        "[waylandcraft][system_ime] created text_input (seat name={})",
+                        name
+                    );
                 }
             }
         }
@@ -153,30 +171,49 @@ impl Dispatch<ZwpTextInputV3, ()> for SystemImeData {
         _qh: &QueueHandle<Self>,
     ) {
         match event {
-            zwp_text_input_v3::Event::Enter { .. } => {
+            zwp_text_input_v3::Event::Enter { surface } => {
                 state.entered = true;
                 // enter 后必须重新 enable（协议：enter 使 enable 状态失效）。
                 state.enabled = false;
+                let sid = surface.id();
+                eprintln!(
+                    "[waylandcraft][system_ime] ENTER: text-input focus -> surface id={sid:?} (entered=true)"
+                );
             }
             zwp_text_input_v3::Event::Leave { .. } => {
                 state.entered = false;
                 state.enabled = false;
+                eprintln!(
+                    "[waylandcraft][system_ime] LEAVE: text-input focus lost (entered=false)"
+                );
             }
             zwp_text_input_v3::Event::CommitString { text } => {
-                state.committed.push(text.unwrap_or_default());
+                let t = text.unwrap_or_default();
+                eprintln!(
+                    "[waylandcraft][system_ime] commit_string: {:?}",
+                    t
+                );
+                state.committed.push(t);
             }
             zwp_text_input_v3::Event::PreeditString {
                 text,
                 cursor_begin,
                 cursor_end,
             } => {
-                state.preedit =
-                    Some((text.unwrap_or_default(), cursor_begin, cursor_end));
+                let t = text.unwrap_or_default();
+                eprintln!(
+                    "[waylandcraft][system_ime] preedit_string: {:?} cursor=({cursor_begin},{cursor_end})",
+                    t
+                );
+                state.preedit = Some((t, cursor_begin, cursor_end));
             }
             zwp_text_input_v3::Event::DeleteSurroundingText {
                 before_length,
                 after_length,
             } => {
+                eprintln!(
+                    "[waylandcraft][system_ime] delete_surrounding: before={before_length} after={after_length}"
+                );
                 state.delete_surrounding =
                     Some((before_length, after_length));
             }
@@ -203,15 +240,36 @@ impl SystemIme {
     /// 合成器就会给本连接的 text_input 发 enter。
     /// 失败（桌面无 Wayland / 合成器无 text-input-v3）返回 None。
     pub fn new(wl_display_ptr: usize) -> Option<Self> {
+        eprintln!(
+            "[waylandcraft][system_ime] init: wl_display_ptr=0x{:x}",
+            wl_display_ptr
+        );
+
         let conn = if wl_display_ptr != 0 {
             // Minecraft Wayland 后端：复用 GLFW 已建立的连接。
+            eprintln!(
+                "[waylandcraft][system_ime] connection: reuse GLFW wl_display (guest mode)"
+            );
             let backend = unsafe {
                 Backend::from_foreign_display(wl_display_ptr as *mut _)
             };
             Connection::from_backend(backend)
         } else {
             // Minecraft X11/XWayland 后端：自己连系统 Wayland 桌面。
-            Connection::connect_to_env().ok()?
+            let env = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+            eprintln!(
+                "[waylandcraft][system_ime] connection: connect_to_env() (WAYLAND_DISPLAY={:?})",
+                env
+            );
+            match Connection::connect_to_env() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "[waylandcraft][system_ime] connect_to_env FAILED: {e}"
+                    );
+                    return None;
+                }
+            }
         };
 
         let mut queue = conn.new_event_queue::<SystemImeData>();
@@ -220,7 +278,19 @@ impl SystemIme {
         // 请求 registry，随后 roundtrip 收集 globals 并 bind manager/seat。
         conn.display().get_registry(&qh, ());
         let mut data = SystemImeData::default();
-        queue.roundtrip(&mut data).ok()?;
+        if let Err(e) = queue.roundtrip(&mut data) {
+            eprintln!(
+                "[waylandcraft][system_ime] registry roundtrip FAILED: {e}"
+            );
+            return None;
+        }
+
+        eprintln!(
+            "[waylandcraft][system_ime] globals done: manager={}, seat={}, text_input={}",
+            data.manager.is_some(),
+            data.seat.is_some(),
+            data.text_input.is_some(),
+        );
 
         if data.text_input.is_none() {
             eprintln!(
@@ -235,6 +305,12 @@ impl SystemIme {
 
     /// 游戏内应用是否有 active text-input（由 ime 状态驱动）。
     pub fn set_active(&mut self, active: bool) {
+        if self.data.want_enabled != active {
+            eprintln!(
+                "[waylandcraft][system_ime] set_active: {} -> {}",
+                self.data.want_enabled, active
+            );
+        }
         self.data.want_enabled = active;
     }
 
@@ -244,23 +320,51 @@ impl SystemIme {
             // 非阻塞读：无新数据时返回 WouldBlock，忽略即可。
             let _ = guard.read();
         }
-        let _ = self.queue.dispatch_pending(&mut self.data);
+        if let Err(e) = self.queue.dispatch_pending(&mut self.data) {
+            eprintln!(
+                "[waylandcraft][system_ime] dispatch_pending ERROR: {e}"
+            );
+        }
 
         // 状态机：只有合成器给了 enter（Minecraft 窗口有焦点）才 enable。
         if let Some(ti) = &self.data.text_input {
             if self.data.entered {
                 if self.data.want_enabled && !self.data.enabled {
+                    eprintln!(
+                        "[waylandcraft][system_ime] state: entered=true want_enabled=true enabled=false -> ENABLE+commit"
+                    );
                     ti.enable();
                     ti.commit();
                     self.data.enabled = true;
                 } else if !self.data.want_enabled && self.data.enabled {
+                    eprintln!(
+                        "[waylandcraft][system_ime] state: want_enabled=false enabled=true -> DISABLE+commit"
+                    );
                     ti.disable();
                     ti.commit();
                     self.data.enabled = false;
                 }
+            } else if self.data.want_enabled {
+                // 节流：最多每 5 秒打一次，避免每帧刷屏。
+                let now = std::time::Instant::now();
+                let due = self
+                    .data
+                    .last_blocked_log
+                    .map(|t| now.duration_since(t).as_secs() >= 5)
+                    .unwrap_or(true);
+                if due {
+                    eprintln!(
+                        "[waylandcraft][system_ime] BLOCKED: want_enabled=true but entered=false (compositor never sent ENTER)"
+                    );
+                    self.data.last_blocked_log = Some(now);
+                }
             }
         }
-        let _ = self.queue.flush();
+        if let Err(e) = self.queue.flush() {
+            eprintln!(
+                "[waylandcraft][system_ime] flush ERROR: {e}"
+            );
+        }
     }
 
     /// 取出系统输入法 commit 的文字（转发给游戏内应用）。

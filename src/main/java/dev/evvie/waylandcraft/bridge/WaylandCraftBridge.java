@@ -390,6 +390,7 @@ public class WaylandCraftBridge {
 		// Wayland 后端下拿到 wl_display 指针，供 native 做系统输入法穿透；
 		// X11/XWayland 后端返回 0，穿透自动禁用（graceful fallback）。
 		long waylandDisplay = GLFWNativeWayland.glfwGetWaylandDisplay();
+		WaylandCraftCommon.LOGGER.info("[waylandcraft][system_ime] Java side: eglDisplay=0x{} waylandDisplay=0x{} (0 == X11/XWayland backend)", Long.toHexString(eglDisplay), Long.toHexString(waylandDisplay));
 
 		long handle = init(GLFW.Functions.GetProcAddress, eglDisplay, waylandDisplay);
 		return new WaylandCraftBridge(handle);
