@@ -60,6 +60,9 @@ struct SystemImeData {
     delete_surrounding: Option<(u32, u32)>,
     /// 上次打印 BLOCKED 提示的时间（节流用，避免每帧刷屏）。
     last_blocked_log: Option<std::time::Instant>,
+    /// 上次销毁重建 text_input 的时间（KWin 只在焦点变化时发 enter，
+    /// 新建 text_input 后可能永远收不到；定期重建强制合成器重新评估焦点）。
+    last_recreate: Option<std::time::Instant>,
 }
 
 impl Default for SystemImeData {
@@ -75,6 +78,7 @@ impl Default for SystemImeData {
             preedit: None,
             delete_surrounding: None,
             last_blocked_log: None,
+            last_recreate: None,
         }
     }
 }
@@ -427,6 +431,39 @@ impl SystemIme {
                         "[waylandcraft][system_ime] BLOCKED: want_enabled=true but entered=false (compositor never sent ENTER)"
                     );
                     self.data.last_blocked_log = Some(now);
+                }
+
+                // KWin 只在键盘焦点变化时广播 enter；text_input 若在焦点稳定后
+                // 才创建，可能永远收不到 enter。定期销毁重建 text_input，
+                // 强制合成器重新评估并（若实现支持）补发当前焦点。
+                let recreate_due = self
+                    .data
+                    .last_recreate
+                    .map(|t| now.duration_since(t).as_secs() >= 15)
+                    .unwrap_or(true);
+                if recreate_due {
+                    self.data.last_recreate = Some(now);
+                    ime_log!(
+                        "[waylandcraft][system_ime][RECREATE] BLOCKED 超时 -> 重建 text_input 触发焦点重协商..."
+                    );
+                    let qh = self.queue.handle();
+                    self.data.text_input = None; // drop 旧 proxy（自动发 destroy）
+                    self.data.entered = false;
+                    self.data.enabled = false;
+                    if let (Some(mgr), Some(seat)) = (
+                        &self.data.manager,
+                        &self.data.seat,
+                    ) {
+                        let ti = mgr.get_text_input(seat, &qh, ());
+                        ime_log!(
+                            "[waylandcraft][system_ime][RECREATE] 新 text_input 已创建，等待 ENTER..."
+                        );
+                        self.data.text_input = Some(ti);
+                    } else {
+                        ime_log!(
+                            "[waylandcraft][system_ime][RECREATE][ERROR] manager/seat 缺失，无法重建"
+                        );
+                    }
                 }
             }
         }
