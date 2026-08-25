@@ -33,6 +33,9 @@ wayland-protocols = { version = "0.32", features = ["client"] }
 
 [dev-dependencies]
 wayland-client = "0.31"
+# 集成测试的“模拟 fcitx5”客户端需要 im2 的 client 绑定
+# （主依赖里该协议只经 smithay reexport 暴露 server 侧）。
+wayland-protocols-misc = { version = "0.3", features = ["client"] }
 
 [profile.release]
 opt-level = "z"      # optimize for size

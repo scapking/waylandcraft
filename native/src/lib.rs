@@ -69,7 +69,7 @@ pub(crate) struct WaylandCraft<'a> {
     pub bridge: BridgeState,
     pub egl: EGLHelper,
     pub xdg: XDGSpecHelper,
-    pub system_ime: Option<crate::system_ime::SystemIme>,
+    pub system_ime: Option<Box<crate::system_ime::SystemIme>>,
     /// 初始探测用的 wl_display 指针，供惰性重试时复用。
     pub wayland_display: usize,
     /// 穿透初始化失败后是否继续自动重试（Unsupported 后置 false）。
@@ -88,12 +88,13 @@ pub struct WLCState {
     pub viewporter_state: ViewporterState,
     pub single_pixel_buffer_state: SinglePixelBufferState,
     pub dmabuf_state: DmabufState,
-    pub dmabuf_global: DmabufGlobal,
     pub requests: WindowRequests,
     pub seat: WLCSeatState,
     pub ime: ImeState,
     pub data: WLCDataState,
     pub output: WLCOutput,
+    /// dmabuf 共享全局；无可用渲染节点时为 None（客户端自动回退 shm 路径）。
+    pub dmabuf_global: Option<DmabufGlobal>,
 }
 
 #[derive(Default)]
@@ -108,7 +109,9 @@ pub struct WindowRequests {
 }
 
 impl WLCState {
-    fn new(disp: DisplayHandle, egl: &EGLHelper) -> Self {
+    /// `egl` 传 None 用于无 GPU 环境（单元测试 / 软件渲染回退）：
+    /// 此时跳过 dmabuf 全局，客户端走 shm 缓冲。
+    fn new(disp: DisplayHandle, egl: Option<&EGLHelper>) -> Self {
         let compositor_state = CompositorState::new::<WLCState>(&disp);
         let shm_state = ShmState::new::<WLCState>(&disp, vec![]);
         let xdg_state = XdgShellState::new::<WLCState>(&disp);
@@ -117,7 +120,15 @@ impl WLCState {
             SinglePixelBufferState::new::<WLCState>(&disp);
 
         let mut dmabuf_state = DmabufState::new();
-        let dmabuf_global = init_dmabuf(&disp, &mut dmabuf_state, egl);
+        let dmabuf_global = match egl.and_then(|e| e.get_render_node().ok()) {
+            Some(node) => Some(init_dmabuf(&disp, &mut dmabuf_state, egl.unwrap(), &node)),
+            None => {
+                eprintln!(
+                    "[waylandcraft] no usable render node -> dmabuf sharing disabled (shm fallback)"
+                );
+                None
+            }
+        };
 
         let seat = WLCSeatState::new();
         seat.create_globals(&disp);
@@ -155,9 +166,8 @@ fn init_dmabuf(
     disp: &DisplayHandle,
     state: &mut DmabufState,
     egl: &EGLHelper,
+    render_node: &smithay::backend::drm::DrmNode,
 ) -> DmabufGlobal {
-    let render_node =
-        egl.get_render_node().expect("Failed to get render node!");
     let render_node_id = render_node.dev_id();
     let formats = egl.query_dmabuf_formats();
 
@@ -315,16 +325,18 @@ pub(crate) fn wlc_init(
     let display: Display<WLCState> = Display::new()?;
     let socket = ListeningSocketSource::new_auto()?;
 
-    let mut state = WLCState::new(display.handle(), &egl);
+    let mut state = WLCState::new(display.handle(), Some(&egl));
     state.socket = socket.socket_name().to_os_string();
 
-    // 系统桌面输入法穿透：复用 GLFW 的 wl_display（Wayland 后端下才可用），
-    // 或 X11/XWayland 后端自连 WAYLAND_DISPLAY。
-    // 暂时性失败（连接问题）会在 update() 里自动重试，不永久跳过。
+    // 系统桌面输入法穿透：复用 GLFW 的 wl_display（Wayland 后端下才可用）。
+    // 非 Wayland 后端为结构性不支持（enter 需要 surface 关联），不再重试；
+    // 暂时性失败（连接问题）会在 update() 里自动重试。
     let mut ime_retry = false;
-    let system_ime = match crate::system_ime::SystemIme::new(wayland_display) {
+    let mut ime_ready = false;
+    let system_ime = match crate::system_ime::SystemIme::connect(wayland_display) {
         crate::system_ime::ImeInit::Ready(si) => {
             eprintln!("[waylandcraft][system_ime] passthrough ENABLED");
+            ime_ready = true;
             Some(si)
         }
         crate::system_ime::ImeInit::Transient(msg) => {
@@ -379,6 +391,9 @@ pub(crate) fn wlc_init(
 
     let xdg = XDGSpecHelper::init();
 
+    // 初始穿透就绪状态同步给 Relay（端点选择）。
+    state.ime.note_passthrough_ready(ime_ready);
+
     let instance = WaylandCraft {
         state,
         event_loop,
@@ -396,10 +411,9 @@ pub(crate) fn wlc_init(
 impl<'a> WaylandCraft<'a> {
     pub fn update(&mut self) {
         // ── 系统桌面输入法穿透桥接 ──
-        // 1. 游戏内 text-input 焦点 → 系统 text-input enable/disable
-        // 2. 系统输入法 commit/preedit/delete → 游戏内 active text-input
-        // 3. 穿透未就绪时惰性重试（每 5 秒一次，TRANSIENT 才重试），
-        //    避免启动时 WAYLAND_DISPLAY 未就绪就永久跳过。
+        // 1. 游戏内会话状态 → 宿主 text-input enable/disable（命令出站）
+        // 2. 宿主输入法事件（保序）→ 游戏内 active text-input（入站应用）
+        // 3. 连接失效时惰性重试（每 5 秒一次，仅限暂时性故障）。
         if self.system_ime.is_none() && self.ime_retry {
             let now = std::time::Instant::now();
             let due = self
@@ -408,12 +422,13 @@ impl<'a> WaylandCraft<'a> {
                 .unwrap_or(true);
             if due {
                 self.last_ime_retry = Some(now);
-                eprintln!(
-                    "[waylandcraft][system_ime][RETRY] 重新初始化..."
-                );
-                match crate::system_ime::SystemIme::new(self.wayland_display)
+                eprintln!("[waylandcraft][system_ime][RETRY] 重新初始化...");
+                match crate::system_ime::SystemIme::connect(self.wayland_display)
                 {
                     crate::system_ime::ImeInit::Ready(si) => {
+                        // 穿透端点就绪；若游戏内已有激活会话，Relay 会补发 Activate。
+                        let ready = true;
+                        self.state.ime.note_passthrough_ready(ready);
                         self.system_ime = Some(si);
                         eprintln!(
                             "[waylandcraft][system_ime][RETRY] OK -> passthrough ENABLED"
@@ -434,22 +449,32 @@ impl<'a> WaylandCraft<'a> {
             }
         }
         if let Some(si) = &mut self.system_ime {
-            let active = self.state.ime.text_input_active();
-            si.set_active(active);
+            // 游戏内会话状态 → 宿主 enable 门控
+            let app_active = self.state.ime.app_active();
+            si.set_active(app_active);
+
+            // Relay 出站命令 → 穿透客户端（缓存 + 调和发送）
+            let cmds = self.state.ime.take_passthrough_outbox();
+            si.execute_commands(cmds);
+
+            // 每帧驱动：收宿主事件 + 调和 enable/状态推送
             si.poll();
 
-            let committed = si.take_committed();
-            let preedit = si.take_preedit();
-            let delete = si.take_delete();
+            // 宿主事件（保序）→ Relay 原子应用 → 游戏内 text-input
+            let events = si.take_events();
+            if !events.is_empty() {
+                self.state.ime.passthrough_events(events);
+            }
 
-            for text in committed {
-                self.state.ime.deliver_commit_string(&text);
-            }
-            if let Some((text, b, e)) = preedit {
-                self.state.ime.deliver_preedit_string(&text, b, e);
-            }
-            if let Some((b, a)) = delete {
-                self.state.ime.deliver_delete_surrounding(b, a);
+            // 连接失效：丢弃实例，允许惰性重试重建。
+            if si.is_dead() {
+                eprintln!(
+                    "[waylandcraft][system_ime] 连接失效 -> 将按 TRANSIENT 重试"
+                );
+                self.state.ime.note_passthrough_ready(false);
+                self.system_ime = None;
+                self.ime_retry = true;
+                self.last_ime_retry = Some(std::time::Instant::now());
             }
         }
 

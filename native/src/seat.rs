@@ -483,7 +483,7 @@ impl WLCSeatState {
         }
     }
 
-    fn serialize_pressed_keys(&self) -> Vec<u8> {
+    pub fn serialize_pressed_keys(&self) -> Vec<u8> {
         let mut pressed: Vec<u32> = vec![];
         if self.kb_active {
             pressed = self.pressed_keys.iter().copied().collect();

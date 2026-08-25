@@ -364,6 +364,11 @@ bind_java_type! {
             name = "setImeLogFileNative",
             fn = set_ime_log_file,
         },
+        static extern fn notify_host_focus_gained {
+            sig = (instance: jlong),
+            name = "notifyHostFocusGainedNative",
+            fn = notify_host_focus_gained,
+        },
         static extern fn audio_capture_status {
             sig = (instance: jlong) -> JString,
             name = "audioCaptureStatusNative",
@@ -1595,6 +1600,23 @@ fn set_ime_log_file<'local>(
             Ok(())
         }
     }
+}
+
+/// notifyHostFocusGained(instance) —— Minecraft 窗口重新获得 OS 键盘焦点。
+///
+/// 供输入法穿透的事件驱动焦点重协商使用：若穿透 text_input 因创建晚于
+/// 宿主焦点分配而收不到 enter（KWin 已知行为），在此一次性重建触发
+/// 宿主重新评估。纯事件驱动，无定时器。
+fn notify_host_focus_gained<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "notifyHostFocusGained")?;
+    if let Some(si) = instance.system_ime.as_mut() {
+        si.notify_host_focus_gained();
+    }
+    Ok(())
 }
 
 /// audioCaptureStatus() —— 返回当前音频捕获链路状态（JSON），供 Java /wl audio status 查询。

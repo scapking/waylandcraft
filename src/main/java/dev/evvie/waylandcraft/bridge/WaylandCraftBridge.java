@@ -920,9 +920,18 @@ public class WaylandCraftBridge {
 	}
 	
 	/** 静态版：必须在 WaylandCraftBridge.start()（native 初始化）之前调用，
-	 * 这样 SystemIme::new 的 BUILD/PHASE 初始化日志也能写入日志文件。 */
+	 * 这样 SystemIme 的 BUILD/PHASE 初始化日志也能写入日志文件。 */
 	public static void setImeLogFileStatic(String path) {
 		setImeLogFileNative(path);
+	}
+
+	/** Minecraft 窗口重新获得 OS 键盘焦点时调用（GLFW focus 回调驱动）。
+	 * 输入法穿透层据此做一次性事件驱动的焦点重协商：
+	 * 若穿透 text_input 因创建晚于宿主焦点分配而收不到 enter
+	 * （KWin 已知行为），在此重建 text_input 触发宿主重新评估。
+	 * 替代已删除的 15 秒定时轮询。 */
+	public void notifyHostFocusGained() {
+		notifyHostFocusGainedNative(instance);
 	}
 	
 	/** 查询 Rust 侧音频捕获链路状态（JSON 字符串），供 /wl audio status 展示。 */
@@ -1150,6 +1159,7 @@ public class WaylandCraftBridge {
 	
 	// Set Rust-side [system_ime] log file path (eprintln also written to this file)
 	private static native void setImeLogFileNative(String path);
+	private static native void notifyHostFocusGainedNative(long instance);
 	
 	// Query Rust-side audio capture pipeline status (JSON string)
 	private static native String audioCaptureStatusNative(long instance);
