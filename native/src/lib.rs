@@ -46,7 +46,6 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
-mod audio;
 mod bridge;
 mod ddm;
 mod desktop_windows;
