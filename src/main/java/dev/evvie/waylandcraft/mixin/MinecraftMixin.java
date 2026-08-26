@@ -39,20 +39,9 @@ public class MinecraftMixin {
 		}
 	}
 
-	/**
-	 * 窗口焦点变化 → 通知输入法穿透层做事件驱动的焦点重协商。
-	 *
-	 * 背景：KWin 等合成器只在键盘焦点「变化」时向 text_input 广播 enter，
-	 * 晚于焦点分配创建的 text_input 可能永远收不到 enter（IME 穿透 BLOCKED）。
-	 * 旧实现用 15 秒定时轮询重建 —— 已删除。现在改为在窗口重新获得焦点的
-	 * 事件里一次性重建 text_input，触发宿主合成器重新评估焦点路由。
-	 * windowFocusChanged(boolean) 是 Minecraft.windowFocusChanged 的稳定签名。
-	 */
-	@Inject(method = "windowFocusChanged", at = @At("TAIL"))
-	public void onWindowFocusChanged(boolean focused, CallbackInfo info) {
-		if(focused && WaylandCraft.instance.bridge != null) {
-			WaylandCraft.instance.bridge.notifyHostFocusGained();
-		}
-	}
-	
+	// 窗口焦点注入已迁移到 WindowMixin：26.x 起 GLFW 焦点回调由
+	// com.mojang.blaze3d.platform.Window#onFocus(JZ) 直接承载，
+	// Minecraft.windowFocusChanged(Z)（Yarn）/setWindowActive(Z)（Mojmap）
+	// 在 26.1.2 中已不存在，继续在此注入会导致启动崩溃。
+
 }
