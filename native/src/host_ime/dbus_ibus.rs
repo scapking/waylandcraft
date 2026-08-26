@@ -58,7 +58,8 @@ macro_rules! ime_log {
 
 const IBUS_SERVICE: &str = "org.freedesktop.IBus";
 const IBUS_FACTORY_PATH: &str = "/org/freedesktop/IBus";
-const IBUS_FACTORY_IFACE: &str = "org.freedesktop.IBus";
+/// 工厂接口：CreateInputContext 挂在该接口上（不是裸的 org.freedesktop.IBus）。
+const IBUS_FACTORY_IFACE: &str = "org.freedesktop.IBus.Factory";
 const IBUS_IC_IFACE: &str = "org.freedesktop.IBus.InputContext";
 
 /// IBUS_CAP_*：PREEDIT_TEXT | AUXILIARY_TEXT | LOOKUP_TABLE | PROPERTY |
@@ -134,6 +135,9 @@ pub struct DbusIbusBackend {
 
 impl DbusIbusBackend {
     /// 快速探测 + 启动工作线程组。
+    /// 完整初始化（探测 + 真实建 IC）都在调用线程同步完成并分类：
+    /// 协议性失败当场 Unsupported（不进入 5 秒重试循环刷屏），
+    /// 环境/超时类失败 Transient。成功后把已建连接移交给命令线程。
     pub fn connect() -> ImeInit {
         ime_log!("[waylandcraft][host_ime][dbus-ibus] probing...");
         match probe_service_owner(IBUS_SERVICE) {
@@ -148,27 +152,51 @@ impl DbusIbusBackend {
             }
         }
 
+        // 真建一次 InputContext：这一步会暴露接口/版本级不兼容。
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        spawn_thread("wc-ibus-init", move || {
+            let _ = done_tx.send(connect_input_context());
+        });
+        let ic_conns = match done_rx.recv_timeout(Duration::from_secs(6)) {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
+                let cls = classify_init_error(&e);
+                ime_log!(
+                    "[waylandcraft][host_ime][dbus-ibus] init failed ({cls}): {e}"
+                );
+                return match cls {
+                    "UNSUPPORTED" => ImeInit::Unsupported(format!("dbus-ibus: {e}")),
+                    _ => ImeInit::Transient(format!("dbus-ibus: {e}")),
+                };
+            }
+            Err(_) => {
+                let msg = "init timeout(6s)".to_string();
+                ime_log!("[waylandcraft][host_ime][dbus-ibus] TRANSIENT: {msg}");
+                return ImeInit::Transient(format!("dbus-ibus: {msg}"));
+            }
+        };
+
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<ToWorker>();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<FromWorker>();
 
-        // 命令线程：初始化连接 → 就绪通知 → 串行处理 Focus/Cursor/Key。
+        // 命令线程：连接已就绪，直接串行处理 Focus/Cursor/Key + 信号订阅。
         spawn_thread("wc-ibus-cmd", {
             let ev_tx = ev_tx.clone();
             move || {
-                if let Err(e) = command_loop(cmd_rx, ev_tx.clone()) {
+                if let Err(e) = command_loop(ic_conns, cmd_rx, ev_tx.clone()) {
                     let _ = ev_tx.send(FromWorker::Fatal(e));
                 }
             }
         });
 
-        ime_log!("[waylandcraft][host_ime][dbus-ibus] worker started");
+        ime_log!("[waylandcraft][host_ime][dbus-ibus] input context READY (pre-connected)");
         ImeInit::Ready(Box::new(Self {
             cmd_tx,
             ev_rx,
             events: Vec::new(),
             pending: VecDeque::new(),
             forwards: Vec::new(),
-            ready: false,
+            ready: true,
             dead: None,
             want_enabled: false,
             focused: false,
@@ -278,27 +306,26 @@ fn connect_input_context() -> Result<IcConnections, String> {
     Ok(IcConnections { _conn: conn, ic })
 }
 
+/// 初始化错误分类：协议/接口级不兼容是确定性的 → UNSUPPORTED；
+/// 总线/超时类 → TRANSIENT（允许重试）。
+pub(crate) fn classify_init_error(e: &str) -> &'static str {
+    if e.contains("UnknownMethod")
+        || e.contains("UnknownObject")
+        || e.contains("InterfaceNotFound")
+        || e.contains("ServiceUnknown")
+        || e.contains("NameHasNoOwner")
+    {
+        "UNSUPPORTED"
+    } else {
+        "TRANSIENT"
+    }
+}
+
 fn command_loop(
+    ic_conns: IcConnections,
     cmd_rx: Receiver<ToWorker>,
     ev_tx: Sender<FromWorker>,
 ) -> Result<(), String> {
-    // 初始化限时：ibus 卡死时按 TRANSIENT 报告而非永久挂起。
-    let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let setup_handle = std::thread::Builder::new()
-        .name("wc-ibus-init".into())
-        .spawn(move || done_tx.send(connect_input_context()))
-        .map_err(|e| format!("init thread: {e}"))?;
-    let ic_conns = match done_rx.recv_timeout(Duration::from_secs(6)) {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => return Err(format!("init failed: {e}")),
-        Err(_) => {
-            setup_handle.join().ok();
-            return Err("init timeout(6s)".into());
-        }
-    };
-
-    let _ = ev_tx.send(FromWorker::Ready);
-    ime_log!("[waylandcraft][host_ime][dbus-ibus] input context READY");
 
     // 每个信号一个迭代线程（见模块文档：线程模型）。
     for sig in WATCHED_SIGNALS {
