@@ -228,9 +228,63 @@ Java 侧：`./gradlew build`（需 JDK 25）；mixin 注入 windowFocusChanged
    上报完整维护，但 popup 像素合成进游戏视图需要 ddm 渲染管线支持，
    为独立特性。穿透模式下候选窗显示在**宿主桌面**上（光标矩形已反向
    同步给宿主，定位正确），不受此限制影响。
-2. **X11/XWayland 后端不支持宿主穿透**：结构性限制——自建连接没有
-   wl_surface，宿主的 enter 需要 client/surface 关联。启动时检测并给出
-   明确诊断（建议原生 Wayland 会话）。这不是可修复的 bug，是能力边界。
+2. **X11/XWayland 后端的 wayland-ti3 路径不支持宿主穿透**：结构性限制——
+   自建连接没有 wl_surface，宿主的 enter 需要 client/surface 关联。
+   v0.9.29 起该场景由 **dbus-ibus 后端**覆盖（见 §10），不再依赖游戏窗口系统；
+   仅当宿主既非原生 Wayland 又无 ibus 时才落入 Unsupported 诊断。
 3. **游戏内 IBus（端点 A）不可用**：ibus 引擎客户端仅实现了 im-v1；
    现代栈下请用 fcitx5 直连游戏合成器，或直接使用穿透路径（推荐，
    无需在游戏内运行任何输入法进程）。
+
+## 10. 宿主后端矩阵（v0.9.29 起）
+
+「把桌面输入法接进嵌套合成器」在不同窗口系统下有不同标准协议栈。
+没有任何单一协议能通吃 —— 正确形态是**统一中继内核 + 可插拔宿主后端**：
+所有后端产出同一套 `HostEvent`（Enter/Leave/Commit/Preedit/Delete/Done）、
+消费同一套 `ImeCommand`，Relay 与游戏内 ti3/im2 wire 层完全不感知差异。
+
+| 后端 | 协议 | 适用环境 | 键盘路由 | 状态 |
+|---|---|---|---|---|
+| `wayland-ti3` | zwp_text_input_v3 客户端 | 游戏本体跑原生 Wayland | 宿主合成器自行处理（不接管） | ✅ |
+| `dbus-ibus` | org.freedesktop.IBus DBus API | 与窗口系统无关，ibus 在跑即可（GNOME 默认） | ProcessKeyEvent 往返，接管+异步裁决 | ✅ |
+| `dbus-fcitx5` | fcitx5 DBus 前端 | fcitx5 用户 | 同上（复用机制） | 规划中 |
+| `x11-xim` | XIM / GLFW 内置 XIC commit | 传统 X11 会话 | 待定 | 规划中 |
+
+### 探测顺序
+
+```text
+wayland-ti3（需要 GLFW wl_display ≠ 0 且宿主暴露 text_input_manager_v3）
+  └─ 不可用 → dbus-ibus（session bus 存在且 org.freedesktop.IBus 有主）
+       └─ 不可用 → dbus-fcitx5 → x11-xim → Unsupported（附完整探测报告）
+```
+
+每一步的失败原因都写入 `waylandcraft-ime.log`；全部失败时汇总成一份
+探测报告，「为什么没有输入法」永远有答案。
+
+### dbus-ibus 的按键路由（零阻塞）
+
+需要原始按键的后端在 `bridge.keyboard_input` 里通过
+`HostImBackend::submit_key` 接管按键：调用方**立即吞下**，后端内部完成
+ProcessKeyEvent 异步往返后在下一帧 `poll` 里裁决 —— 消费则丢弃，
+放行则按提交顺序补投递给焦点应用。渲染线程零阻塞、零竞态，
+代价是按键最多晚一帧（≤16ms）到达应用。
+
+### dbus-ibus 能力协商与信号
+
+- Capabilities = PREEDIT | AUXILIARY | LOOKUP_TABLE | PROPERTY | FOCUS |
+  SURROUNDING_TEXT (0x3F)。
+- 信号映射：CommitText→Commit、UpdatePreedit*→Preedit、
+  DeleteSurroundingText→Delete、HidePreeditText→空 Preedit、
+  ForwardKeyEvent→注入应用。每条信号后立即补 Done，保证 Relay 原子应用。
+- 信号体解析为容错式（定位变体/结构体内的文本与游标字段），不硬编码
+  IBus 内部序列化细节；无法识别的形态记日志并安全丢弃。
+- 候选窗由宿主输入法框架绘制（gnome-shell 的 IBus 面板），光标位置经
+  SetCursorLocationRelative 反向同步。
+
+### 已知边界
+
+- dbus-ibus 后端要求宿主运行 IBus（GNOME 默认；KDE 需用户改用 ibus 或
+  等 dbus-fcitx5 后端）。
+- ibus 进程僵死时其回复不会到达，被接管的按键将不再投递（如实失败，
+  不猜测语义）；连接失效会进入 TRANSIENT 重试链路。
+

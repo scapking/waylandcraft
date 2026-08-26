@@ -1475,12 +1475,43 @@ fn keyboard_input<'local>(
     let action = KeyboardAction::from_i32(action)
         .ok_or(BridgeError::UnknownKeyboardState(action))?;
 
-    // 输入法已 grab 键盘 → 按键先发给 IME；IME 未 grab 时才走普通键盘路径。
+    // 输入法已 grab 键盘（游戏内 im2）→ 按键先发给 IME。
     let mods = instance.state.seat.modifiers_tuple();
-    let handled = instance
+    let mut handled = instance
         .state
         .ime
         .handle_key(scancode as u32, action, mods);
+
+    // 穿透端点的 dbus 类后端需要原始按键做 ProcessKeyEvent 往返：
+    // 接管该键（调用方不再立即投递），由后端在 poll 中裁决放行/丢弃。
+    if !handled && instance.state.ime.passthrough_wants_keys() {
+        if let Some(be) = instance.system_ime.as_mut() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static KEY_SEQ: AtomicU64 = AtomicU64::new(1);
+            let key_u = scancode as u32;
+            // xkb keycode -> keysym：按当前修饰态/layout 解析（ibus keyval 语义）。
+            let keysym = instance
+                .state
+                .seat
+                .xkb_state
+                .key_get_one_sym(xkbcommon::xkb::Keycode::new(key_u))
+                .raw();
+            handled = be.submit_key(crate::host_ime::SubmittedKey {
+                seq: KEY_SEQ.fetch_add(1, Ordering::Relaxed),
+                key: key_u,
+                keysym,
+                evdev: key_u.saturating_sub(8),
+                state: if action == KeyboardAction::Release {
+                    crate::host_ime::IBUS_RELEASE_MASK
+                } else {
+                    0
+                },
+                action,
+                mods,
+            });
+        }
+    }
+
     if !handled {
         instance.state.seat.keyboard_key(scancode as u32, action);
     }

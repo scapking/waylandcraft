@@ -46,12 +46,14 @@ use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
 
+mod audio;
 mod bridge;
 mod ddm;
 mod desktop_windows;
 mod portal_capture;
 mod audio_capture;
 mod egl;
+mod host_ime;
 mod ime;
 mod java_types;
 mod output;
@@ -69,7 +71,7 @@ pub(crate) struct WaylandCraft<'a> {
     pub bridge: BridgeState,
     pub egl: EGLHelper,
     pub xdg: XDGSpecHelper,
-    pub system_ime: Option<Box<crate::system_ime::SystemIme>>,
+    pub system_ime: Option<Box<dyn crate::host_ime::HostImBackend>>,
     /// 初始探测用的 wl_display 指针，供惰性重试时复用。
     pub wayland_display: usize,
     /// 穿透初始化失败后是否继续自动重试（Unsupported 后置 false）。
@@ -328,14 +330,17 @@ pub(crate) fn wlc_init(
     let mut state = WLCState::new(display.handle(), Some(&egl));
     state.socket = socket.socket_name().to_os_string();
 
-    // 系统桌面输入法穿透：复用 GLFW 的 wl_display（Wayland 后端下才可用）。
-    // 非 Wayland 后端为结构性不支持（enter 需要 surface 关联），不再重试；
-    // 暂时性失败（连接问题）会在 update() 里自动重试。
+    // 系统桌面输入法穿透：按探测顺序选择宿主后端
+    // （wayland-ti3 → dbus-ibus → …）。全部不可用为结构性不支持（不再重试）；
+    // 暂时性失败（连接/总线问题）会在 update() 里自动重试。
     let mut ime_retry = false;
     let mut ime_ready = false;
-    let system_ime = match crate::system_ime::SystemIme::connect(wayland_display) {
+    let system_ime = match crate::host_ime::probe(wayland_display) {
         crate::system_ime::ImeInit::Ready(si) => {
-            eprintln!("[waylandcraft][system_ime] passthrough ENABLED");
+            eprintln!(
+                "[waylandcraft][host_ime] passthrough ENABLED ({})",
+                si.name()
+            );
             ime_ready = true;
             Some(si)
         }
@@ -422,17 +427,17 @@ impl<'a> WaylandCraft<'a> {
                 .unwrap_or(true);
             if due {
                 self.last_ime_retry = Some(now);
-                eprintln!("[waylandcraft][system_ime][RETRY] 重新初始化...");
-                match crate::system_ime::SystemIme::connect(self.wayland_display)
+                eprintln!("[waylandcraft][host_ime][RETRY] 重新探测...");
+                match crate::host_ime::probe(self.wayland_display)
                 {
                     crate::system_ime::ImeInit::Ready(si) => {
-                        // 穿透端点就绪；若游戏内已有激活会话，Relay 会补发 Activate。
-                        let ready = true;
-                        self.state.ime.note_passthrough_ready(ready);
-                        self.system_ime = Some(si);
                         eprintln!(
-                            "[waylandcraft][system_ime][RETRY] OK -> passthrough ENABLED"
+                            "[waylandcraft][host_ime][RETRY] OK -> passthrough ENABLED ({})",
+                            si.name()
                         );
+                        // 穿透端点就绪；若游戏内已有激活会话，Relay 会补发 Activate。
+                        self.state.ime.note_passthrough_ready(true);
+                        self.system_ime = Some(si);
                     }
                     crate::system_ime::ImeInit::Transient(msg) => {
                         eprintln!(
@@ -449,6 +454,10 @@ impl<'a> WaylandCraft<'a> {
             }
         }
         if let Some(si) = &mut self.system_ime {
+            // dbus 类后端异步就绪：每帧刷新端点可用性（幂等）。
+            let ready = si.is_ready();
+            self.state.ime.note_passthrough_ready(ready);
+
             // 游戏内会话状态 → 宿主 enable 门控
             let app_active = self.state.ime.app_active();
             si.set_active(app_active);
@@ -457,8 +466,14 @@ impl<'a> WaylandCraft<'a> {
             let cmds = self.state.ime.take_passthrough_outbox();
             si.execute_commands(cmds);
 
-            // 每帧驱动：收宿主事件 + 调和 enable/状态推送
+            // 每帧驱动：收宿主事件 + 调和 enable/状态推送 + 按键裁决
             si.poll();
+
+            // 后端裁决放行的按键：按提交顺序补投递给焦点应用
+            // （dbus 类后端的 ProcessKeyEvent 异步往返结果，见 host_ime 模块文档）。
+            for k in si.take_forwarded_keys() {
+                self.state.seat.keyboard_key(k.key, k.action);
+            }
 
             // 宿主事件（保序）→ Relay 原子应用 → 游戏内 text-input
             let events = si.take_events();

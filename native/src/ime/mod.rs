@@ -323,6 +323,13 @@ impl ImeState {
         self.relay.app_active()
     }
 
+    /// 穿透端点是否需要接管原始按键（dbus 类宿主后端的 ProcessKeyEvent 路由）。
+    /// 条件：当前端点为穿透 && 游戏内有激活文本会话。
+    /// 后端自身是否就绪由驱动层结合 `system_ime` 实例状态判断（见 bridge.keyboard_input）。
+    pub fn passthrough_wants_keys(&self) -> bool {
+        self.endpoint == Endpoint::Passthrough && self.relay.app_active()
+    }
+
     // ── 键盘路由（bridge.rs keyboard_input 调用）──────────────
 
     /// 输入法是否抓走了键盘（抓走期间原始按键只发给 IME）。

@@ -42,6 +42,7 @@ use wayland_protocols::wp::text_input::zv3::client::{
     zwp_text_input_v3::{self as ti3c, ZwpTextInputV3},
 };
 
+use crate::host_ime::HostImBackend;
 use crate::ime::{AppState, ImeCommand};
 
 /// [system_ime] 日志宏：同时写 stderr 和 IME_LOG_FILE
@@ -68,12 +69,13 @@ pub enum HostEvent {
 }
 
 /// 初始化结果：区分「可重试的环境问题」和「结构性不支持」。
+/// 就绪载荷为后端抽象（probe 链的产物），不再绑定具体实现。
 pub enum ImeInit {
-    /// 初始化成功（Box 化：变体尺寸差异大，避免 enum 膨胀）。
-    Ready(Box<SystemIme>),
+    /// 初始化成功。
+    Ready(Box<dyn HostImBackend>),
     /// 暂时性失败（WAYLAND_DISPLAY 缺失/连接失败等），稍后可自动重试。
     Transient(String),
-    /// 结构性不支持（非原生 Wayland / 宿主无 text-input-v3），重试无意义。
+    /// 结构性不支持（所有后端均不可用），重试无意义。
     Unsupported(String),
 }
 
@@ -494,5 +496,44 @@ impl SystemIme {
     #[allow(dead_code)]
     fn _keep_conn_alive(&self) -> &Connection {
         &self.conn
+    }
+}
+
+// ── HostImBackend 适配 ────────────────────────────────────────────
+// wayland-ti3 后端 = 现有 SystemIme 的薄封装。语义完全一致：
+// - 不接管原始按键（宿主合成器自己处理键盘→IME 路由，我们只收文本结果）；
+// - is_ready() 恒 true（connect() 成功即就绪，无异步初始化阶段）。
+
+impl HostImBackend for SystemIme {
+    fn name(&self) -> &'static str {
+        "wayland-ti3"
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn set_active(&mut self, active: bool) {
+        Self::set_active(self, active);
+    }
+
+    fn execute_commands(&mut self, commands: Vec<ImeCommand>) {
+        Self::execute_commands(self, commands);
+    }
+
+    fn notify_host_focus_gained(&mut self) {
+        Self::notify_host_focus_gained(self);
+    }
+
+    fn poll(&mut self) {
+        Self::poll(self);
+    }
+
+    fn take_events(&mut self) -> Vec<HostEvent> {
+        Self::take_events(self)
+    }
+
+    fn is_dead(&self) -> bool {
+        Self::is_dead(self)
     }
 }
