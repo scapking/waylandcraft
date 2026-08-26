@@ -414,21 +414,58 @@ type StaticFields = Vec<zbus::zvariant::Value<'static>>;
 
 pub(crate) fn body_fields(msg: &zbus::message::Message) -> Result<StaticFields, String> {
     let body = msg.body();
-    // 单参数与多参数两种形态统一成字段列表（全部转为 'static 值）。
+    let to_owned = |f: &zbus::zvariant::Value| -> Option<zbus::zvariant::Value<'static>> {
+        zbus::zvariant::OwnedValue::try_from(f)
+            .ok()
+            .map(zbus::zvariant::Value::from)
+    };
+    // 单参数：整个消息体就是一个值。
     if let Ok(v) = body.deserialize::<zbus::zvariant::OwnedValue>() {
         return Ok(vec![zbus::zvariant::Value::from(v)]);
     }
-    if let Ok(fields) = body.deserialize::<Vec<zbus::zvariant::OwnedValue>>() {
-        return Ok(fields.into_iter().map(zbus::zvariant::Value::from).collect());
+    // 多参数：DBus 把参数列表编码为结构体 —— 必须按 Structure 解，
+    // 不能用 Vec（元组签名不是序列）。（v0.9.31 在此丢失全部 preedit）
+    if let Ok(st) = body.deserialize::<zbus::zvariant::Structure>() {
+        let fields: Option<Vec<_>> = st.fields().iter().map(to_owned).collect();
+        if let Some(fields) = fields {
+            return Ok(fields);
+        }
     }
-    Err("无法反序列化消息体".into())
+    Err(format!(
+        "无法反序列化消息体（sig={:?}）",
+        body.signature()
+    ))
 }
 
 /// 在字段（或变体内层结构体字段）里找第一个字符串 —— IBusText 的文本位。
+/// ibus_serializable_serialize_object 会先写 GObject 类型名再写正文字段；
+/// 这些名字永远不可能是用户文本（v0.9.31 曾把 "IBusText" 当正文提交）。
+fn is_gobject_typename(s: &str) -> bool {
+    matches!(
+        s,
+        "IBusText"
+            | "IBusLookupTable"
+            | "IBusAttrList"
+            | "IBusEngineDesc"
+            | "IBusComponent"
+            | "IBusConfig"
+            | "IBusObject"
+            | "IBusSerializable"
+            | "IBusInputContext"
+            | "IBusObservedPath"
+            | "IBusRegistryEntry"
+    )
+}
+
 pub(crate) fn find_text(values: &[zbus::zvariant::Value<'static>]) -> Option<String> {
     for v in values {
         match v {
-            zbus::zvariant::Value::Str(s) => return Some(s.as_str().to_string()),
+            zbus::zvariant::Value::Str(s) => {
+                let t = s.as_str();
+                if !t.is_empty() && !is_gobject_typename(t) {
+                    return Some(t.to_string());
+                }
+            }
             zbus::zvariant::Value::Value(inner) => {
                 if let Some(t) = find_text(std::slice::from_ref(inner.as_ref())) {
                     return Some(t);
@@ -632,6 +669,9 @@ impl HostImBackend for DbusIbusBackend {
                         Some(p) if p.seq == seq => {
                             let p = self.pending.pop_front().expect("front checked");
                             if !consumed {
+                                ime_log!(
+                                    "[waylandcraft][host_ime][dbus-ibus] key seq={seq} NOT consumed -> 放行注入（app 会收到该键）"
+                                );
                                 self.forwards.push(ForwardedKey {
                                     key: p.key,
                                     action: p.action,
@@ -699,6 +739,9 @@ impl HostImBackend for DbusIbusBackend {
         }
         self.last_cursor = Some(rect);
         let (x, y, w, h) = rect;
+        ime_log!(
+            "[waylandcraft][host_ime][dbus-ibus] SetCursorLocationRelative ({x},{y},{w},{h})"
+        );
         let _ = self.cmd_tx.send(ToWorker::SetCursorRect(x, y, w, h));
     }
 
