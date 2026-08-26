@@ -233,7 +233,12 @@ impl ImeState {
         if commands.is_empty() {
             return;
         }
-        let Some(active_id) = self.ti3.active_id() else { return };
+        let Some(active_id) = self.ti3.active_id() else {
+            crate::bridge::ime_log_write(
+                "[waylandcraft][ime] ti3 batch DROPPED：无 active text_input 实例（App 未 enable 或未聚焦）",
+            );
+            return;
+        };
         let Some(inst) = self.ti3.instance_mut(&active_id) else { return };
         for cmd in commands {
             match cmd {
@@ -306,7 +311,15 @@ impl ImeState {
                     // （即我们）完成，这里无条件应用缓冲。
                     let fr = self.relay.ime_flush();
                     if fr.applied {
+                        crate::bridge::ime_log_write(&format!(
+                            "[waylandcraft][ime] passthrough flush applied -> ti3 batch ({} cmds)",
+                            fr.commands.len()
+                        ));
                         self.emit_ti_batch(fr.commands);
+                    } else {
+                        crate::bridge::ime_log_write(
+                            "[waylandcraft][ime] passthrough flush NOT applied（无激活会话或 serial 不符）",
+                        );
                     }
                 }
             }

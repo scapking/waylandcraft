@@ -56,10 +56,19 @@ macro_rules! ime_log {
     };
 }
 
-const IBUS_SERVICE: &str = "org.freedesktop.IBus";
+// ── 入口选择：session bus 上的 ibus portal ──
+// ibus 客户端(GTK/Qt)默认连 ibus 私有总线地址(IBUS_ADDRESS 文件)，session bus
+// 上同名服务并不实现 IBus 接口 —— 这正是 v0.9.29/30 UnknownMethod 的根因。
+// 而 ibus-portal 守护进程在 session bus 上以 org.freedesktop.portal.IBus 名字
+// 转发同一套 API(flatpak 应用即走此路径)。Ubuntu/GNOME 默认随 ibus 启动。
+// 常量对齐上游 src/ibusshare.h：
+//   IBUS_SERVICE_PORTAL="org.freedesktop.portal.IBus"
+//   IBUS_PATH_IBUS="/org/freedesktop/IBus"
+//   IBUS_INTERFACE_PORTAL="org.freedesktop.IBus.Portal"
+//   IC 对象仍用标准 org.freedesktop.IBus.InputContext。
+const IBUS_SERVICE: &str = "org.freedesktop.portal.IBus";
 const IBUS_FACTORY_PATH: &str = "/org/freedesktop/IBus";
-/// 工厂接口：CreateInputContext 挂在该接口上（不是裸的 org.freedesktop.IBus）。
-const IBUS_FACTORY_IFACE: &str = "org.freedesktop.IBus.Factory";
+const IBUS_FACTORY_IFACE: &str = "org.freedesktop.IBus.Portal";
 const IBUS_IC_IFACE: &str = "org.freedesktop.IBus.InputContext";
 
 /// IBUS_CAP_*：PREEDIT_TEXT | AUXILIARY_TEXT | LOOKUP_TABLE | PROPERTY |
@@ -273,7 +282,7 @@ fn probe_service_owner_impl(service: &str) -> Result<(), ProbeErr> {
                 || s.contains("1.2") // NameHasNoOwner error name: org.freedesktop.DBus.Error.NameHasNoOwner
             {
                 ProbeErr::Unsupported(format!(
-                    "session bus 上没有运行中的服务 {service}（名字无主）"
+                    "session bus 上没有 {service}（需要 ibus-portal 进程在运行；名字无主）"
                 ))
             } else {
                 ProbeErr::Transient(format!("GetNameOwner 失败: {e}"))
