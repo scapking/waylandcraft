@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.17-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.27-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -428,6 +428,7 @@ cd .. && ./gradlew clean build
 
 **近期亮点：**
 
+- **v0.9.27** — **输入法协议层重构。** 旧实现无法可靠上屏的根本原因：穿透路径向 App 发送 `commit_string`/`preedit_string` 后**从不发送协议强制的 `done` 事件**，GTK/Qt 永远缓冲不应用；宿主事件被拆进三条乱序缓冲（破坏协议规定的 `delete_surrounding → commit` 次序）；IME 状态不经 `commit(serial)` 校验就提前流出，丢弃语义完全失效；serial 记账三处错位（`clear_focus` 发 done 不计数——焦点一切换后续所有组合被判过期永久丢弃；全局共享 serial 计数器而非 per-instance）。彻底删除 `text-input-v1`/`input-method-v1` 遗留路径（约 470 行，会诱导 ibus 退回废弃协议栈），只保留现代 `zwp_text_input_v3` + `zwp_input_method_v2`，并以纯逻辑中继状态机（`ime/relay.rs`）重建 serial 记账、原子批次与丢弃判定。穿透路径现保序转发、反向同步 surrounding/光标矩形/内容类型给桌面输入法、以窗口焦点事件驱动的一次性重协商替代 15 秒轮询、对结构性不支持的环境（X11/XWayland 后端）启动即明确诊断。22 个测试验证，含真实合成器 + 双真实 Wayland 客户端（编辑器 + 模拟 fcitx5）的线缆级集成测试。详见 [docs/IME.md](docs/IME.md)。
 - **v0.9.17** — 修复共享窗口音频「实际不可用」的根因：PipeWire 捕获流的 `process` 回调注册句柄（`StreamListener`）是函数局部变量，返回即被 drop 导致回调注销、PCM 永远捕获不到；现已随捕获状态保活。补齐全链路音频日志（native 首次捕获、各阶段错误经 JNI 把真实原因传到 Java 日志、收发端首包/字节数日志）。
 - **v0.9.16** — 新增 `/wl show all` / `/wl hide all`（也支持 `*`）一键显示/隐藏全部窗口；`hide all` 一并解除钉住。
 - **v0.9.15** — 布局排序在窗口关闭/新增后实时更新：序号紧凑重排填补空洞。

@@ -4,6 +4,48 @@
 > 删除了旧的 text-input-v1 / input-method-v1 路径与全部 workaround，
 > 以标准现代协议栈（zwp_text_input_v3 + zwp_input_method_v2）为核心重建。
 
+## v0.9.27 重构摘要：为什么旧实现无法工作 & 新实现如何解决
+
+### 为什么旧代码不能实现输入法
+
+旧代码把 IME 当作「字符串搬运管道」，但 Wayland 输入法协议是**分布式
+double-buffered 状态机**，正确性由 serial 纪律、原子性、生命周期耦合三者
+共同保证——旧代码三者皆缺：
+
+| # | 缺陷 | 协议依据 | 后果 |
+|---|---|---|---|
+| 1 | 穿透路径发 `commit_string`/`preedit_string` 后**从不发送 `done`** | text-input-v3：客户端缓冲一切事件，仅在 `done(serial)` 到达时应用 | 桌面输入法提交的文本永远停在 App 的缓冲区里，无法上屏 |
+| 2 | 宿主事件拆进三条独立缓冲（committed/preedit/delete）分别转发 | 一个 done 周期内必须按 删除→插入→preedit 固定次序应用 | `delete_surrounding + commit` 批次乱序 → 选区重组产出错误文本 |
+| 3a | `clear_focus()` 发 `deactivate+done` 却不给计数器 +1 | im-v2：`commit(serial)` 的 serial 必须等于该对象已收到的 done 总数 | 焦点切换一次后，所有后续组合的 serial 全部「过期」→ 整批静默丢弃 |
+| 3b | `ti3_serial` 是全局共享计数器 | serial 按「该 text_input 对象收到的 commit 请求数」per-instance 计数 | 多客户端交错提交时 serial 彻底混乱 |
+| 3c | im2 事件收到即转发，不等 `commit(serial)` 校验 | 不匹配时合成器必须整批丢弃、不改变状态 | 「丢弃」时污染早已到达 App，丢弃机制形同虚设 |
+| 4 | 同时广播 ti_v1/im_v1 与 ti_v3/im_v2；KWin BLOCKED 用 15 秒轮询重建 | — | ibus 被 v1 吸走造成行为分叉；轮询救不了结构性问题 |
+
+### 新代码为什么可以
+
+核心是新增的**纯逻辑中继状态机** `ime/relay.rs`（零 Wayland 类型依赖），
+显式建模协议语义本身；wire 层退化为薄适配器：
+
+1. **done 纪律成为不变式**：每次批次放行后必然且只发一次
+   `ti.done(<per-instance commit 计数>)` —— 这是客户端应用文本的充要条件。
+2. **单 FIFO 原子缓冲**：IME 操作只在两个出口落地——im2 `commit(serial)`
+   校验通过（不符则整批清空、App 零感知）；穿透 Done 标记处保序应用。
+3. **正确的 serial 模型**：两侧均 per-object 计数；activate/deactivate/
+   PushState 每次都推进 IME 侧计数（旧代码漏掉的正是 deactivate 这次）。
+4. **生命周期耦合**：焦点 A→B 直接切换时先终结旧会话（Deactivate），
+   B 的 enable 再触发 Activate——否则新 surface 的 enable 会被误判为
+   会话延续。
+5. **双向数据流**：App 的 surrounding/cursor/content_type/cursor_rect
+   反向同步给当前端点（桌面 fcitx5 因此拿到真实文本上下文）。
+6. **结构问题用结构手段**：X11 后端结构性不支持 enter → 启动即明确
+   Unsupported；原生 Wayland 下 KWin 晚创建 text_input 收不到 enter →
+   窗口焦点事件驱动的一次性重建（GLFW 回调 → JNI），全程无定时器。
+
+验证：22 个 cargo test —— relay 单元测试 9 个 + **真线缆集成测试** 13 个
+（真实 `Display<WLCState>` 上跑两个真实 wayland-client 连接，分别模拟
+编辑器与 fcitx5），覆盖拼音逐键组合/退格/候选/选区重组/过期 serial/
+A→B 直接切换/grab 分流等完整场景。
+
 ## 1. 总体架构
 
 WaylandCraft 同时扮演两个角色：
@@ -151,21 +193,21 @@ seat 键盘焦点变化（bridge::keyboard_focus / keyboard_unfocus）
 ## 7. 测试方式
 
 ```sh
-cd native && cargo test          # 全部 21 个测试
-cargo test --lib ime::           # 仅 IME 子系统（19 个）
+cd native && cargo test          # 全部 22 个测试
+cargo test --lib ime::           # 仅 IME 子系统（20 个）
 ```
 
 两层测试：
 
 - **relay 单元测试**（9 个）：纯逻辑状态机的 serial 链、丢弃语义、
   端点重连、焦点丢失、组合全流程。
-- **线缆级集成测试**（10 个，`ime/tests.rs`）：真实 `Display<WLCState>`
+- **线缆级集成测试**（11 个，`ime/tests.rs`）：真实 `Display<WLCState>`
   （无 GPU 模式，dmabuf 关闭）+ 两个真实 wayland-client 连接——
   「编辑器」（ti3 客户端）与「模拟 fcitx5」（im2 客户端），覆盖：
-  英文原始键路径（seat 测试）、enable 激活、逐键拼音组合、组合中退格、
-  组合中移动光标、候选选定提交、选区删除重组保序、过期 serial 丢弃、
-  焦点 A→none→A、enable/disable/enable 循环、键盘 grab 分流与释放、
-  穿透入站保序应用、穿透出站反向同步。
+  enable 激活、逐键拼音组合、组合中退格、组合中移动光标、候选选定提交、
+  选区删除重组保序、过期 serial 丢弃、焦点 A→none→A、焦点 A→B 直接切换、
+  enable/disable/enable 循环、键盘 grab 分流与释放、穿透入站保序应用、
+  穿透出站反向同步。另有 seat.rs 的英文原始键路径测试。
 
 Java 侧：`./gradlew build`（需 JDK 25）；mixin 注入 windowFocusChanged
 驱动事件式重协商。

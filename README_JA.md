@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.17-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.27-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -428,6 +428,7 @@ cd .. && ./gradlew clean build
 
 **最近のハイライト：**
 
+- **v0.9.27** — **IME プロトコル層の書き直し。** 旧実装が IME テキストを確実に表示できなかった根本原因：パススルー経路が `commit_string`/`preedit_string` を送った後にプロトコル必須の `done` イベントを一度も送らず、GTK/Qt はテキストを永遠にバッファしたまま適用されない；ホスト側イベントが 3 つの独立バッファに分割され、プロトコルが定める `delete_surrounding → commit` の順序が崩壊；`commit(serial)` 検証前にステートを先行転送し、破棄セマンティクスが機能しない；serial 記帳の 3 重の誤り（`clear_focus` が done を発行するのにカウントしないため、フォーカス切替後のすべての変換が期限切れとして永久破棄される／全 text_input インスタンスで serial カウンタを共有）。レガシー `text-input-v1`/`input-method-v1`（約 470 行）を完全削除し、モダンな `zwp_text_input_v3` + `zwp_input_method_v2` のみに。純粋ロジックのリレー状態機械（`ime/relay.rs`）で serial 記帳・アトミックバッチ・破棄判定を再構築。22 個のテストで検証（実 compositor + 実 Wayland クライアント 2 本によるワイヤレベル統合テスト含む）。詳細は [docs/IME.md](docs/IME.md)。
 - **v0.9.17** — 共有ウィンドウ音声が実質使えない根本原因を修正：PipeWire キャプチャストリームの `process` コールバック登録ハンドル（`StreamListener`）が関数ローカル変数で、return 時に drop されコールバックが解除され PCM が一切取得できなかった。キャプチャ状態と共に保持するよう修正。音声パイプライン全体のログも追加。
 - **v0.9.16** — `/wl show all` / `/wl hide all`（`*` も可）で全ウィンドウを一括表示/非表示；`hide all` はピン留めも解除。
 - **v0.9.15** — ウィンドウの開閉に応じてレイアウト順序をリアルタイム更新：番号を詰め直して隙間を埋める。

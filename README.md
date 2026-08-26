@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.17-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-v0.9.27-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -434,6 +434,7 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
 
 **Recent highlights:**
 
+- **v0.9.27** — **IME protocol-level rewrite.** The old implementation could never reliably deliver IME text: the passthrough path sent `commit_string`/`preedit_string` to apps **without ever sending the mandatory `done` event**, so GTK/Qt buffered the text forever and nothing appeared on screen; host events were split into three unordered buffers (breaking the protocol-mandated `delete_surrounding` → `commit` order); IME state was forwarded before `commit(serial)` validation, making protocol discard impossible; and serial bookkeeping was wrong in three ways (`clear_focus` emitted a `done` without counting it — after any focus change *every* subsequent composition was discarded as stale; one global serial counter shared by all text-input instances instead of per-instance). The legacy `text-input-v1`/`input-method-v1` paths (~470 lines, which steered ibus onto the deprecated stack) are removed entirely; only the modern `zwp_text_input_v3` + `zwp_input_method_v2` stack remains, rebuilt around a pure-logic relay state machine (`ime/relay.rs`) that owns serial accounting, atomic batching and discard semantics. Host-desktop passthrough now preserves event order, reverse-syncs surrounding text / cursor rect / content type back to the desktop IME, replaces the 15s polling recreate with an event-driven renegotiation on window focus (GLFW callback → JNI), and detects structurally unsupported setups (X11/XWayland backend) up front instead of polling forever. Verified by 22 tests including wire-level integration tests that run a real compositor with two real Wayland clients (an editor and a simulated fcitx5). See [docs/IME.md](docs/IME.md).
 - **v0.9.17** — Fixed shared-window audio being effectively unusable: the PipeWire capture stream's `process` callback handle (`StreamListener`) was a function-local variable dropped on return, which unregistered the callback — so no PCM was ever captured. It is now kept alive in capture state. Added full audio-pipeline logging (native first-capture, per-stage errors now reach the Java log with the real reason, send/receive-side first-packet & byte-count logs).
 - **v0.9.16** — Added `/wl show all` / `/wl hide all` (also `*`) to show/hide every window in one command; `hide all` also unpins.
 - **v0.9.15** — Layout order now updates in real time as windows close/open — slots are compactly renumbered to fill gaps.
