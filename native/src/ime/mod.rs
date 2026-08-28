@@ -78,9 +78,28 @@ pub struct ImeState {
 
     /// 发往穿透端点的命令出站队列；lib.rs 每帧取走交给 SystemIme 执行。
     passthrough_outbox: Vec<ImeCommand>,
+
+    /// 最近一次候选窗快照（Java 每帧轮询，自绘候选窗用）。
+    lookup_table: Option<LookupTableSnapshot>,
+}
+
+/// 候选窗快照（宿主输入法归一化数据，与协议后端无关）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LookupTableSnapshot {
+    pub candidates: Vec<String>,
+    pub labels: Vec<String>,
+    pub cursor_pos: u32,
+    pub cursor_visible: bool,
+    pub page_size: u32,
+    pub orientation: u32,
+    pub visible: bool,
 }
 
 impl ImeState {
+    /// 取走候选窗快照（Java 侧 JNI 每帧调用；无更新时返回 None）。
+    pub fn take_lookup_table(&mut self) -> Option<LookupTableSnapshot> {
+        self.lookup_table.take()
+    }
     pub fn create_globals(&self, disp: &DisplayHandle) {
         disp.create_global::<WLCState, ZwpTextInputManagerV3, ()>(1, ());
         disp.create_global::<WLCState, ZwpInputMethodManagerV2, ()>(1, ());
@@ -305,6 +324,23 @@ impl ImeState {
                 HostEvent::PreeditString(t, b, e) => self.relay.ime_op(ImeOp::Preedit(t, b, e)),
                 HostEvent::DeleteSurroundingText(b, a) => {
                     self.relay.ime_op(ImeOp::DeleteSurrounding(b, a))
+                }
+                HostEvent::LookupTable { candidates, labels, cursor_pos, cursor_visible, page_size, orientation, visible } => {
+                    // 候选窗数据：不进 relay 文本流，直接进 UI 快照供 Java 自绘候选窗。
+                    self.lookup_table = Some(LookupTableSnapshot {
+                        candidates,
+                        labels,
+                        cursor_pos,
+                        cursor_visible,
+                        page_size,
+                        orientation,
+                        visible,
+                    });
+                    crate::bridge::ime_log_write(&format!(
+                        "[waylandcraft][ime] lookup_table updated: {} candidates visible={}",
+                        self.lookup_table.as_ref().map(|l| l.candidates.len()).unwrap_or(0),
+                        visible
+                    ));
                 }
                 HostEvent::Done(_) => {
                     // 宿主批次完成。serial 校验已由宿主合成器对它的客户端

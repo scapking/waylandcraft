@@ -26,7 +26,7 @@
 //! 单元测试覆盖，真实 fcitx5 桌面回归待社区验证（同 docs/IME.md §8 惯例）。
 
 use super::dbus_ibus::{body_fields, find_int, find_text};
-use super::{ForwardedKey, HostImBackend, SubmittedKey, IBUS_RELEASE_MASK};
+use super::{CandidateNav, ForwardedKey, HostImBackend, SubmittedKey};
 use crate::ime::ImeCommand;
 use crate::seat::KeyboardAction;
 use crate::system_ime::{HostEvent, ImeInit};
@@ -46,8 +46,31 @@ const FCITX_IM_IFACE: &str = "org.fcitx.Fcitx.InputMethod1";
 const FCITX_IC_IFACE: &str = "org.fcitx.Fcitx.InputContext1";
 
 /// 我们监听的 InputContext 信号。
-const WATCHED_SIGNALS: &[&str] =
-    &["CommitString", "UpdateFormattedPreedit", "DeleteSurroundingText", "ForwardKey"];
+const WATCHED_SIGNALS: &[&str] = &[
+    "CommitString",
+    "UpdateFormattedPreedit",
+    "UpdateClientSideUI",
+    "DeleteSurroundingText",
+    "ForwardKey",
+];
+
+/// 能力位（fcitx5-qt platforminputcontext 参考集；缺失则 fcitx5 不发任何
+/// preedit/候选 —— 上游 `updatePreedit()`/`updateSingleComponent<InputPanel>`
+/// 分别检查 Preedit / ClientSideInputPanel）。
+const CAP_PREEDIT: u64 = 1 << 1;
+const CAP_FORMATTED_PREEDIT: u64 = 1 << 4;
+const CAP_CLIENT_UNFOCUS_COMMIT: u64 = 1 << 5;
+const CAP_GET_IM_INFO_ON_FOCUS: u64 = 1 << 23;
+const CAP_KEY_EVENT_ORDER_FIX: u64 = 1 << 37;
+const CAP_REPORT_KEY_REPEAT: u64 = 1 << 38;
+const CAP_CLIENT_SIDE_INPUT_PANEL: u64 = 1 << 39;
+const CAPABILITY_FLAGS: u64 = CAP_PREEDIT
+    | CAP_FORMATTED_PREEDIT
+    | CAP_CLIENT_UNFOCUS_COMMIT
+    | CAP_GET_IM_INFO_ON_FOCUS
+    | CAP_KEY_EVENT_ORDER_FIX
+    | CAP_REPORT_KEY_REPEAT
+    | CAP_CLIENT_SIDE_INPUT_PANEL;
 
 enum ToWorker {
     FocusIn,
@@ -62,6 +85,11 @@ enum ToWorker {
         release: bool,
         time_ms: u32,
     },
+    /// 候选窗专用命令：翻页 / 按页内下标选字（跳过 placeholder，与
+    /// UpdateClientSideUI 的信号下标空间一致）。
+    PrevPage,
+    NextPage,
+    SelectCandidate(i32),
 }
 
 enum FromWorker {
@@ -211,6 +239,20 @@ fn command_loop(
     let _ = ev_tx.send(FromWorker::Ready);
     ime_log!("[waylandcraft][host_ime][dbus-fcitx5] input context READY");
 
+    // 致命缺失的补丁：不声明能力位则 fcitx5 不发任何 preedit/候选。
+    match ic_conns
+        .ic
+        .call::<_, _, ()>("SetSupportedCapability", &(CAPABILITY_FLAGS,))
+        .and_then(|_| ic_conns.ic.call::<_, _, ()>("SetCapability", &(CAPABILITY_FLAGS,)))
+    {
+        Ok(()) => ime_log!(
+            "[waylandcraft][host_ime][dbus-fcitx5] SetCapability({CAPABILITY_FLAGS:#x}) ok"
+        ),
+        Err(e) => ime_log!(
+            "[waylandcraft][host_ime][dbus-fcitx5] SetCapability 失败（preedit/候选可能缺失）: {e}"
+        ),
+    }
+
     for sig in WATCHED_SIGNALS {
         let ic = ic_conns.ic.clone();
         let ev_tx = ev_tx.clone();
@@ -268,6 +310,21 @@ fn command_loop(
                     let _ = ev_tx.send(FromWorker::KeyReply { seq, consumed });
                     Ok(())
                 }),
+            ToWorker::PrevPage => ic_conns
+                .ic
+                .call::<_, _, ()>("PrevPage", &())
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            ToWorker::NextPage => ic_conns
+                .ic
+                .call::<_, _, ()>("NextPage", &())
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            ToWorker::SelectCandidate(idx) => ic_conns
+                .ic
+                .call::<_, _, ()>("SelectCandidate", &(idx,))
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
         };
         if let Err(e) = res {
             ime_log!("[waylandcraft][host_ime][dbus-fcitx5] 命令执行失败: {e}");
@@ -313,7 +370,68 @@ fn parse_formatted_preedit(
         }
     }
     let fallback_cursor = text.chars().count() as i32;
-    Some((text, cursor.unwrap_or(fallback_cursor)))
+    // fcitx 的游标是 UTF-8 字节偏移（text.h "Get cursor by byte"），
+    // ti3 语义要字符偏移 —— 逐字符累计字节、越界即停（防御性处理
+    // 落在字符中间的字节游标，向下取整到前一字符边界）。
+    let cursor = cursor
+        .map(|b| {
+            let b = b.max(0) as usize;
+            let mut consumed = 0usize;
+            let mut n = 0i32;
+            for c in text.chars() {
+                if consumed + c.len_utf8() > b {
+                    break;
+                }
+                consumed += c.len_utf8();
+                n += 1;
+            }
+            n
+        })
+        .unwrap_or(fallback_cursor);
+    Some((text, cursor))
+}
+
+/// `UpdateClientSideUI` 解析：`a(si) i a(si) a(si) a(ss) i i b b`
+/// （preedit, cursorpos, auxUp, auxDown, candidates[(label,text+comment)],
+///  candidateIndex, layoutHint, hasPrev, hasNext）。
+/// 归一到 [`HostEvent::LookupTable`]；preedit/aux 由游戏侧其它路径消费。
+fn parse_candidate_panel(fields: &[zbus::zvariant::Value<'static>]) -> Option<HostEvent> {
+    use super::dbus_ibus::{as_array, as_structure, field_peeled};
+    let mut candidates = Vec::new();
+    let mut labels = Vec::new();
+    if let Some(arr) = field_peeled(fields, 4).and_then(as_array) {
+        for item in arr.iter() {
+            if let Some(st) = as_structure(item) {
+                let f = st.fields();
+                if let Some(zbus::zvariant::Value::Str(l)) = field_peeled(f, 0) {
+                    labels.push(l.as_str().to_string());
+                }
+                if let Some(zbus::zvariant::Value::Str(t)) = field_peeled(f, 1) {
+                    candidates.push(t.as_str().to_string());
+                }
+            }
+        }
+    }
+    let idx = match field_peeled(fields, 5) {
+        Some(zbus::zvariant::Value::I32(n)) => *n,
+        _ => -1,
+    };
+    let layout = match field_peeled(fields, 6) {
+        Some(zbus::zvariant::Value::I32(n)) => *n,
+        _ => 0,
+    };
+    let has_prev = matches!(field_peeled(fields, 7), Some(zbus::zvariant::Value::Bool(true)));
+    let has_next = matches!(field_peeled(fields, 8), Some(zbus::zvariant::Value::Bool(true)));
+    let visible = !candidates.is_empty() || has_prev || has_next;
+    Some(HostEvent::LookupTable {
+        candidates,
+        labels,
+        cursor_pos: idx.max(0) as u32,
+        cursor_visible: idx >= 0,
+        page_size: 0,
+        orientation: layout.max(0) as u32,
+        visible,
+    })
 }
 
 /// 提交一批文本事件并立即补 Done（原子应用单位 = 单条信号）。
@@ -346,6 +464,19 @@ fn handle_signal(
             } else {
                 push_with_done(ev_tx, HostEvent::PreeditString(String::new(), 0, 0));
             }
+        }
+        "UpdateClientSideUI" => {
+            let ev = parse_candidate_panel(&fields)
+                .ok_or_else(|| "UpdateClientSideUI 解析失败".to_string())?;
+            if let HostEvent::LookupTable { candidates, visible, cursor_pos, .. } = &ev {
+                ime_log!(
+                    "[waylandcraft][host_ime][dbus-fcitx5] candidate panel {} visible={} cursor={}",
+                    candidates.len(),
+                    visible,
+                    cursor_pos
+                );
+            }
+            push_with_done(ev_tx, ev);
         }
         "DeleteSurroundingText" => {
             // (i offset, u nchars)：游标相对区间 [cursor+offset, cursor+offset+nchars)
@@ -514,6 +645,19 @@ impl HostImBackend for DbusFcitx5Backend {
         true
     }
 
+    fn candidate_nav(&mut self, nav: CandidateNav) {
+        if !self.ready || self.dead.is_some() {
+            return;
+        }
+        let cmd = match nav {
+            CandidateNav::SelectCandidate(i) => ToWorker::SelectCandidate(i as i32),
+            CandidateNav::PrevPage => ToWorker::PrevPage,
+            CandidateNav::NextPage => ToWorker::NextPage,
+        };
+        ime_log!("[waylandcraft][host_ime][dbus-fcitx5] candidate_nav {nav:?}");
+        let _ = self.cmd_tx.send(cmd);
+    }
+
     fn update_cursor_rect(&mut self, rect: (i32, i32, i32, i32)) {
         if self.last_cursor == Some(rect) {
             return;
@@ -531,6 +675,7 @@ impl HostImBackend for DbusFcitx5Backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_ime::IBUS_RELEASE_MASK;
 
     /// parse_formatted_preedit：a(si) 分段拼接 + 尾部游标。
     #[test]
@@ -552,6 +697,84 @@ mod tests {
         let (text, cursor) = parse_formatted_preedit(&fields).expect("parse");
         assert_eq!(text, "nihao");
         assert_eq!(cursor, 4);
+    }
+
+    /// 字节游标 → 字符游标（fcitx 给 UTF-8 字节偏移，CJK 下必须换算）。
+    #[test]
+    fn preedit_cursor_byte_to_char() {
+        use zbus::zvariant as zv;
+        let seg = |t: String| {
+            let mut b = zv::StructureBuilder::new();
+            b.push_value(zv::Value::from(t));
+            b.push_value(zv::Value::from(0i32));
+            zv::Value::Structure(b.build().expect("structure build"))
+        };
+        // "ni" (2B) + "好" (3B) —— 字节游标 3 应落在 "好" 之后 = 2 个字符。
+        let arr = zv::Value::Array(
+            vec![seg("ni".into()), seg("好".into())]
+                .try_into()
+                .expect("array build"),
+        );
+        let fields = vec![arr, zv::Value::from(3i32)];
+        let (text, cursor) = parse_formatted_preedit(&fields).expect("parse");
+        assert_eq!(text, "ni好");
+        assert_eq!(cursor, 2);
+    }
+
+    /// UpdateClientSideUI 全量解析：候选/高亮/翻页/布局位。
+    #[test]
+    fn candidate_panel_parsing() {
+        use zbus::zvariant as zv;
+        let pair = |label: &str, text: &str| {
+            let mut b = zv::StructureBuilder::new();
+            b.push_value(zv::Value::from(label.to_string()));
+            b.push_value(zv::Value::from(text.to_string()));
+            zv::Value::Structure(b.build().expect("structure build"))
+        };
+        let cands = zv::Value::Array(
+            vec![pair("1.", "你"), pair("2.", "泥"), pair("3.", "逆")]
+                .try_into()
+                .expect("array build"),
+        );
+        // a(si) preedit, i cursorpos, a(si) auxUp, a(si) auxDown,
+        // a(ss) candidates, i idx, i layoutHint, b hasPrev, b hasNext
+        let empty_arr = || {
+            zv::Value::Array(
+                Vec::<zv::Value>::new()
+                    .try_into()
+                    .expect("empty array"),
+            )
+        };
+        let fields = vec![
+            empty_arr(),
+            zv::Value::from(3i32),
+            empty_arr(),
+            empty_arr(),
+            cands,
+            zv::Value::from(1i32),
+            zv::Value::from(1i32),
+            zv::Value::from(false),
+            zv::Value::from(true),
+        ];
+        let ev = parse_candidate_panel(&fields).expect("parse");
+        let HostEvent::LookupTable {
+            candidates,
+            labels,
+            cursor_pos,
+            cursor_visible,
+            orientation,
+            visible,
+            ..
+        } = ev
+        else {
+            panic!("期望 LookupTable");
+        };
+        assert_eq!(candidates, vec!["你", "泥", "逆"]);
+        assert_eq!(labels, vec!["1.", "2.", "3."]);
+        assert_eq!(cursor_pos, 1);
+        assert!(cursor_visible);
+        assert_eq!(orientation, 1);
+        assert!(visible);
     }
 
     /// 未就绪不接管。

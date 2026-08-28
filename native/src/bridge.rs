@@ -369,6 +369,11 @@ bind_java_type! {
             name = "notifyHostFocusGainedNative",
             fn = notify_host_focus_gained,
         },
+        static extern fn candidate_nav {
+            sig = (instance: jlong, action: jint, arg: jint),
+            name = "candidateNavNative",
+            fn = candidate_nav,
+        },
         static extern fn audio_capture_status {
             sig = (instance: jlong) -> JString,
             name = "audioCaptureStatusNative",
@@ -1646,6 +1651,34 @@ fn notify_host_focus_gained<'local>(
     let instance = jptr_to_instance!(instance, "notifyHostFocusGained")?;
     if let Some(si) = instance.system_ime.as_mut() {
         si.notify_host_focus_gained();
+    }
+    Ok(())
+}
+
+/// candidateNav(instance, action, arg) —— Java 候选窗用户操作 → 宿主输入法。
+///
+/// action: `0`=选字（arg=当前页内下标） `1`=上一页 `2`=下一页。
+/// fcitx5 后端走专用 `SelectCandidate`/`PrevPage`/`NextPage` 方法；
+/// ibus portal 无候选方法，忽略（候选操作走按键通路）。
+fn candidate_nav<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    action: jint,
+    arg: jint,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "candidateNav")?;
+    let nav = match action {
+        0 => crate::host_ime::CandidateNav::SelectCandidate(arg.max(0) as u32),
+        1 => crate::host_ime::CandidateNav::PrevPage,
+        2 => crate::host_ime::CandidateNav::NextPage,
+        other => {
+            eprintln!("[waylandcraft][bridge] candidateNav 未知 action {other}");
+            return Ok(());
+        }
+    };
+    if let Some(si) = instance.system_ime.as_mut() {
+        si.candidate_nav(nav);
     }
     Ok(())
 }

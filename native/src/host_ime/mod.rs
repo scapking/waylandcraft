@@ -74,6 +74,15 @@ pub struct ForwardedKey {
     pub action: KeyboardAction,
 }
 
+/// 候选窗用户操作（Java 候选窗点击/翻页 → 宿主输入法）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateNav {
+    /// 按【当前页内】下标选字（fcitx5 `SelectCandidate` 语义，跳过 placeholder）。
+    SelectCandidate(u32),
+    PrevPage,
+    NextPage,
+}
+
 pub(crate) trait HostImBackend {
     /// 后端名（诊断日志用）。
     fn name(&self) -> &'static str;
@@ -87,6 +96,9 @@ pub(crate) trait HostImBackend {
 
     /// 执行来自 Relay 的抽象命令（缓存语义，wire 写入在 poll 内调和）。
     fn execute_commands(&mut self, commands: Vec<ImeCommand>);
+
+    /// 候选窗导航（Java UI 触发；默认忽略，dbus-fcitx5 转发专用方法）。
+    fn candidate_nav(&mut self, _nav: CandidateNav) {}
 
     /// Minecraft 窗口重新获得 OS 键盘焦点（事件驱动焦点重协商钩子）。
     fn notify_host_focus_gained(&mut self) {}

@@ -66,6 +66,21 @@ pub enum HostEvent {
     DeleteSurroundingText(u32, u32),
     /// 宿主批次完成标记；携带的 serial 仅作诊断（校验已在宿主侧完成）。
     Done(u32),
+    /// 候选窗数据（ibus LookupTable / fcitx5 ClientSideUI 归一化）。
+    /// 空列表 + visible=false ≡ 隐藏候选窗。
+    LookupTable {
+        candidates: Vec<String>,
+        /// 候选序号标签（ibus 可能为空，渲染侧按 page 补 "1.".."9.","0."）。
+        labels: Vec<String>,
+        /// 高亮候选在【当前页内】的下标（ibus 全表绝对下标已换算；fcitx5 本页下标直用）。
+        cursor_pos: u32,
+        cursor_visible: bool,
+        /// 每页候选数。
+        page_size: u32,
+        /// 0=水平 1=垂直 2=系统。
+        orientation: u32,
+        visible: bool,
+    },
 }
 
 /// 初始化结果：区分「可重试的环境问题」和「结构性不支持」。

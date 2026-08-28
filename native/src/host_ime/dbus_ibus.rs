@@ -86,6 +86,9 @@ const WATCHED_SIGNALS: &[&str] = &[
     "DeleteSurroundingText",
     "HidePreeditText",
     "ForwardKeyEvent",
+    "UpdateLookupTable",
+    "ShowLookupTable",
+    "HideLookupTable",
 ];
 
 // ── 主线程 ↔ 工作线程协议 ─────────────────────────────────────────
@@ -509,6 +512,136 @@ pub(crate) fn find_int(values: &[zbus::zvariant::Value<'static>]) -> Option<i64>
     None
 }
 
+/// 解包 variant 拿到内层值。
+fn variant_inner<'a>(
+    v: &'a zbus::zvariant::Value<'static>,
+) -> Option<&'a zbus::zvariant::Value<'static>> {
+    match v {
+        zbus::zvariant::Value::Value(inner) => Some(inner.as_ref()),
+        _ => None,
+    }
+}
+
+/// 逐层剥 variant，直到拿到非 variant 值（zbus 不同构造/反序列化路径
+/// 可能多包一层 variant：`Value::Array` 或 `Value::Value(Box(Array))`）。
+fn peel_variant<'a>(v: &'a zbus::zvariant::Value<'static>) -> &'a zbus::zvariant::Value<'static> {
+    let mut cur = v;
+    while let zbus::zvariant::Value::Value(inner) = cur {
+        cur = inner.as_ref();
+    }
+    cur
+}
+
+/// 在值上找数组（容错：可能被 variant 包裹）。
+pub(crate) fn as_array<'a>(
+    v: &'a zbus::zvariant::Value<'static>,
+) -> Option<&'a zbus::zvariant::Array<'static>> {
+    match peel_variant(v) {
+        zbus::zvariant::Value::Array(arr) => Some(arr),
+        _ => None,
+    }
+}
+
+/// 在值上找结构体（容错：可能被 variant 包裹）。
+pub(crate) fn as_structure<'a>(
+    v: &'a zbus::zvariant::Value<'static>,
+) -> Option<&'a zbus::zvariant::Structure<'static>> {
+    match peel_variant(v) {
+        zbus::zvariant::Value::Structure(st) => Some(st),
+        _ => None,
+    }
+}
+
+/// 取字段并剥 variant（zbus 5 的 `Value::new` 对 Value 输入会包 variant；
+/// serde 反序列化路径不包。两种都兼容）。
+pub(crate) fn field_peeled<'a>(
+    fields: &'a [zbus::zvariant::Value<'static>],
+    idx: usize,
+) -> Option<&'a zbus::zvariant::Value<'static>> {
+    fields.get(idx).map(peel_variant)
+}
+
+/// IBusLookupTable 的候选/标签元素：`av` 数组里每个元素是
+/// variant 包一个 IBusText（`sa{sv}sv`：类型名 + attachments + 正文 + attrs）。
+fn lookup_element_text(
+    v: &zbus::zvariant::Value<'static>,
+) -> Option<String> {
+    let st = as_structure(v)?;
+    let f = st.fields();
+    // f[0]=Str(类型名) f[1]=Dict f[2]=Str(正文) —— 结构化解，不漫游（避免抓到 labels/preedit）
+    if let Some(zbus::zvariant::Value::Str(s)) = field_peeled(f, 2) {
+        if !s.as_str().is_empty() && !is_gobject_typename(s.as_str()) {
+            return Some(s.as_str().to_string());
+        }
+    }
+    None
+}
+
+/// 从 `UpdateLookupTable (v b)` 消息体里结构化解出候选表。
+///
+/// IBusLookupTable 序列化 = `( s  a{sv}  u  u  b  b  i  av  av )`：
+/// 类型名 / attachments / page_size / cursor_pos / cursor_visible / round /
+/// orientation / candidates / labels。每个候选是 variant 包 IBusText。
+fn parse_lookup_table(fields: &StaticFields) -> Result<HostEvent, String> {
+    let visible = match fields.get(1) {
+        Some(zbus::zvariant::Value::Bool(b)) => *b,
+        _ => false,
+    };
+    let table = fields
+        .get(0)
+        .ok_or_else(|| "UpdateLookupTable 缺表字段".to_string())?;
+    let st = as_structure(table).ok_or_else(|| "UpdateLookupTable 表不是结构体".to_string())?;
+    let f = st.fields();
+    let page_size = match field_peeled(f, 2) {
+        Some(zbus::zvariant::Value::U32(n)) => *n,
+        _ => 0,
+    };
+    let cursor_pos = match field_peeled(f, 3) {
+        Some(zbus::zvariant::Value::U32(n)) => *n,
+        _ => 0,
+    };
+    let cursor_visible = match field_peeled(f, 4) {
+        Some(zbus::zvariant::Value::Bool(b)) => *b,
+        _ => false,
+    };
+    let orientation = match field_peeled(f, 6) {
+        Some(zbus::zvariant::Value::I32(n)) => (*n).max(0) as u32,
+        _ => 0,
+    };
+
+    let mut candidates = Vec::new();
+    let mut labels = Vec::new();
+    if let Some(arr) = as_array(field_peeled(f, 7).ok_or("缺候选字段")?) {
+        for item in arr.iter() {
+            if let Some(t) = lookup_element_text(item) {
+                candidates.push(t);
+            }
+        }
+    }
+    if let Some(arr) = as_array(field_peeled(f, 8).ok_or("缺标签字段")?) {
+        for item in arr.iter() {
+            if let Some(t) = lookup_element_text(item) {
+                labels.push(t);
+            }
+        }
+    }
+
+    Ok(HostEvent::LookupTable {
+        candidates,
+        labels,
+        // 归一化：cursor_pos 统一为【当前页内】下标（ibus 给的是全表绝对下标）。
+        cursor_pos: if page_size > 0 {
+            cursor_pos % page_size
+        } else {
+            0
+        },
+        cursor_visible,
+        page_size,
+        orientation,
+        visible,
+    })
+}
+
 pub(crate) fn find_bool(values: &[zbus::zvariant::Value<'static>]) -> Option<bool> {
     for v in values {
         match v {
@@ -568,6 +701,52 @@ fn handle_signal(
         }
         "HidePreeditText" => {
             push_with_done(ev_tx, HostEvent::PreeditString(String::new(), 0, 0));
+        }
+        "UpdateLookupTable" => {
+            match parse_lookup_table(&fields) {
+                Ok(ev) => {
+                    if let HostEvent::LookupTable { candidates, visible, cursor_pos, .. } = &ev {
+                        ime_log!(
+                            "[waylandcraft][host_ime][dbus-ibus] lookup {} visible={} cursor={}",
+                            candidates.len(),
+                            visible,
+                            cursor_pos
+                        );
+                    }
+                    push_with_done(ev_tx, ev);
+                }
+                Err(e) => {
+                    ime_log!("[waylandcraft][host_ime][dbus-ibus] LookupTable 解析失败: {e}");
+                }
+            }
+        }
+        "ShowLookupTable" => {
+            push_with_done(
+                ev_tx,
+                HostEvent::LookupTable {
+                    candidates: Vec::new(),
+                    labels: Vec::new(),
+                    cursor_pos: 0,
+                    cursor_visible: true,
+                    page_size: 0,
+                    orientation: 0,
+                    visible: true,
+                },
+            );
+        }
+        "HideLookupTable" => {
+            push_with_done(
+                ev_tx,
+                HostEvent::LookupTable {
+                    candidates: Vec::new(),
+                    labels: Vec::new(),
+                    cursor_pos: 0,
+                    cursor_visible: false,
+                    page_size: 0,
+                    orientation: 0,
+                    visible: false,
+                },
+            );
         }
         "ForwardKeyEvent" => {
             // (keyval, keycode(evdev), state)
@@ -648,6 +827,14 @@ impl HostImBackend for DbusIbusBackend {
                 }
             }
         }
+    }
+
+    fn candidate_nav(&mut self, nav: crate::host_ime::CandidateNav) {
+        // ibus portal 接口没有 SelectCandidate/PrevPage/NextPage 方法
+        //（调研确认），候选翻页/选字只能靠按键 → ProcessKeyEvent 通路。
+        ime_log!(
+            "[waylandcraft][host_ime][dbus-ibus] candidate_nav {nav:?} 忽略（ibus portal 无候选方法）"
+        );
     }
 
     fn poll(&mut self) {
@@ -885,5 +1072,92 @@ mod tests {
             action: KeyboardAction::Press,
             mods: (0, 0, 0, 0),
         }));
+    }
+
+    /// UpdateLookupTable 结构化解：IBusLookupTable `(sa{sv}uubbiavav)` +
+    /// 候选 IBusText `(sa{sv}sv)`，跳 GObject 类型名，labels/光标/分页全对。
+    #[test]
+    fn parse_lookup_table_structured() {
+        use std::collections::HashMap;
+        use zbus::zvariant::{Array, Structure, Value};
+
+        // attachments 空字典 sa{sv}
+        let empty_dict = || zbus::zvariant::Dict::from(HashMap::<String, Value>::new());
+        // IBusText = (Str(类型名), Dict, Str(正文), Variant(attrs))
+        let mk_cand = |text: &'static str| {
+            Value::Value(Box::new(Value::Structure(Structure::from((
+                Value::Str("IBusText".into()),
+                Value::Dict(empty_dict()),
+                Value::Str(text.into()),
+                Value::Value(Box::new(Value::Bool(false))),
+            )))))
+        };
+        let candidates = Array::from(vec![mk_cand("你"), mk_cand("泥"), mk_cand("逆")]);
+        let labels = Array::from(vec![mk_cand("1."), mk_cand("2."), mk_cand("3.")]);
+
+        let table = Value::Value(Box::new(Value::Structure(Structure::from((
+            Value::Str("IBusLookupTable".into()),
+            Value::Dict(empty_dict()),
+            Value::U32(3),       // page_size
+            Value::U32(1),       // cursor_pos（全表绝对下标）
+            Value::Bool(true),   // cursor_visible
+            Value::Bool(false),  // round
+            Value::I32(1),       // orientation=垂直
+            Value::Array(candidates),
+            Value::Array(labels),
+        )))));
+
+        let fields: StaticFields = vec![table, Value::Bool(true)]; // (v b)
+        let ev = parse_lookup_table(&fields).expect("parse");
+        match ev {
+            HostEvent::LookupTable {
+                candidates,
+                labels,
+                cursor_pos,
+                cursor_visible,
+                page_size,
+                orientation,
+                visible,
+            } => {
+                assert_eq!(candidates, vec!["你", "泥", "逆"]);
+                assert_eq!(labels, vec!["1.", "2.", "3."]);
+                assert_eq!(cursor_pos, 1);
+                assert!(cursor_visible);
+                assert_eq!(page_size, 3);
+                assert_eq!(orientation, 1);
+                assert!(visible);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    /// 空表 + visible=false ≡ 隐藏；解析后 candidates 为空、visible=false。
+    #[test]
+    fn parse_lookup_table_hidden() {
+        use std::collections::HashMap;
+        use zbus::zvariant::{Array, Structure, Value};
+
+        let empty_dict = || zbus::zvariant::Dict::from(HashMap::<String, Value>::new());
+        let table = Value::Value(Box::new(Value::Structure(Structure::from((
+            Value::Str("IBusLookupTable".into()),
+            Value::Dict(empty_dict()),
+            Value::U32(9),
+            Value::U32(0),
+            Value::Bool(false),
+            Value::Bool(false),
+            Value::I32(0),
+            Value::Array(Array::from(Vec::<Value>::new())),
+            Value::Array(Array::from(Vec::<Value>::new())),
+        )))));
+
+        let fields: StaticFields = vec![table, Value::Bool(false)];
+        let ev = parse_lookup_table(&fields).expect("parse");
+        match ev {
+            HostEvent::LookupTable { candidates, visible, .. } => {
+                assert!(candidates.is_empty());
+                assert!(!visible);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 }
