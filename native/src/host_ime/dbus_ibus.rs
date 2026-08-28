@@ -392,14 +392,27 @@ fn command_loop(
                 keysym,
                 evdev,
                 state,
-            } => ic_conns
-                .ic
-                .call::<_, _, bool>("ProcessKeyEvent", &(keysym, evdev, state))
-                .map_err(|e| format!("ProcessKeyEvent: {e}"))
-                .and_then(|consumed| {
-                    let _ = ev_tx.send(FromWorker::KeyReply { seq, consumed });
-                    Ok(())
-                }),
+            } => {
+                // P0 可观测性：记录传给 ibus 的原始键（keysym 名 + press/release），
+                // 用于定位「选字数字/空格被放行」时 ibus 实际收到什么键。
+                let sym_name = xkbcommon::xkb::keysym_get_name(xkbcommon::xkb::Keysym::new(keysym));
+                let action = if state & IBUS_RELEASE_MASK != 0 {
+                    "release"
+                } else {
+                    "press"
+                };
+                ime_log!(
+                    "[waylandcraft][host_ime][dbus-ibus] ProcessKeyEvent seq={seq} keysym={keysym:#x}({sym_name}) evdev={evdev} state={state:#x} action={action}"
+                );
+                ic_conns
+                    .ic
+                    .call::<_, _, bool>("ProcessKeyEvent", &(keysym, evdev, state))
+                    .map_err(|e| format!("ProcessKeyEvent: {e}"))
+                    .and_then(|consumed| {
+                        let _ = ev_tx.send(FromWorker::KeyReply { seq, consumed });
+                        Ok(())
+                    })
+            }
         };
         if let Err(e) = res {
             ime_log!("[waylandcraft][host_ime][dbus-ibus] 命令执行失败: {e}");

@@ -283,6 +283,11 @@ impl Dispatch<ZwpTextInputV3, ()> for crate::WLCState {
                 }
             }
             zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
+                // P0 可观测性：应用（WaylandCraft 世界内窗口，如卫星桥的 firefox）
+                // 通过 ti3 上报光标矩形——验证候选窗锚点能否取真实应用光标。
+                crate::bridge::ime_log_write(&format!(
+                    "[waylandcraft][ime][ti3] SetCursorRectangle obj={obj_id} rect=({x},{y},{width},{height})"
+                ));
                 inst.pending.cursor_rectangle = Some((x, y, width, height));
             }
             zwp_text_input_v3::Request::Destroy => {}

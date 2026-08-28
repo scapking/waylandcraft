@@ -1516,8 +1516,20 @@ fn keyboard_input<'local>(
                 .xkb_state
                 .key_get_one_sym(xkbcommon::xkb::Keycode::new(key_u))
                 .raw();
+            let seq = KEY_SEQ.fetch_add(1, Ordering::Relaxed);
+            // P0 可观测性：记录驱动层提交给后端的键（keysym 名 + press/release），
+            // 与后端 ProcessKeyEvent 日志配对，确认 ibus 收到的键是否与用户按键一致。
+            let sym_name = xkbcommon::xkb::keysym_get_name(xkbcommon::xkb::Keysym::new(keysym));
+            let act = if action == KeyboardAction::Release {
+                "release"
+            } else {
+                "press"
+            };
+            crate::bridge::ime_log_write(&format!(
+                "[waylandcraft][ime] submit_key seq={seq} scancode={key_u} keysym={keysym:#x}({sym_name}) {act}"
+            ));
             handled = be.submit_key(crate::host_ime::SubmittedKey {
-                seq: KEY_SEQ.fetch_add(1, Ordering::Relaxed),
+                seq,
                 key: key_u,
                 keysym,
                 evdev: key_u.saturating_sub(8),
