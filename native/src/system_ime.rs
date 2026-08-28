@@ -318,6 +318,11 @@ impl SystemIme {
     ///
     /// 只接受「复用 GLFW 的 wl_display」这一条路径（原生 Wayland 后端）。
     pub fn connect(wl_display_ptr: usize) -> ImeInit {
+        ime_log!(
+            "[waylandcraft][system_ime] native {} (git {})",
+            env!("CARGO_PKG_VERSION"),
+            env!("WAYLANDCRAFT_GIT_HASH")
+        );
         ime_log!("[waylandcraft][system_ime] init (protocol-correct rebuild)");
 
         if wl_display_ptr == 0 {

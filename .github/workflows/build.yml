@@ -48,6 +48,8 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
     - name: Compile native library (release)
       working-directory: native/
+      env:
+        WAYLANDCRAFT_GIT_HASH: ${{ github.sha }}
       run: cargo build --release --target=${{ matrix.platform.target }}
     - name: Move native library
       run: |

@@ -29,10 +29,20 @@ public final class CursorRectReporter {
 			return;
 		}
 		EditBox box = null;
-		for (GuiEventListener child : mc.screen.children()) {
-			if (child instanceof EditBox eb && eb.isFocused()) {
-				box = eb;
-				break;
+		// 优先用 MC 自己的焦点跟踪（Screen.getFocused）：它记录最后一次交互的组件，
+		// 多输入框场景（聊天/搜索/服务器地址共存）不会误取非聚焦框 —— 实测
+		// 遍历 children 检查 isFocused() 会在多个框都返回 true 时取错框，
+		// 导致光标矩形在 y=21 ↔ y=244 间跳变（v0.9.33 实机漂移根因之一）。
+		GuiEventListener focused = mc.screen.getFocused();
+		if (focused instanceof EditBox eb) {
+			box = eb;
+		}
+		if (box == null) {
+			for (GuiEventListener child : mc.screen.children()) {
+				if (child instanceof EditBox eb && eb.isFocused()) {
+					box = eb;
+					break;
+				}
 			}
 		}
 		if (box == null) {
