@@ -57,20 +57,23 @@ const WATCHED_SIGNALS: &[&str] = &[
 /// 能力位（fcitx5-qt platforminputcontext 参考集；缺失则 fcitx5 不发任何
 /// preedit/候选 —— 上游 `updatePreedit()`/`updateSingleComponent<InputPanel>`
 /// 分别检查 Preedit / ClientSideInputPanel）。
+///
+/// 注意：**不声明 `ClientSideInputPanel`(1<<39)** —— 候选窗由桌面输入法
+/// 框架显示（fcitx5 kimpanel / 桌面 panel），不是应用自绘。声明该位会
+/// 让 fcitx5 改走 UpdateClientSideUI 把候选数据发给应用，而我们不自绘。
+/// 光标位置靠 SetCursorRect 上报，让桌面候选窗锚定在光标处（防漂移）。
 const CAP_PREEDIT: u64 = 1 << 1;
 const CAP_FORMATTED_PREEDIT: u64 = 1 << 4;
 const CAP_CLIENT_UNFOCUS_COMMIT: u64 = 1 << 5;
 const CAP_GET_IM_INFO_ON_FOCUS: u64 = 1 << 23;
 const CAP_KEY_EVENT_ORDER_FIX: u64 = 1 << 37;
 const CAP_REPORT_KEY_REPEAT: u64 = 1 << 38;
-const CAP_CLIENT_SIDE_INPUT_PANEL: u64 = 1 << 39;
 const CAPABILITY_FLAGS: u64 = CAP_PREEDIT
     | CAP_FORMATTED_PREEDIT
     | CAP_CLIENT_UNFOCUS_COMMIT
     | CAP_GET_IM_INFO_ON_FOCUS
     | CAP_KEY_EVENT_ORDER_FIX
-    | CAP_REPORT_KEY_REPEAT
-    | CAP_CLIENT_SIDE_INPUT_PANEL;
+    | CAP_REPORT_KEY_REPEAT;
 
 enum ToWorker {
     FocusIn,

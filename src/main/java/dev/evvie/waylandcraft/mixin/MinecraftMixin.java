@@ -22,6 +22,11 @@ public class MinecraftMixin {
 		WaylandCraft.instance.update();
 	}
 	
+	@Inject(method = "runTick", at = @At("HEAD"))
+	public void cursorRectTick(boolean doTick, CallbackInfo info) {
+		dev.evvie.waylandcraft.ime.CursorRectReporter.tick();
+	}
+	
 	@Inject(method = "renderFrame", at = @At(value = "INVOKE_STRING", target = "Lnet/minecraft/util/profiling/ProfilerFiller;push(Ljava/lang/String;)V", args = "ldc=present"))
 	public void hotfixRenderFrame(boolean advanceGameTime, CallbackInfo info) {
 		WindowTranslucencyHotfix.render();

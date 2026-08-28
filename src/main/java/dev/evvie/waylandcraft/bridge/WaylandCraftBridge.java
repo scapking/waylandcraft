@@ -948,6 +948,14 @@ public class WaylandCraftBridge {
 	public void candidateNav(int action, int arg) {
 		candidateNavNative(instance, action, arg);
 	}
+
+	/** 上报焦点文本框光标的屏幕坐标（桌面候选窗锚点，防漂移）。
+	 * 候选窗由桌面输入法框架显示（fcitx5 kimpanel / ibus panel / GNOME 集成），
+	 * 本方法只负责把锚点报准：x/y = 光标左上角，w/h = 光标尺寸。
+	 * 光标移动/文本变化时调用。 */
+	public void updateCursorRect(int x, int y, int w, int h) {
+		updateCursorRectNative(instance, x, y, w, h);
+	}
 	
 	/** 查询 Rust 侧音频捕获链路状态（JSON 字符串），供 /wl audio status 展示。 */
 	public String audioCaptureStatus() {
@@ -1179,6 +1187,9 @@ public class WaylandCraftBridge {
 	
 	// Take candidate-window snapshot (JSON; empty string = no update)
 	private static native String takeLookupTableNative(long instance);
+	
+	// Report focused text-field cursor screen rect (desktop candidate-window anchor)
+	private static native void updateCursorRectNative(long instance, int x, int y, int w, int h);
 	
 	// Query Rust-side audio capture pipeline status (JSON string)
 	private static native String audioCaptureStatusNative(long instance);

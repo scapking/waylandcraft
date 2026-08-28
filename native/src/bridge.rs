@@ -379,6 +379,11 @@ bind_java_type! {
             name = "takeLookupTableNative",
             fn = take_lookup_table,
         },
+        static extern fn update_cursor_rect {
+            sig = (instance: jlong, x: jint, y: jint, w: jint, h: jint),
+            name = "updateCursorRectNative",
+            fn = update_cursor_rect,
+        },
         static extern fn audio_capture_status {
             sig = (instance: jlong) -> JString,
             name = "audioCaptureStatusNative",
@@ -1705,6 +1710,24 @@ fn take_lookup_table<'local>(
         None => String::new(),
     };
     env.new_string(json).map_err(BridgeError::JniError)
+}
+
+/// updateCursorRect(instance, x, y, w, h) —— Java 上报焦点文本框光标屏幕坐标
+/// （桌面候选窗锚点，防漂移核心；fcitx5 SetCursorRect / ibus SetCursorLocationRelative）。
+fn update_cursor_rect<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    x: jint,
+    y: jint,
+    w: jint,
+    h: jint,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "updateCursorRect")?;
+    if let Some(si) = instance.system_ime.as_mut() {
+        si.update_cursor_rect((x, y, w, h));
+    }
+    Ok(())
 }
 
 /// LookupTableSnapshot → 紧凑 JSON（手工序列化，避免引 serde_json）。
