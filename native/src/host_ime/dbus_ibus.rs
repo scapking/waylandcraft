@@ -417,6 +417,12 @@ type StaticFields = Vec<zbus::zvariant::Value<'static>>;
 
 pub(crate) fn body_fields(msg: &zbus::message::Message) -> Result<StaticFields, String> {
     let body = msg.body();
+    // 空 body（无参信号：HidePreeditText / HideLookupTable 等）→ 合法，返回空字段。
+    // zbus 对 Unit 签名 body 的 Debug 显示为 `Unit`（空签名），反序列化 Structure
+    // 会失败 —— v0.9.33 实测在此丢失全部 hide 事件，导致 preedit/候选状态残留。
+    if body.signature() == &zbus::zvariant::Signature::Unit {
+        return Ok(Vec::new());
+    }
     let to_owned = |f: &zbus::zvariant::Value| -> Option<zbus::zvariant::Value<'static>> {
         zbus::zvariant::OwnedValue::try_from(f)
             .ok()
@@ -803,20 +809,18 @@ impl HostImBackend for DbusIbusBackend {
         }
         for cmd in commands {
             match cmd {
-                ImeCommand::Activate(st) => {
+                ImeCommand::Activate(_st) => {
                     self.want_enabled = true;
                     if !self.focused {
                         let _ = self.cmd_tx.send(ToWorker::FocusIn);
                         self.focused = true;
                     }
-                    if let Some(r) = st.cursor_rect {
-                        HostImBackend::update_cursor_rect(self, r);
-                    }
+                    // 光标矩形不取 st.cursor_rect：relay 的 ti3 值在 XWayland 下不可靠
+                    // （MC 不走 ti3，值为空或陈旧），且会与 Java CursorRectReporter 的
+                    // 真实上报互相覆盖导致候选窗漂移。统一以 update_cursor_rect 为准。
                 }
-                ImeCommand::PushState(st) => {
-                    if let Some(r) = st.cursor_rect {
-                        HostImBackend::update_cursor_rect(self, r);
-                    }
+                ImeCommand::PushState(_st) => {
+                    // 同上：不在此更新光标矩形。
                 }
                 ImeCommand::Deactivate => {
                     self.want_enabled = false;

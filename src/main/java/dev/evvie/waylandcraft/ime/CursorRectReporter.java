@@ -46,11 +46,17 @@ public final class CursorRectReporter {
 		}
 		int x = box.getScreenX(box.getCursorPosition());
 		int y = box.getY();
+		// MC 的 getScreenX/getY 是 GUI 逻辑坐标（相对窗口左上，guiScale 坐标系）；
+		// Wayland SetCursorLocationRelative / fcitx5 SetCursorRect 期望 surface 物理像素。
+		// 不乘 scale 时，候选窗锚点差一个 scale 因子 → 输入法"漂移"（v0.9.33 实机根因之一）。
+		int guiScale = (int) Minecraft.getInstance().getWindow().getGuiScale();
+		x *= guiScale;
+		y *= guiScale;
 		if (x != lastX || y != lastY) {
 			lastX = x;
 			lastY = y;
-			// 光标近似矩形：宽 2 高 9（字体行高），桌面候选窗只取左上锚点。
-			WaylandCraft.instance.bridge.updateCursorRect(x, y, 2, 9);
+			// 光标近似矩形：宽 2 高 9（字体行高）→ 物理像素；桌面候选窗只取左上锚点。
+			WaylandCraft.instance.bridge.updateCursorRect(x, y, 2 * guiScale, 9 * guiScale);
 		}
 	}
 }
