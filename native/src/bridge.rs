@@ -364,6 +364,11 @@ bind_java_type! {
             name = "setImeLogFileNative",
             fn = set_ime_log_file,
         },
+        static extern fn native_version {
+            sig = () -> JString,
+            name = "nativeVersionNative",
+            fn = native_version,
+        },
         static extern fn notify_host_focus_gained {
             sig = (instance: jlong),
             name = "notifyHostFocusGainedNative",
@@ -1612,6 +1617,19 @@ fn set_audio_log_file<'local>(
     }
 }
 
+/// nativeVersion() —— 返回 native 构建标识 "0.1.0 (git <short>)"，
+/// Java 加载后立即打印到 latest.log，诊断时无需翻 ime.log 即可确认版本。
+fn native_version<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+) -> Result<JString<'local>, BridgeError> {
+    Ok(env.new_string(format!(
+        "{} (git {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("WAYLANDCRAFT_GIT_HASH")
+    ))?)
+}
+
 /// setImeLogFile(path) —— 让 Rust 侧 [system_ime] 行同时写入文件（默认只进 stderr）。
 /// Java 在 bridge 初始化后调用，路径通常是 .minecraft/waylandcraft-ime.log。
 fn set_ime_log_file<'local>(
@@ -1625,7 +1643,22 @@ fn set_ime_log_file<'local>(
         .append(true)
         .open(&path_str);
     match file {
-        Ok(f) => {
+        Ok(mut f) => {
+            // 每次进程启动写一条运行边界（带 native 版本标识）。
+            // ime.log 是追加模式（不清空），多实例/多版本日志混在一起时，
+            // 用这条分隔行区分"本次运行"的起点 —— 诊断时从最新边界行
+            // 往后读，避免把历史残留（如 log-v3 旧版）误判为当前版本。
+            {
+                use std::io::Write;
+                let _ = writeln!(
+                    f,
+                    "===== WaylandCraft native session start | native {} (git {}) | pid {} =====",
+                    env!("CARGO_PKG_VERSION"),
+                    env!("WAYLANDCRAFT_GIT_HASH"),
+                    std::process::id()
+                );
+                let _ = f.flush();
+            }
             let mut guard = match IME_LOG_FILE.lock() {
                 Ok(g) => g,
                 Err(e) => {

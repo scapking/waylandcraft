@@ -73,6 +73,11 @@ public class WaylandCraftBridge {
 				loaded = true;
 				
 				WaylandCraftCommon.LOGGER.info("Loaded native library from jar");
+				try {
+					WaylandCraftCommon.LOGGER.info("WaylandCraft native version: {}", nativeVersionNative());
+				} catch (UnsatisfiedLinkError | Exception e) {
+					WaylandCraftCommon.LOGGER.warn("WaylandCraft nativeVersionNative unavailable: {}", e.toString());
+				}
 			} catch (IOException e) {
 				e.printStackTrace();
 			} catch (UnsatisfiedLinkError e) {
@@ -1182,6 +1187,10 @@ public class WaylandCraftBridge {
 	
 	// Set Rust-side [system_ime] log file path (eprintln also written to this file)
 	private static native void setImeLogFileNative(String path);
+	/** native 构建标识（"0.1.0 (git <short-hash>)"），用于诊断确认实际加载的
+	 * native 库版本 —— 若与 mod 版本对应的 git hash 不符，说明 jar 内 native
+	 * 未更新或加载了系统残留旧库。 */
+	private static native String nativeVersionNative();
 	private static native void notifyHostFocusGainedNative(long instance);
 	private static native void candidateNavNative(long instance, int action, int arg);
 	
