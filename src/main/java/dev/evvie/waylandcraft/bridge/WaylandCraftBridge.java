@@ -933,6 +933,21 @@ public class WaylandCraftBridge {
 	public void notifyHostFocusGained() {
 		notifyHostFocusGainedNative(instance);
 	}
+
+	/** 取候选窗快照（JSON）。Java 每帧轮询；返回空串表示无新快照。
+	 * 字段：visible / cursor / page_size / orientation / candidates / labels。
+	 * 数据源：ibus UpdateLookupTable / fcitx5 UpdateClientSideUI 归一化。 */
+	public String takeLookupTable() {
+		return takeLookupTableNative(instance);
+	}
+
+	/** 候选窗用户操作 → 宿主输入法。
+	 * action: 0=选字(arg=当前页内下标) 1=上一页 2=下一页。
+	 * fcitx5 走 SelectCandidate/PrevPage/NextPage 专用方法；ibus portal
+	 * 无候选方法（忽略，候选操作走按键通路）。 */
+	public void candidateNav(int action, int arg) {
+		candidateNavNative(instance, action, arg);
+	}
 	
 	/** 查询 Rust 侧音频捕获链路状态（JSON 字符串），供 /wl audio status 展示。 */
 	public String audioCaptureStatus() {
@@ -1160,6 +1175,10 @@ public class WaylandCraftBridge {
 	// Set Rust-side [system_ime] log file path (eprintln also written to this file)
 	private static native void setImeLogFileNative(String path);
 	private static native void notifyHostFocusGainedNative(long instance);
+	private static native void candidateNavNative(long instance, int action, int arg);
+	
+	// Take candidate-window snapshot (JSON; empty string = no update)
+	private static native String takeLookupTableNative(long instance);
 	
 	// Query Rust-side audio capture pipeline status (JSON string)
 	private static native String audioCaptureStatusNative(long instance);

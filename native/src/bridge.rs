@@ -374,6 +374,11 @@ bind_java_type! {
             name = "candidateNavNative",
             fn = candidate_nav,
         },
+        static extern fn take_lookup_table {
+            sig = (instance: jlong) -> JString,
+            name = "takeLookupTableNative",
+            fn = take_lookup_table,
+        },
         static extern fn audio_capture_status {
             sig = (instance: jlong) -> JString,
             name = "audioCaptureStatusNative",
@@ -1681,6 +1686,63 @@ fn candidate_nav<'local>(
         si.candidate_nav(nav);
     }
     Ok(())
+}
+
+/// takeLookupTable(instance) —— 取走候选窗快照（JSON，Java 每帧轮询）。
+///
+/// 返回空串表示无新快照（候选窗应维持上次状态/隐藏）。字段：
+/// `visible` 候选窗可见性、`cursor` 高亮页内下标、`page_size` 页大小、
+/// `orientation` 布局（0=NotSet 1=Vertical 2=Horizontal）、
+/// `candidates`/`labels` 字符串数组。
+fn take_lookup_table<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "takeLookupTable")?;
+    let json = match instance.state.ime.take_lookup_table() {
+        Some(lt) => lookup_table_to_json(&lt),
+        None => String::new(),
+    };
+    env.new_string(json).map_err(BridgeError::JniError)
+}
+
+/// LookupTableSnapshot → 紧凑 JSON（手工序列化，避免引 serde_json）。
+fn lookup_table_to_json(lt: &crate::ime::LookupTableSnapshot) -> String {
+    fn esc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len() + 2);
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+    let cands: Vec<String> = lt
+        .candidates
+        .iter()
+        .map(|s| format!("\"{}\"", esc(s)))
+        .collect();
+    let labels: Vec<String> = lt
+        .labels
+        .iter()
+        .map(|s| format!("\"{}\"", esc(s)))
+        .collect();
+    format!(
+        "{{\"visible\":{},\"cursor\":{},\"page_size\":{},\"orientation\":{},\"candidates\":[{}],\"labels\":[{}]}}",
+        lt.visible,
+        lt.cursor_pos,
+        lt.page_size,
+        lt.orientation,
+        cands.join(","),
+        labels.join(",")
+    )
 }
 
 /// audioCaptureStatus() —— 返回当前音频捕获链路状态（JSON），供 Java /wl audio status 查询。
