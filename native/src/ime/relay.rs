@@ -98,7 +98,9 @@ pub enum TiCommand {
     CommitString(String),
     /// 应用批次。`serial == 0` 表示丢弃标记（协议允许的复位手段），
     /// 否则由 wire 层以 per-instance commit 计数填充后发出。
-    Done { serial: u32 },
+    Done {
+        serial: u32,
+    },
 }
 
 /// 输入法端点发来的单条文本操作（缓冲于 [`Relay::pending_ops`]）。
@@ -176,12 +178,21 @@ impl Relay {
     /// App 侧 enable/disable 生命周期变化。
     ///
     /// enable=true 且 IME 在线 → Activate；enable=false → 清缓冲 + Deactivate。
-    pub fn set_app_enabled(&mut self, enabled: bool) -> Vec<ImeCommand> {
+    /// `reason` 是变化来源（ti3.enable / ti3.disable / focus_lost / 测试），
+    /// 写入日志用于实机诊断 set_active 周期性 toggle 的驱动源（P3）。
+    pub fn set_app_enabled(
+        &mut self,
+        enabled: bool,
+        reason: &str,
+    ) -> Vec<ImeCommand> {
         let mut cmds = Vec::new();
         if enabled == self.app_active {
             return cmds;
         }
         self.app_active = enabled;
+        crate::bridge::ime_log_write(&format!(
+            "[waylandcraft][ime][relay] set_app_enabled {enabled} (reason={reason})"
+        ));
         if enabled {
             if self.ime_present {
                 cmds.push(ImeCommand::Activate(self.last_state.clone()));
@@ -202,7 +213,7 @@ impl Relay {
     /// 等价于强制 disable 并清空全部会话状态。
     pub fn focus_lost(&mut self) -> Vec<ImeCommand> {
         self.last_state = AppState::default();
-        self.set_app_enabled(false)
+        self.set_app_enabled(false, "focus_lost")
     }
 
     /// 推送 App 最新已提交状态（ti3 commit 携带的新值）。
@@ -264,11 +275,15 @@ impl Relay {
         let mut commands = Vec::with_capacity(ops.len() + 1);
         for op in ops {
             match op {
-                ImeOp::Preedit(t, b, e) => commands.push(TiCommand::Preedit(t, b, e)),
+                ImeOp::Preedit(t, b, e) => {
+                    commands.push(TiCommand::Preedit(t, b, e))
+                }
                 ImeOp::DeleteSurrounding(b, a) => {
                     commands.push(TiCommand::DeleteSurrounding(b, a))
                 }
-                ImeOp::CommitString(t) => commands.push(TiCommand::CommitString(t)),
+                ImeOp::CommitString(t) => {
+                    commands.push(TiCommand::CommitString(t))
+                }
             }
         }
         FlushResult {
@@ -286,7 +301,7 @@ mod tests {
     #[test]
     fn enable_before_ime_defers_activation() {
         let mut r = Relay::new();
-        assert!(r.set_app_enabled(true).is_empty());
+        assert!(r.set_app_enabled(true, "test").is_empty());
         assert!(r.app_active());
 
         // IME 迟到上线 → 补发 Activate
@@ -302,11 +317,11 @@ mod tests {
     #[test]
     fn disable_discards_pending_and_deactivates() {
         let mut r = Relay::new();
-        r.set_app_enabled(true);
+        r.set_app_enabled(true, "test");
         r.set_ime_present(true);
 
         r.ime_op(ImeOp::Preedit("ni".into(), 0, 2));
-        let cmds = r.set_app_enabled(false);
+        let cmds = r.set_app_enabled(false, "test");
         assert_eq!(cmds, vec![ImeCommand::Deactivate]);
 
         // 缓冲已清空：flush 无事发生
@@ -321,11 +336,11 @@ mod tests {
     fn serial_accounting_activate_deactivate() {
         let mut r = Relay::new();
         r.set_ime_present(true);
-        r.set_app_enabled(true); // Activate → done#1
+        r.set_app_enabled(true, "test"); // Activate → done#1
         assert_eq!(r.ime_done_count, 1);
-        r.set_app_enabled(false); // Deactivate → done#2
+        r.set_app_enabled(false, "test"); // Deactivate → done#2
         assert_eq!(r.ime_done_count, 2);
-        r.set_app_enabled(true); // Activate → done#3
+        r.set_app_enabled(true, "test"); // Activate → done#3
         assert_eq!(r.ime_done_count, 3);
 
         // IME 以旧 serial 提交 → 丢弃（缓冲被清空）
@@ -336,17 +351,14 @@ mod tests {
         r.ime_op(ImeOp::CommitString("你好".into()));
         let fr = r.ime_commit(3);
         assert!(fr.applied);
-        assert_eq!(
-            fr.commands,
-            vec![TiCommand::CommitString("你好".into())]
-        );
+        assert_eq!(fr.commands, vec![TiCommand::CommitString("你好".into())]);
     }
 
     /// PushState 属于带 done 的状态更新，必须推进计数。
     #[test]
     fn push_state_advances_serial() {
         let mut r = Relay::new();
-        r.set_app_enabled(true);
+        r.set_app_enabled(true, "test");
         r.set_ime_present(true); // Activate → 1
         assert_eq!(r.ime_done_count, 1);
 
@@ -370,19 +382,30 @@ mod tests {
     fn pinyin_composition_flow() {
         let mut r = Relay::new();
         r.set_ime_present(true);
-        r.set_app_enabled(true);
+        r.set_app_enabled(true, "test");
 
         // nihao 逐键演进的 preedit。
         // 协议语义：IME 的 commit(serial) 回填「已收到的 done 计数」；组合期间
         // 合成器不推送新状态 → 不发新 done → 每步回填同一 serial（Activate 后=1）。
         // 这正是真实 fcitx5 的行为。
         for s in ["n", "ni", "nih", "niha", "nihao"] {
-            r.ime_op(ImeOp::Preedit(s.to_string(), s.len() as i32, s.len() as i32));
+            r.ime_op(ImeOp::Preedit(
+                s.to_string(),
+                s.len() as i32,
+                s.len() as i32,
+            ));
             let fr = r.ime_commit(1);
             assert!(fr.applied, "step {s} should apply");
             // FlushResult 只含操作命令；done 由 wire 层按协议补发。
             assert_eq!(fr.commands.len(), 1, "step {s}");
-            assert_eq!(fr.commands[0], TiCommand::Preedit(s.to_string(), s.len() as i32, s.len() as i32));
+            assert_eq!(
+                fr.commands[0],
+                TiCommand::Preedit(
+                    s.to_string(),
+                    s.len() as i32,
+                    s.len() as i32
+                )
+            );
         }
 
         // 选定候选「你好」：preedit 清空 + commit string 同批（仍回填 serial=1）
@@ -404,7 +427,7 @@ mod tests {
     fn delete_then_commit_order_preserved() {
         let mut r = Relay::new();
         r.set_ime_present(true);
-        r.set_app_enabled(true);
+        r.set_app_enabled(true, "test");
 
         r.ime_op(ImeOp::DeleteSurrounding(3, 0));
         r.ime_op(ImeOp::CommitString("你".into()));
@@ -425,7 +448,7 @@ mod tests {
     fn focus_lost_rejects_late_ops() {
         let mut r = Relay::new();
         r.set_ime_present(true);
-        r.set_app_enabled(true);
+        r.set_app_enabled(true, "test");
         let cmds = r.focus_lost();
         assert_eq!(cmds, vec![ImeCommand::Deactivate]);
 
@@ -438,7 +461,7 @@ mod tests {
     #[test]
     fn ime_restart_resets_serial() {
         let mut r = Relay::new();
-        r.set_app_enabled(true);
+        r.set_app_enabled(true, "test");
         r.set_ime_present(true); // done#1
         assert_eq!(r.ime_done_count, 1);
 

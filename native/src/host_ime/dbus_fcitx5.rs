@@ -30,7 +30,7 @@ use super::{CandidateNav, ForwardedKey, HostImBackend, SubmittedKey};
 use crate::ime::ImeCommand;
 use crate::seat::KeyboardAction;
 use crate::system_ime::{HostEvent, ImeInit};
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
@@ -97,10 +97,7 @@ enum ToWorker {
 
 enum FromWorker {
     Ready,
-    KeyReply {
-        seq: u64,
-        consumed: bool,
-    },
+    KeyReply { seq: u64, consumed: bool },
     Ev(HostEvent),
     Forward(ForwardedKey),
     Fatal(String),
@@ -118,26 +115,49 @@ pub struct DbusFcitx5Backend {
     ev_rx: Receiver<FromWorker>,
     events: Vec<HostEvent>,
     pending: VecDeque<PendingKey>,
+    /// P1：被 IME 消费（consumed）的按键；其 release 到达时直接配对吃掉。
+    ime_consumed: HashSet<u32>,
+    /// P1：press 仍在裁决中时到达的 release，挂起等待裁决。
+    release_waiting: VecDeque<u32>,
     forwards: Vec<ForwardedKey>,
     ready: bool,
     dead: Option<String>,
     want_enabled: bool,
     focused: bool,
     last_cursor: Option<(i32, i32, i32, i32)>,
+    /// P2：ti3 光标优先（WaylandCraft 世界内窗口）；true 时 Java 上报不覆盖。
+    cursor_prefer_ti3: bool,
 }
 
 impl DbusFcitx5Backend {
+    /// P2：ti3 上报光标（经 relay st.cursor_rect）→ fcitx5 SetCursorRect。
+    fn set_cursor_from_ti3(&mut self, rect: (i32, i32, i32, i32)) {
+        if self.last_cursor == Some(rect) {
+            return;
+        }
+        self.last_cursor = Some(rect);
+        let (x, y, w, h) = rect;
+        ime_log!(
+            "[waylandcraft][host_ime][dbus-fcitx5] SetCursorRect (ti3) ({x},{y},{w},{h})"
+        );
+        let _ = self.cmd_tx.send(ToWorker::SetCursorRect(x, y, w, h));
+    }
+
     pub fn connect() -> ImeInit {
         ime_log!("[waylandcraft][host_ime][dbus-fcitx5] probing...");
         // 服务在不在：GetNameOwner 快速探测（复用 ibus 的分类逻辑）。
         match super::dbus_ibus::probe_service_owner(FCITX_SERVICE) {
             Ok(()) => {}
             Err(super::dbus_ibus::ProbeErr::Unsupported(msg)) => {
-                ime_log!("[waylandcraft][host_ime][dbus-fcitx5] UNSUPPORTED: {msg}");
+                ime_log!(
+                    "[waylandcraft][host_ime][dbus-fcitx5] UNSUPPORTED: {msg}"
+                );
                 return ImeInit::Unsupported(format!("dbus-fcitx5: {msg}"));
             }
             Err(super::dbus_ibus::ProbeErr::Transient(msg)) => {
-                ime_log!("[waylandcraft][host_ime][dbus-fcitx5] TRANSIENT: {msg}");
+                ime_log!(
+                    "[waylandcraft][host_ime][dbus-fcitx5] TRANSIENT: {msg}"
+                );
                 return ImeInit::Transient(format!("dbus-fcitx5: {msg}"));
             }
         }
@@ -160,28 +180,37 @@ impl DbusFcitx5Backend {
             ev_rx,
             events: Vec::new(),
             pending: VecDeque::new(),
+            ime_consumed: HashSet::new(),
+            release_waiting: VecDeque::new(),
             forwards: Vec::new(),
             ready: false,
             dead: None,
             want_enabled: false,
             focused: false,
             last_cursor: None,
+            cursor_prefer_ti3: false,
         }))
     }
 
     #[cfg(test)]
-    fn from_parts(cmd_tx: Sender<ToWorker>, ev_rx: Receiver<FromWorker>) -> Self {
+    fn from_parts(
+        cmd_tx: Sender<ToWorker>,
+        ev_rx: Receiver<FromWorker>,
+    ) -> Self {
         Self {
             cmd_tx,
             ev_rx,
             events: Vec::new(),
             pending: VecDeque::new(),
+            ime_consumed: HashSet::new(),
+            release_waiting: VecDeque::new(),
             forwards: Vec::new(),
             ready: true,
             dead: None,
             want_enabled: false,
             focused: false,
             last_cursor: None,
+            cursor_prefer_ti3: false,
         }
     }
 }
@@ -206,12 +235,10 @@ fn connect_input_context() -> Result<IcConnections, String> {
     let reply: (zbus::zvariant::OwnedObjectPath, Vec<u8>) = factory
         .call::<_, _, (zbus::zvariant::OwnedObjectPath, Vec<u8>)>(
             "CreateInputContext",
-            &((
-                vec![
-                    ("program".to_string(), "waylandcraft".to_string()),
-                    ("display".to_string(), String::new()),
-                ],
-            )),
+            &((vec![
+                ("program".to_string(), "waylandcraft".to_string()),
+                ("display".to_string(), String::new()),
+            ],)),
         )
         .map_err(|e| format!("CreateInputContext: {e}"))?;
     let ic_path = reply.0;
@@ -246,8 +273,11 @@ fn command_loop(
     match ic_conns
         .ic
         .call::<_, _, ()>("SetSupportedCapability", &(CAPABILITY_FLAGS,))
-        .and_then(|_| ic_conns.ic.call::<_, _, ()>("SetCapability", &(CAPABILITY_FLAGS,)))
-    {
+        .and_then(|_| {
+            ic_conns
+                .ic
+                .call::<_, _, ()>("SetCapability", &(CAPABILITY_FLAGS,))
+        }) {
         Ok(()) => ime_log!(
             "[waylandcraft][host_ime][dbus-fcitx5] SetCapability({CAPABILITY_FLAGS:#x}) ok"
         ),
@@ -260,20 +290,25 @@ fn command_loop(
         let ic = ic_conns.ic.clone();
         let ev_tx = ev_tx.clone();
         let name = (*sig).to_string();
-        super::dbus_ibus::spawn_thread("wc-fcitx5-sig", move || match ic.receive_signal(name.as_str()) {
-            Ok(iter) => {
-                for msg in iter {
-                    if let Err(e) = handle_signal(&name, &msg, &ev_tx) {
-                        ime_log!(
-                            "[waylandcraft][host_ime][dbus-fcitx5] signal {name} 解析失败: {e}"
-                        );
+        super::dbus_ibus::spawn_thread("wc-fcitx5-sig", move || {
+            match ic.receive_signal(name.as_str()) {
+                Ok(iter) => {
+                    for msg in iter {
+                        if let Err(e) = handle_signal(&name, &msg, &ev_tx) {
+                            ime_log!(
+                                "[waylandcraft][host_ime][dbus-fcitx5] signal {name} 解析失败: {e}"
+                            );
+                        }
                     }
+                    let _ = ev_tx.send(FromWorker::Fatal(format!(
+                        "signal {name} 流结束"
+                    )));
                 }
-                let _ = ev_tx.send(FromWorker::Fatal(format!("signal {name} 流结束")));
-            }
-            Err(e) => {
-                let _ =
-                    ev_tx.send(FromWorker::Fatal(format!("订阅信号 {name} 失败: {e}")));
+                Err(e) => {
+                    let _ = ev_tx.send(FromWorker::Fatal(format!(
+                        "订阅信号 {name} 失败: {e}"
+                    )));
+                }
             }
         });
     }
@@ -366,7 +401,9 @@ fn parse_formatted_preedit(
             }
             // 尾随顶层 i32 = 拼接后字符串中的总游标位置。
             other => {
-                if cursor.is_none() && let Some(n) = find_int(std::slice::from_ref(other)) {
+                if cursor.is_none()
+                    && let Some(n) = find_int(std::slice::from_ref(other))
+                {
                     cursor = Some(n as i32);
                 }
             }
@@ -398,7 +435,9 @@ fn parse_formatted_preedit(
 /// （preedit, cursorpos, auxUp, auxDown, candidates[(label,text+comment)],
 ///  candidateIndex, layoutHint, hasPrev, hasNext）。
 /// 归一到 [`HostEvent::LookupTable`]；preedit/aux 由游戏侧其它路径消费。
-fn parse_candidate_panel(fields: &[zbus::zvariant::Value<'static>]) -> Option<HostEvent> {
+fn parse_candidate_panel(
+    fields: &[zbus::zvariant::Value<'static>],
+) -> Option<HostEvent> {
     use super::dbus_ibus::{as_array, as_structure, field_peeled};
     let mut candidates = Vec::new();
     let mut labels = Vec::new();
@@ -406,10 +445,12 @@ fn parse_candidate_panel(fields: &[zbus::zvariant::Value<'static>]) -> Option<Ho
         for item in arr.iter() {
             if let Some(st) = as_structure(item) {
                 let f = st.fields();
-                if let Some(zbus::zvariant::Value::Str(l)) = field_peeled(f, 0) {
+                if let Some(zbus::zvariant::Value::Str(l)) = field_peeled(f, 0)
+                {
                     labels.push(l.as_str().to_string());
                 }
-                if let Some(zbus::zvariant::Value::Str(t)) = field_peeled(f, 1) {
+                if let Some(zbus::zvariant::Value::Str(t)) = field_peeled(f, 1)
+                {
                     candidates.push(t.as_str().to_string());
                 }
             }
@@ -423,8 +464,14 @@ fn parse_candidate_panel(fields: &[zbus::zvariant::Value<'static>]) -> Option<Ho
         Some(zbus::zvariant::Value::I32(n)) => *n,
         _ => 0,
     };
-    let has_prev = matches!(field_peeled(fields, 7), Some(zbus::zvariant::Value::Bool(true)));
-    let has_next = matches!(field_peeled(fields, 8), Some(zbus::zvariant::Value::Bool(true)));
+    let has_prev = matches!(
+        field_peeled(fields, 7),
+        Some(zbus::zvariant::Value::Bool(true))
+    );
+    let has_next = matches!(
+        field_peeled(fields, 8),
+        Some(zbus::zvariant::Value::Bool(true))
+    );
     let visible = !candidates.is_empty() || has_prev || has_next;
     Some(HostEvent::LookupTable {
         candidates,
@@ -463,15 +510,27 @@ fn handle_signal(
                 ime_log!(
                     "[waylandcraft][host_ime][dbus-fcitx5] preedit {text:?} cursor={cursor}"
                 );
-                push_with_done(ev_tx, HostEvent::PreeditString(text, cursor, cursor));
+                push_with_done(
+                    ev_tx,
+                    HostEvent::PreeditString(text, cursor, cursor),
+                );
             } else {
-                push_with_done(ev_tx, HostEvent::PreeditString(String::new(), 0, 0));
+                push_with_done(
+                    ev_tx,
+                    HostEvent::PreeditString(String::new(), 0, 0),
+                );
             }
         }
         "UpdateClientSideUI" => {
             let ev = parse_candidate_panel(&fields)
                 .ok_or_else(|| "UpdateClientSideUI 解析失败".to_string())?;
-            if let HostEvent::LookupTable { candidates, visible, cursor_pos, .. } = &ev {
+            if let HostEvent::LookupTable {
+                candidates,
+                visible,
+                cursor_pos,
+                ..
+            } = &ev
+            {
                 ime_log!(
                     "[waylandcraft][host_ime][dbus-fcitx5] candidate panel {} visible={} cursor={}",
                     candidates.len(),
@@ -491,14 +550,14 @@ fn handle_signal(
                 .unwrap_or(Some(0))
                 .unwrap_or(0) as u32;
             let (before, after) = if offset <= 0 {
-                (
-                    (-offset) as u32,
-                    nchars.saturating_sub((-offset) as u32),
-                )
+                ((-offset) as u32, nchars.saturating_sub((-offset) as u32))
             } else {
                 (0u32, nchars)
             };
-            push_with_done(ev_tx, HostEvent::DeleteSurroundingText(before, after));
+            push_with_done(
+                ev_tx,
+                HostEvent::DeleteSurroundingText(before, after),
+            );
         }
         "ForwardKey" => {
             let nums: Vec<i64> = fields
@@ -535,6 +594,8 @@ impl HostImBackend for DbusFcitx5Backend {
             return;
         }
         self.want_enabled = active;
+        // P2：光标源随 app_active 切换（同 dbus-ibus）。
+        self.cursor_prefer_ti3 = active;
         if active {
             let _ = self.cmd_tx.send(ToWorker::FocusIn);
             self.focused = true;
@@ -552,21 +613,26 @@ impl HostImBackend for DbusFcitx5Backend {
             match cmd {
                 ImeCommand::Activate(st) => {
                     self.want_enabled = true;
+                    // P2：ti3 会话激活 → ti3 光标优先。
+                    self.cursor_prefer_ti3 = true;
                     if !self.focused {
                         let _ = self.cmd_tx.send(ToWorker::FocusIn);
                         self.focused = true;
                     }
                     if let Some(r) = st.cursor_rect {
-                        HostImBackend::update_cursor_rect(self, r);
+                        self.set_cursor_from_ti3(r);
                     }
                 }
                 ImeCommand::PushState(st) => {
+                    // P2：PushState 仅在 app_active（ti3 会话启用）时由 relay 产生，
+                    // st.cursor_rect 即世界内窗口实时光标，直接用。
                     if let Some(r) = st.cursor_rect {
-                        HostImBackend::update_cursor_rect(self, r);
+                        self.set_cursor_from_ti3(r);
                     }
                 }
                 ImeCommand::Deactivate => {
                     self.want_enabled = false;
+                    self.cursor_prefer_ti3 = false;
                     if self.focused {
                         let _ = self.cmd_tx.send(ToWorker::FocusOut);
                         self.focused = false;
@@ -584,16 +650,52 @@ impl HostImBackend for DbusFcitx5Backend {
             match self.ev_rx.try_recv() {
                 Ok(FromWorker::Ready) => {
                     self.ready = true;
-                    ime_log!("[waylandcraft][host_ime][dbus-fcitx5] READY (main side)");
+                    ime_log!(
+                        "[waylandcraft][host_ime][dbus-fcitx5] READY (main side)"
+                    );
                 }
-                Ok(FromWorker::KeyReply { seq, consumed }) => match self.pending.front() {
+                Ok(FromWorker::KeyReply { seq, consumed }) => match self
+                    .pending
+                    .front()
+                {
                     Some(p) if p.seq == seq => {
-                        let p = self.pending.pop_front().expect("front checked");
+                        let p =
+                            self.pending.pop_front().expect("front checked");
                         if !consumed {
                             self.forwards.push(ForwardedKey {
                                 key: p.key,
                                 action: p.action,
                             });
+                            // P1：press 放行 → 挂起的 release 一并补投递。
+                            if let Some(pos) = self
+                                .release_waiting
+                                .iter()
+                                .position(|k| *k == p.key)
+                            {
+                                self.release_waiting.remove(pos);
+                                self.forwards.push(ForwardedKey {
+                                    key: p.key,
+                                    action: KeyboardAction::Release,
+                                });
+                                ime_log!(
+                                    "[waylandcraft][host_ime][dbus-fcitx5] release key={} 挂起配对 press(放行) -> 补投递",
+                                    p.key
+                                );
+                            }
+                        } else {
+                            // P1：press 被 IME 消费 → release 配对吃掉。
+                            self.ime_consumed.insert(p.key);
+                            if let Some(pos) = self
+                                .release_waiting
+                                .iter()
+                                .position(|k| *k == p.key)
+                            {
+                                self.release_waiting.remove(pos);
+                                ime_log!(
+                                    "[waylandcraft][host_ime][dbus-fcitx5] release key={} 挂起配对 press(consumed) -> 丢弃",
+                                    p.key
+                                );
+                            }
                         }
                     }
                     other => {
@@ -601,13 +703,35 @@ impl HostImBackend for DbusFcitx5Backend {
                             "[waylandcraft][host_ime][dbus-fcitx5] KeyReply seq={seq} 错位（队首 {:?}）-> 重同步丢弃",
                             other.map(|p| p.seq)
                         );
+                        let lost_key = self
+                            .pending
+                            .iter()
+                            .find(|p| p.seq == seq)
+                            .map(|p| p.key);
                         self.pending.retain(|p| p.seq != seq);
+                        if let Some(key) = lost_key
+                            && let Some(pos) = self
+                                .release_waiting
+                                .iter()
+                                .position(|k| *k == key)
+                        {
+                            self.release_waiting.remove(pos);
+                            self.forwards.push(ForwardedKey {
+                                key,
+                                action: KeyboardAction::Release,
+                            });
+                            ime_log!(
+                                "[waylandcraft][host_ime][dbus-fcitx5] KeyReply 错位 seq={seq} key={key} -> release 补投递（避免卡键）"
+                            );
+                        }
                     }
                 },
                 Ok(FromWorker::Ev(e)) => self.events.push(e),
                 Ok(FromWorker::Forward(f)) => self.forwards.push(f),
                 Ok(FromWorker::Fatal(msg)) => {
-                    ime_log!("[waylandcraft][host_ime][dbus-fcitx5] FATAL: {msg}");
+                    ime_log!(
+                        "[waylandcraft][host_ime][dbus-fcitx5] FATAL: {msg}"
+                    );
                     self.dead = Some(msg);
                     return;
                 }
@@ -632,6 +756,29 @@ impl HostImBackend for DbusFcitx5Backend {
         if !self.ready || self.dead.is_some() {
             return false;
         }
+        // P1：release 跟随 press 裁决（同 dbus-ibus）。
+        if sk.action == KeyboardAction::Release {
+            if self.ime_consumed.contains(&sk.key) {
+                self.ime_consumed.remove(&sk.key);
+                ime_log!(
+                    "[waylandcraft][host_ime][dbus-fcitx5] release key={} 配对 press(consumed) -> 丢弃",
+                    sk.key
+                );
+                return true;
+            }
+            if self
+                .pending
+                .iter()
+                .any(|p| p.key == sk.key && p.action != KeyboardAction::Release)
+            {
+                self.release_waiting.push_back(sk.key);
+                ime_log!(
+                    "[waylandcraft][host_ime][dbus-fcitx5] release key={} press 未裁决 -> 挂起等待",
+                    sk.key
+                );
+                return true;
+            }
+        }
         self.pending.push_back(PendingKey {
             seq: sk.seq,
             key: sk.key,
@@ -653,7 +800,9 @@ impl HostImBackend for DbusFcitx5Backend {
             return;
         }
         let cmd = match nav {
-            CandidateNav::SelectCandidate(i) => ToWorker::SelectCandidate(i as i32),
+            CandidateNav::SelectCandidate(i) => {
+                ToWorker::SelectCandidate(i as i32)
+            }
             CandidateNav::PrevPage => ToWorker::PrevPage,
             CandidateNav::NextPage => ToWorker::NextPage,
         };
@@ -662,11 +811,22 @@ impl HostImBackend for DbusFcitx5Backend {
     }
 
     fn update_cursor_rect(&mut self, rect: (i32, i32, i32, i32)) {
+        // P2：ti3 优先态下 Java 上报不覆盖（同 dbus-ibus）。
+        if self.cursor_prefer_ti3 {
+            ime_log!(
+                "[waylandcraft][host_ime][dbus-fcitx5] Java update_cursor_rect {:?} 忽略（ti3 光标优先）",
+                rect
+            );
+            return;
+        }
         if self.last_cursor == Some(rect) {
             return;
         }
         self.last_cursor = Some(rect);
         let (x, y, w, h) = rect;
+        ime_log!(
+            "[waylandcraft][host_ime][dbus-fcitx5] SetCursorRect (java) ({x},{y},{w},{h})"
+        );
         let _ = self.cmd_tx.send(ToWorker::SetCursorRect(x, y, w, h));
     }
 
@@ -743,9 +903,7 @@ mod tests {
         // a(ss) candidates, i idx, i layoutHint, b hasPrev, b hasNext
         let empty_arr = || {
             zv::Value::Array(
-                Vec::<zv::Value>::new()
-                    .try_into()
-                    .expect("empty array"),
+                Vec::<zv::Value>::new().try_into().expect("empty array"),
             )
         };
         let fields = vec![

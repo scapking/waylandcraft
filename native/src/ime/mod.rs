@@ -47,9 +47,9 @@ use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::{
 };
 use smithay::reexports::wayland_server::{DisplayHandle, Resource};
 
+use crate::WLCState;
 use crate::seat::KeyboardAction;
 use crate::utils::{get_time, new_serial};
-use crate::WLCState;
 
 /// 当前生效的输入法端点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -195,13 +195,20 @@ impl ImeState {
     // ── 焦点入口（bridge.rs keyboard_focus / keyboard_unfocus 调用）──
 
     /// 键盘焦点切到某 surface：更新 ti3 焦点并同步 Relay 会话状态。
-    pub fn set_focus(&mut self, surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface) {
+    pub fn set_focus(
+        &mut self,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) {
         let had_focus = self.ti3.focus_surface().is_some();
         let switched = self.ti3.enter(surface);
         // 焦点在两个 surface 间直接切换（A→B 不经过空焦点）时，
         // 旧会话必须显式终结：否则 B 的 enable 会被误判为会话延续，
         // IME 收不到重新激活（对应测试场景「输入框 A → 输入框 B」）。
         if switched && had_focus && self.relay.app_active() {
+            // P3 来源日志：surface 直接切换（A→B）触发 focus_lost。
+            crate::bridge::ime_log_write(
+                "[waylandcraft][ime][ti3] focus switched A->B -> focus_lost",
+            );
             let cmds = self.relay.focus_lost();
             self.execute_ime_commands(cmds);
         }
@@ -226,12 +233,22 @@ impl ImeState {
         let cmds = match outcome {
             O::Ignored | O::DisabledInactive => Vec::new(),
             O::Enabled(st) => {
+                // P3 来源日志：app_active 变 true 的驱动源。
+                crate::bridge::ime_log_write(
+                    "[waylandcraft][ime][ti3] outcome=Enabled -> set_app_enabled(true, ti3.enable)",
+                );
                 // 先把首批状态灌入 relay 缓存（未激活时只更新不产出命令），
                 // 使随后的 Activate 单周期携带最新状态，避免多余的 done 往返。
                 let _ = ime.relay.push_app_state(st);
-                ime.relay.set_app_enabled(true)
+                ime.relay.set_app_enabled(true, "ti3.enable")
             }
-            O::Disabled => ime.relay.set_app_enabled(false),
+            O::Disabled => {
+                // P3 来源日志：app_active 变 false 的驱动源。
+                crate::bridge::ime_log_write(
+                    "[waylandcraft][ime][ti3] outcome=Disabled -> set_app_enabled(false, ti3.disable)",
+                );
+                ime.relay.set_app_enabled(false, "ti3.disable")
+            }
             O::State(st) => ime.relay.push_app_state(st),
         };
         ime.execute_ime_commands(cmds);
@@ -258,11 +275,17 @@ impl ImeState {
             );
             return;
         };
-        let Some(inst) = self.ti3.instance_mut(&active_id) else { return };
+        let Some(inst) = self.ti3.instance_mut(&active_id) else {
+            return;
+        };
         for cmd in commands {
             match cmd {
-                TiCommand::Preedit(t, b, e) => inst.obj.preedit_string(Some(t), b, e),
-                TiCommand::DeleteSurrounding(b, a) => inst.obj.delete_surrounding_text(b, a),
+                TiCommand::Preedit(t, b, e) => {
+                    inst.obj.preedit_string(Some(t), b, e)
+                }
+                TiCommand::DeleteSurrounding(b, a) => {
+                    inst.obj.delete_surrounding_text(b, a)
+                }
                 TiCommand::CommitString(t) => inst.obj.commit_string(Some(t)),
                 TiCommand::Done { .. } => unreachable!("relay 不产出 Done"),
             }
@@ -312,7 +335,10 @@ impl ImeState {
     /// 宿主穿透事件入站（lib.rs 每帧从 SystemIme 取出后灌入）。
     ///
     /// 保序处理：文本操作进 Relay 缓冲，Done 触发原子应用。
-    pub fn passthrough_events(&mut self, events: Vec<crate::system_ime::HostEvent>) {
+    pub fn passthrough_events(
+        &mut self,
+        events: Vec<crate::system_ime::HostEvent>,
+    ) {
         use crate::system_ime::HostEvent;
         for ev in events {
             match ev {
@@ -320,12 +346,24 @@ impl ImeState {
                     // 焦点路由由 SystemIme 内部状态机消费（enable 门控），
                     // 对游戏内会话无语义影响。
                 }
-                HostEvent::CommitString(t) => self.relay.ime_op(ImeOp::CommitString(t)),
-                HostEvent::PreeditString(t, b, e) => self.relay.ime_op(ImeOp::Preedit(t, b, e)),
+                HostEvent::CommitString(t) => {
+                    self.relay.ime_op(ImeOp::CommitString(t))
+                }
+                HostEvent::PreeditString(t, b, e) => {
+                    self.relay.ime_op(ImeOp::Preedit(t, b, e))
+                }
                 HostEvent::DeleteSurroundingText(b, a) => {
                     self.relay.ime_op(ImeOp::DeleteSurrounding(b, a))
                 }
-                HostEvent::LookupTable { candidates, labels, cursor_pos, cursor_visible, page_size, orientation, visible } => {
+                HostEvent::LookupTable {
+                    candidates,
+                    labels,
+                    cursor_pos,
+                    cursor_visible,
+                    page_size,
+                    orientation,
+                    visible,
+                } => {
                     // 候选窗数据：不进 relay 文本流，直接进 UI 快照供 Java 自绘候选窗。
                     self.lookup_table = Some(LookupTableSnapshot {
                         candidates,
@@ -338,7 +376,10 @@ impl ImeState {
                     });
                     crate::bridge::ime_log_write(&format!(
                         "[waylandcraft][ime] lookup_table updated: {} candidates visible={}",
-                        self.lookup_table.as_ref().map(|l| l.candidates.len()).unwrap_or(0),
+                        self.lookup_table
+                            .as_ref()
+                            .map(|l| l.candidates.len())
+                            .unwrap_or(0),
                         visible
                     ));
                 }
@@ -388,8 +429,15 @@ impl ImeState {
 
     /// 按键转发给输入法 grab（当其存在时）。返回 true 表示已被 IME 消费。
     /// `key` 为 xkb keycode（evdev+8）；wire 侧还原为 evdev。
-    pub fn handle_key(&mut self, key: u32, action: KeyboardAction, mods: (u32, u32, u32, u32)) -> bool {
-        let Some(grab) = &self.im2.grab else { return false };
+    pub fn handle_key(
+        &mut self,
+        key: u32,
+        action: KeyboardAction,
+        mods: (u32, u32, u32, u32),
+    ) -> bool {
+        let Some(grab) = &self.im2.grab else {
+            return false;
+        };
         let serial = new_serial();
         let wire = key.saturating_sub(8);
         grab.key(serial, get_time(), wire, action.key_state());
