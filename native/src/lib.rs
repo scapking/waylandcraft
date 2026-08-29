@@ -412,11 +412,12 @@ impl<'a> WaylandCraft<'a> {
         // 待办：实现 XIM server（X11 应用）+ im1 global（ibus-wayland）
         //       + host_bridge 跟 im2 grab / XIM / im1 三路对接
 
-        // host_bridge 每帧 drain 上行事件（commit/preedit/delete/lookup）。
-        // C 方案 XIM server 上线后这些事件会通过这里灌入 relay；当前 no-op。
+        // host_bridge 每帧 drain 上行事件（commit/preedit/delete/lookup），
+        // 灌入 relay → 原子推到 firefox 等嵌套应用的 ti3 text_input。
         if let Some(hb) = &mut self.host_bridge {
-            let _batches = hb.take_up_events_batched();
-            // TODO: 把 batches 通过 ime.apply_im_events() 灌入 relay
+            for batch in hb.take_up_events_batched() {
+                self.state.ime.apply_up_events(batch);
+            }
         }
 
         let state = &mut self.state;

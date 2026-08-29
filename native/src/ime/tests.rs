@@ -902,3 +902,101 @@ fn test_direct_focus_switch_a_to_b() {
         "切换后组合应落在新的激活实例上"
     );
 }
+
+/// host_bridge 上行 UpEvent 灌入 relay：commit 推到嵌套应用 ti3。
+#[test]
+fn host_bridge_commit_propagates_to_ti3() {
+    use crate::ime::{Commit, Done, UpEvent};
+    let mut f = setup_with_ime(false); // 无 im2 grab
+    f.focus_and_enable();
+
+    // 模拟 host_bridge 上行：commit "你" + Done
+    f.server
+        .ime
+        .apply_up_events(vec![UpEvent::Commit(Commit { text: "你".into() }), UpEvent::Done(Done { batch_id: 1 })]);
+
+    f.display.flush_clients().unwrap();
+    f.editor.dispatch_pending();
+
+    assert!(
+        f.editor.state.ti_events.contains(&"commit(\"你\")".to_string()),
+        "commit 应推到 firefox ti3 text_input；实际: {:?}",
+        f.editor.state.ti_events
+    );
+}
+
+/// host_bridge 上行 Preedit + Done 推到 ti3（preedit 显示在 firefox 文本框）。
+#[test]
+fn host_bridge_preedit_propagates_to_ti3() {
+    use crate::ime::{Done, PreeditUpdate, UpEvent};
+    let mut f = setup_with_ime(false);
+    f.focus_and_enable();
+
+    f.server.ime.apply_up_events(vec![
+        UpEvent::Preedit(PreeditUpdate::set("年", 0, 1)),
+        UpEvent::Done(Done { batch_id: 1 }),
+    ]);
+
+    f.display.flush_clients().unwrap();
+    f.editor.dispatch_pending();
+
+    assert!(
+        f.editor.state.ti_events.contains(&"preedit(\"年\",0,1)".to_string()),
+        "preedit 应推到 ti3；实际: {:?}",
+        f.editor.state.ti_events
+    );
+}
+
+/// LookupTable 在 host_bridge 路径上**被忽略**（mod 不自绘候选窗）。
+/// 这是 C 方案决策：候选窗由宿主 IME 框架（kimpanel/ibus panel/GNOME）画。
+#[test]
+fn host_bridge_lookup_table_is_ignored() {
+    use crate::ime::{Done, LookupTable, UpEvent};
+    let mut f = setup_with_ime(false);
+    f.focus_and_enable();
+    let baseline = f.editor.state.ti_events.len();
+
+    f.server.ime.apply_up_events(vec![
+        UpEvent::LookupTable(LookupTable {
+            candidates: vec!["一".into()],
+            labels: vec![],
+            cursor_pos: 0,
+            cursor_visible: true,
+            page_size: 9,
+            orientation: 0,
+            visible: true,
+        }),
+        UpEvent::Done(Done { batch_id: 1 }),
+    ]);
+
+    f.display.flush_clients().unwrap();
+    f.editor.dispatch_pending();
+
+    // LookupTable 不应产生任何**新** wire 事件（相对于 baseline）
+    let new_events: Vec<_> = f.editor.state.ti_events.iter().skip(baseline).collect();
+    assert!(
+        new_events.is_empty(),
+        "LookupTable 在 host_bridge 路径不应推送到 ti3；新增: {new_events:?}"
+    );
+}
+
+/// host_bridge 在 app_active=false 时收到事件 → flush NOT applied（保留缓冲）。
+#[test]
+fn host_bridge_events_buffered_when_app_inactive() {
+    use crate::ime::{Commit, Done, UpEvent};
+    let mut f = setup_with_ime(false);
+    // 不调 focus_and_enable —— app_active=false
+
+    f.server
+        .ime
+        .apply_up_events(vec![UpEvent::Commit(Commit { text: "你".into() }), UpEvent::Done(Done { batch_id: 1 })]);
+
+    // Done 触发 flush，但 app_active=false → 不应用
+    // buffered 保留
+    f.display.flush_clients().unwrap();
+    f.editor.dispatch_pending();
+    assert!(
+        f.editor.state.ti_events.is_empty(),
+        "app_active=false 时 commit 不应推到 ti3"
+    );
+}

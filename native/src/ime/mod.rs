@@ -273,9 +273,59 @@ impl ImeState {
     }
 
     // ── 内部 IME 事件流（协议无关）──
-    // C 方案下一阶段：所有 IME 事件流（XIM / im2 / im1）都翻译成 ImeEvent 内部流，
-    // 由 host_bridge 转发给宿主 dbus-ibus/dbus-fcitx5。
-    // 当前只有 im2 端点（游戏内直连），所以 im2 事件直接发 im2 协议。
+    // C 方案：所有 IME 事件流（XIM / im2 / im1 / host_bridge）都翻译成 ImeEvent
+    // 内部流（ime/ime_event.rs），由 lib.rs 每帧灌入这里。
+
+    /// 接收 host_bridge / XIM / im1 的 UpEvent 批次，灌入 relay 并原子应用。
+    ///
+    /// 行为：
+    /// - Preedit / Commit / DeleteSurrounding → 进 relay.ime_op 缓冲
+    /// - Done → 触发 relay.ime_flush，原子推到 ti3 wire
+    /// - LookupTable → 跳过（mod 不自绘候选窗；用宿主 IME 框架 kimpanel；
+    ///   光标位置由 host_bridge.update_cursor_rect 在 im2 grab 缺席时
+    ///   单独发给宿主 SetCursorLocationRelative）
+    pub fn apply_up_events(
+        &mut self,
+        events: Vec<crate::ime::UpEvent>,
+    ) {
+        use crate::ime::{ImeOp, UpEvent};
+        for ev in events {
+            match ev {
+                UpEvent::Preedit(p) => {
+                    self.relay.ime_op(ImeOp::Preedit(p.text, p.cursor_begin, p.cursor_end));
+                }
+                UpEvent::Commit(c) => {
+                    self.relay.ime_op(ImeOp::CommitString(c.text));
+                }
+                UpEvent::DeleteSurrounding(d) => {
+                    self.relay.ime_op(ImeOp::DeleteSurrounding(
+                        d.before_length,
+                        d.after_length,
+                    ));
+                }
+                UpEvent::LookupTable(_) => {
+                    // mod 不自绘候选窗（v0.9.40+ 决策：交给宿主 IME 框架）。
+                    // XIM / im1 / host_bridge 上行 LookupTable 忽略；
+                    // firefox / gnome-terminal 等 GTK 应用自己处理候选窗 UI。
+                }
+                UpEvent::Done(_) => {
+                    // 原子应用缓冲到 ti3 wire
+                    let fr = self.relay.ime_flush();
+                    if fr.applied {
+                        crate::bridge::ime_log_write(&format!(
+                            "[waylandcraft][ime] host_bridge flush applied -> ti3 batch ({} cmds)",
+                            fr.commands.len()
+                        ));
+                        self.emit_ti_batch(fr.commands);
+                    } else {
+                        crate::bridge::ime_log_write(
+                            "[waylandcraft][ime] host_bridge flush NOT applied（无激活会话）",
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// 是否有激活的文本输入会话（Java 侧驱动宿主 enable 门控）。
     pub fn app_active(&self) -> bool {
