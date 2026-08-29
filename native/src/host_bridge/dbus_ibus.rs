@@ -47,9 +47,15 @@ use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 use std::time::Duration;
 
-const IBUS_SERVICE: &str = "org.freedesktop.IBus";
+// ibus-portal 入口（事实 1：session bus 上同名 `org.freedesktop.IBus` 服务
+// 不实现 IBus 接口 —— 真正的入口是 `org.freedesktop.portal.IBus` portal 服务）。
+// 这正是 flatpak 应用在 GNOME 下打中文的同一条路。
+// 参考：8/26 笔记 waylandcraft-ime-fix.md 「v0.9.31 真根因」节。
+const IBUS_SERVICE: &str = "org.freedesktop.portal.IBus";
 const IBUS_FACTORY_PATH: &str = "/org/freedesktop/IBus";
-const IBUS_FACTORY_IFACE: &str = "org.freedesktop.IBus.Factory";
+// ibus-portal 暴露的是 `org.freedesktop.IBus.Portal` 接口
+// （不是旧的 `org.freedesktop.IBus.Factory` —— 旧接口只在 ibus 私有总线上）。
+const IBUS_FACTORY_IFACE: &str = "org.freedesktop.IBus.Portal";
 const IBUS_IC_IFACE: &str = "org.freedesktop.IBus.InputContext";
 
 /// 客户端能力（声明完整支持）。
