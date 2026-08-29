@@ -185,6 +185,16 @@ impl ImeState {
                 // 先把首批状态灌入 relay 缓存（未激活时只更新不产出命令），
                 // 使随后的 Activate 单周期携带最新状态，避免多余的 done 往返。
                 let _ = ime.relay.push_app_state(st);
+                // v0.9.45 修法：同时通知 host_bridge FocusIn。
+                // 没有 FocusIn，ibus 引擎收到 ProcessKeyEvent 但不处理
+                // （InputContext 状态 unfocused）→ 永远不发回 commit/preedit。
+                if let Some(hb) = state.host_bridge.as_mut() {
+                    if hb.is_ready() {
+                        hb.submit(crate::ime::DownEvent::State(
+                            crate::ime::FocusChange::Activate,
+                        ));
+                    }
+                }
                 ime.relay.set_app_enabled(true, "ti3.enable")
             }
             O::Disabled => {
@@ -192,6 +202,14 @@ impl ImeState {
                 crate::bridge::ime_log_write(
                     "[waylandcraft][ime][ti3] outcome=Disabled -> set_app_enabled(false, ti3.disable)",
                 );
+                // v0.9.45 修法：同时通知 host_bridge FocusOut。
+                if let Some(hb) = state.host_bridge.as_mut() {
+                    if hb.is_ready() {
+                        hb.submit(crate::ime::DownEvent::State(
+                            crate::ime::FocusChange::Deactivate,
+                        ));
+                    }
+                }
                 ime.relay.set_app_enabled(false, "ti3.disable")
             }
             O::State(st) => ime.relay.push_app_state(st),

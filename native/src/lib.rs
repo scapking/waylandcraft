@@ -92,6 +92,9 @@ pub struct WLCState {
     pub output: WLCOutput,
     /// dmabuf 共享全局；无可用渲染节点时为 None（客户端自动回退 shm 路径）。
     pub dmabuf_global: Option<DmabufGlobal>,
+    /// 宿主 IME 桥接（v0.9.45+：让 apply_ti3_outcome / lib.rs::update
+    /// 都能访问；之前只在 WaylandCraft 上有，但 Dispatch 路径拿不到）。
+    pub host_bridge: Option<crate::host_bridge::HostBridgeHandle>,
 }
 
 #[derive(Default)]
@@ -155,6 +158,7 @@ impl WLCState {
             ime,
             data,
             output,
+            host_bridge: None, // WaylandCraft::update() 每帧同步（避免双 owner）
         }
     }
 }
@@ -407,6 +411,19 @@ pub(crate) fn wlc_init(
 
 impl<'a> WaylandCraft<'a> {
     pub fn update(&mut self) {
+        // v0.9.45：把 host_bridge 句柄共享给 state（让 apply_ti3_outcome
+        // 也能访问——ti3 enter/leave 时需要给 host_bridge 发 FocusIn/FocusOut）。
+        // 用 std::mem::take 避免双 &mut self 借用冲突：
+        //   1. 从 self.host_bridge 取出 Option
+        //   2. 把它移到 self.state.host_bridge
+        //   3. dispatch 期间 dispatch 路径可能调用 apply_ti3_outcome（state borrow）
+        //   4. dispatch 完后把它从 state 拿回 self.host_bridge
+        // （更干净的做法是用 Rc<RefCell<Option<...>>>——但当前路径已经正确工作）
+        let hb = self.host_bridge.take();
+        if hb.is_some() {
+            self.state.host_bridge = hb;
+        }
+
         // 嵌套合成器更新：嵌套应用通过原生 IME 协议（XIM / im2 / im1）
         // 直接连宿主 IME daemon。mod 不参与 IME 桥接。
         // 待办：实现 XIM server（X11 应用）+ im1 global（ibus-wayland）
@@ -414,7 +431,7 @@ impl<'a> WaylandCraft<'a> {
 
         // host_bridge 每帧 drain 上行事件（commit/preedit/delete/lookup），
         // 灌入 relay → 原子推到 firefox 等嵌套应用的 ti3 text_input。
-        if let Some(hb) = &mut self.host_bridge {
+        if let Some(hb) = &mut self.state.host_bridge {
             for batch in hb.take_up_events_batched() {
                 self.state.ime.apply_up_events(batch);
             }
@@ -424,6 +441,9 @@ impl<'a> WaylandCraft<'a> {
         let event_loop = &mut self.event_loop;
         event_loop.dispatch(Some(Duration::ZERO), state).unwrap();
         state.display_handle.flush_clients().unwrap();
+
+        // dispatch 后把 host_bridge 取回 self.host_bridge（避免下一帧重复 take）
+        self.host_bridge = state.host_bridge.take();
     }
 }
 
