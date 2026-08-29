@@ -65,8 +65,14 @@ fn detect_app_type(cmd: &str) -> &'static str {
 /// 这样 AppImage / Nix / deb / portable / wine / 未来任何新格式都不用识别：
 /// 只要它是直接 exec 的进程，这套环境就让它 wayland 可用时走 wayland（原生渲染），
 /// 不可用时自动退 x11（satellite 渲染），全部回 Minecraft。
+///
+/// C 方案（v0.9.39+）：显式传递 `DBUS_SESSION_BUS_ADDRESS` —— 这是
+/// 嵌套应用（如 firefox、gnome-terminal）通过 GdkIMContext 找宿主 IME daemon
+/// 的关键变量。如果不传，应用会尝试默认 `$XDG_RUNTIME_DIR/bus`，但**嵌套
+/// 合成器里 `$XDG_RUNTIME_DIR` 是我们写的**（不是宿主），可能导致 bus
+/// 路径错误。显式传宿主的 bus 地址确保嵌套应用直接连宿主 IME daemon。
 fn build_universal_env_list(wayland_display: &str, display: &str) -> Vec<(String, String)> {
-    vec![
+    let mut env = vec![
         ("WAYLAND_DISPLAY".to_string(), wayland_display.to_string()),
         ("DISPLAY".to_string(), display.to_string()),
         // 会话类型告知：我们就是 wayland 会话（compositor 真实存在）
@@ -76,7 +82,13 @@ fn build_universal_env_list(wayland_display: &str, display: &str) -> Vec<(String
         ("MOZ_ENABLE_WAYLAND".to_string(), "1".to_string()),
         ("OZONE_PLATFORM_HINT".to_string(), "auto".to_string()),
         ("ELECTRON_OZONE_PLATFORM_HINT".to_string(), "auto".to_string()),
-    ]
+    ];
+    // C 方案：嵌套应用需要宿主 dbus 路径找 IME daemon（ibus / fcitx5）
+    // 如果有就传（最常见 unix:path=/run/user/1000/bus）
+    if let Ok(bus) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        env.push(("DBUS_SESSION_BUS_ADDRESS".to_string(), bus));
+    }
+    env
 }
 
 /// 为 flatpak 注入 --env= / --socket= / --filesystem= 参数
