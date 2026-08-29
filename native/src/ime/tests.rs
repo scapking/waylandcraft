@@ -20,7 +20,7 @@ use smithay::reexports::wayland_server::{
 };
 
 use crate::seat::KeyboardAction;
-use crate::system_ime::HostEvent;
+// use crate::system_ime::HostEvent; // C 方案：穿透已删
 use crate::WLCState;
 
 // ═══════════════════════════ 服务端 ═══════════════════════════
@@ -840,74 +840,6 @@ fn test_keyboard_grab_routing() {
 }
 
 /// 穿透入站：宿主事件（含 delete+commit 保序批次与 done）正确应用到编辑器。
-#[test]
-fn test_passthrough_inbound_ordered_apply() {
-    // 无游戏内 im2 客户端 → 穿透成为当前端点。
-    let mut f = setup_with_ime(false);
-    f.server.ime.note_passthrough_ready(true);
-    f.focus_and_enable();
-
-    // enable 时出站命令应包含 Activate。
-    let outbox = f.server.ime.take_passthrough_outbox();
-    assert!(
-        outbox.iter().any(|c| matches!(c, crate::ime::ImeCommand::Activate(_))),
-        "激活会话应向穿透端点发出 Activate"
-    );
-
-    // 模拟宿主 fcitx5 的一轮组合：delete 选区 + commit + done（严格保序）。
-    let events = vec![
-        HostEvent::DeleteSurroundingText(3, 0),
-        HostEvent::CommitString("你".into()),
-        HostEvent::Done(7),
-    ];
-    f.server.ime.passthrough_events(events);
-    // 直接驱动 server → editor 方向（无客户端请求需要分发）。
-    f.display.flush_clients().unwrap();
-    f.editor.dispatch_pending();
-
-    let idx_delete = f
-        .editor
-        .state
-        .ti_events
-        .iter()
-        .position(|e| e == "delete")
-        .expect("穿透 delete 应到达");
-    let idx_commit = f
-        .editor
-        .state
-        .ti_events
-        .iter()
-        .position(|e| e == "commit(\"你\")")
-        .expect("穿透 commit 应到达");
-    assert!(idx_delete < idx_commit, "穿透路径同样必须保序");
-    assert_eq!(f.editor.state.dones.last(), Some(&1));
-}
-
-/// 穿透模式下的反向同步：app 状态变化进入出站队列。
-#[test]
-fn test_passthrough_outbound_state_sync() {
-    let mut f = setup_with_ime(false);
-    f.server.ime.note_passthrough_ready(true);
-    f.focus_and_enable();
-    f.server.ime.take_passthrough_outbox(); // 清掉 Activate
-
-    let ti = f.editor.state.ti.as_ref().unwrap();
-    ti.set_surrounding_text("abc".into(), 3, 3);
-    ti.set_cursor_rectangle(10, 20, 30, 40);
-    ti.commit();
-    f.drive();
-
-    let outbox = f.server.ime.take_passthrough_outbox();
-    assert!(
-        outbox
-            .iter()
-            .any(|c| matches!(c, crate::ime::ImeCommand::PushState(st)
-                if st.surrounding_text == "abc"
-                    && st.cursor_rect == Some((10, 20, 30, 40)))),
-        "surrounding 与光标矩形必须反向同步给宿主输入法，实际: {outbox:?}"
-    );
-}
-
 /// 焦点在两个输入框间直接切换（A→B，不经过空焦点）：
 /// 旧会话必须终结，B 的 enable 必须重新激活 IME，组合落在 B 上。
 #[test]

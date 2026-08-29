@@ -52,7 +52,6 @@ mod desktop_windows;
 mod portal_capture;
 mod audio_capture;
 mod egl;
-mod host_ime;
 mod ime;
 mod java_types;
 mod output;
@@ -60,7 +59,6 @@ mod process;
 mod satellite;
 mod seat;
 mod svg;
-mod system_ime;
 mod utils;
 mod xdg_spec;
 
@@ -70,13 +68,6 @@ pub(crate) struct WaylandCraft<'a> {
     pub bridge: BridgeState,
     pub egl: EGLHelper,
     pub xdg: XDGSpecHelper,
-    pub system_ime: Option<Box<dyn crate::host_ime::HostImBackend>>,
-    /// 初始探测用的 wl_display 指针，供惰性重试时复用。
-    pub wayland_display: usize,
-    /// 穿透初始化失败后是否继续自动重试（Unsupported 后置 false）。
-    pub ime_retry: bool,
-    /// 上次重试时间（节流：每 5 秒最多一次）。
-    pub last_ime_retry: Option<std::time::Instant>,
 }
 
 pub struct WLCState {
@@ -332,31 +323,10 @@ pub(crate) fn wlc_init(
     // 系统桌面输入法穿透：按探测顺序选择宿主后端
     // （wayland-ti3 → dbus-ibus → …）。全部不可用为结构性不支持（不再重试）；
     // 暂时性失败（连接/总线问题）会在 update() 里自动重试。
-    let mut ime_retry = false;
     let mut ime_ready = false;
-    let system_ime = match crate::host_ime::probe(wayland_display) {
-        crate::system_ime::ImeInit::Ready(si) => {
-            eprintln!(
-                "[waylandcraft][host_ime] passthrough ENABLED ({})",
-                si.name()
-            );
-            ime_ready = true;
-            Some(si)
-        }
-        crate::system_ime::ImeInit::Transient(msg) => {
-            ime_retry = true;
-            eprintln!(
-                "[waylandcraft][system_ime] TRANSIENT: {msg} -> 将自动重试"
-            );
-            None
-        }
-        crate::system_ime::ImeInit::Unsupported(msg) => {
-            eprintln!(
-                "[waylandcraft][system_ime] UNSUPPORTED: {msg} -> 不再重试"
-            );
-            None
-        }
-    };
+    // host_ime/system_ime 穿透已删 —— 嵌套应用通过自己的 GdkIMContext
+    // 直接连宿主 IME daemon（ibus / fcitx5）。本进程不再当中间人。
+    eprintln!("[waylandcraft] 嵌套合成器模式：app 通过原生 IME 协议直接连宿主");
 
     // Start xwayland-satellite to provide an X11 display for X11-only apps
     match satellite::start_satellite(&state.socket) {
@@ -395,8 +365,7 @@ pub(crate) fn wlc_init(
 
     let xdg = XDGSpecHelper::init();
 
-    // 初始穿透就绪状态同步给 Relay（端点选择）。
-    state.ime.note_passthrough_ready(ime_ready);
+    let _ = ime_ready; // 抑制 unused warning；未来 XIM server/im1 global 加回时用
 
     let instance = WaylandCraft {
         state,
@@ -404,93 +373,16 @@ pub(crate) fn wlc_init(
         bridge: BridgeState::new(),
         egl,
         xdg,
-        system_ime,
-        wayland_display,
-        ime_retry,
-        last_ime_retry: None,
     };
     Ok(instance)
 }
 
 impl<'a> WaylandCraft<'a> {
     pub fn update(&mut self) {
-        // ── 系统桌面输入法穿透桥接 ──
-        // 1. 游戏内会话状态 → 宿主 text-input enable/disable（命令出站）
-        // 2. 宿主输入法事件（保序）→ 游戏内 active text-input（入站应用）
-        // 3. 连接失效时惰性重试（每 5 秒一次，仅限暂时性故障）。
-        if self.system_ime.is_none() && self.ime_retry {
-            let now = std::time::Instant::now();
-            let due = self
-                .last_ime_retry
-                .map(|t| now.duration_since(t).as_secs() >= 5)
-                .unwrap_or(true);
-            if due {
-                self.last_ime_retry = Some(now);
-                eprintln!("[waylandcraft][host_ime][RETRY] 重新探测...");
-                match crate::host_ime::probe(self.wayland_display)
-                {
-                    crate::system_ime::ImeInit::Ready(si) => {
-                        eprintln!(
-                            "[waylandcraft][host_ime][RETRY] OK -> passthrough ENABLED ({})",
-                            si.name()
-                        );
-                        // 穿透端点就绪；若游戏内已有激活会话，Relay 会补发 Activate。
-                        self.state.ime.note_passthrough_ready(true);
-                        self.system_ime = Some(si);
-                    }
-                    crate::system_ime::ImeInit::Transient(msg) => {
-                        eprintln!(
-                            "[waylandcraft][system_ime][RETRY] 仍不可用: {msg}"
-                        );
-                    }
-                    crate::system_ime::ImeInit::Unsupported(msg) => {
-                        eprintln!(
-                            "[waylandcraft][system_ime][RETRY] 不再重试: {msg}"
-                        );
-                        self.ime_retry = false;
-                    }
-                }
-            }
-        }
-        if let Some(si) = &mut self.system_ime {
-            // dbus 类后端异步就绪：每帧刷新端点可用性（幂等）。
-            let ready = si.is_ready();
-            self.state.ime.note_passthrough_ready(ready);
-
-            // 游戏内会话状态 → 宿主 enable 门控
-            let app_active = self.state.ime.app_active();
-            si.set_active(app_active);
-
-            // Relay 出站命令 → 穿透客户端（缓存 + 调和发送）
-            let cmds = self.state.ime.take_passthrough_outbox();
-            si.execute_commands(cmds);
-
-            // 每帧驱动：收宿主事件 + 调和 enable/状态推送 + 按键裁决
-            si.poll();
-
-            // 后端裁决放行的按键：按提交顺序补投递给焦点应用
-            // （dbus 类后端的 ProcessKeyEvent 异步往返结果，见 host_ime 模块文档）。
-            for k in si.take_forwarded_keys() {
-                self.state.seat.keyboard_key(k.key, k.action);
-            }
-
-            // 宿主事件（保序）→ Relay 原子应用 → 游戏内 text-input
-            let events = si.take_events();
-            if !events.is_empty() {
-                self.state.ime.passthrough_events(events);
-            }
-
-            // 连接失效：丢弃实例，允许惰性重试重建。
-            if si.is_dead() {
-                eprintln!(
-                    "[waylandcraft][system_ime] 连接失效 -> 将按 TRANSIENT 重试"
-                );
-                self.state.ime.note_passthrough_ready(false);
-                self.system_ime = None;
-                self.ime_retry = true;
-                self.last_ime_retry = Some(std::time::Instant::now());
-            }
-        }
+        // 嵌套合成器更新：嵌套应用通过原生 IME 协议（XIM / im2 / im1）
+        // 直接连宿主 IME daemon。mod 不参与 IME 桥接。
+        // 待办：实现 XIM server（X11 应用）+ im1 global（ibus-wayland）
+        //       + host_bridge（统一把 XIM/im2/im1 转给宿主 dbus-ibus/fcitx5）
 
         let state = &mut self.state;
         let event_loop = &mut self.event_loop;

@@ -1,4 +1,4 @@
-//! 输入法子系统门面 —— 协议全局对象注册、端点路由与统一执行层。
+//! 输入法子系统门面 —— 协议全局对象注册与执行层。
 //!
 //! ## 模块结构与职责边界
 //!
@@ -9,24 +9,26 @@
 //!                                   Relay（纯逻辑状态机：serial 记账、
 //!                                         原子缓冲、丢弃判定）   ← 本模块组装
 //!                                        │ ImeCommand / TiCommand
-//!              ┌─────────────────────────┴────────────────────┐
-//!              ▼                                              ▼
-//!     InputMethodV2State（im2 wire 层，           Passthrough outbox →
-//!     游戏内直连 fcitx5 等输入法客户端）            system_ime/passthrough.rs
-//!                                                   （宿主桌面输入法穿透）
+//!                                        ▼
+//!                              InputMethodV2State（im2 wire 层）
+//!                              游戏内直连 fcitx5 等输入法客户端
 //! ```
 //!
-//! **端点策略**：同一时刻至多一个 IME 端点生效。
-//! - 游戏内 im2 客户端（如直接跑在游戏合成器上的 fcitx5）拥有最高优先级；
-//! - 无 im2 实例且宿主穿透就绪时，走穿透端点；
-//! - 端点切换时 Relay 负责在新端点上重新激活会话（重发 Activate），
-//!   旧端点的 serial 计数随下线复位。
+//! **架构演进**（C 方案）：
+//! - 旧 v0.9.38 路径有 host_ime 穿透（已被证明架构错误）
+//! - v0.9.39 又用 hybrid async 重新做穿透（仍是 dbus 客户端模式）
+//! - **当前重构** 删除所有 host_ime / system_ime / 穿透代码
+//! - 嵌套应用通过自己的 GdkIMContext（GTK/Qt）直接连宿主 IME daemon
+//! - mod 未来要实现 XIM server（X11 native 应用）+ im1 global（ibus-wayland）
+//! - **永不模拟** IME 引擎——永远转发给宿主 daemon
 //!
-//! **数据流总览**（协议正确路径）：
+//! **数据流总览**（重构后协议正确路径）：
 //!
 //! ```text
-//! keyboard(Java/GLFW) → 合成器 ─(grab 时)→ 输入法端点 → preedit/commit → text-input → App
-//! App 文本状态(surrounding/cursor/content) → text-input commit → Relay → 输入法端点（反向同步）
+//! keyboard(Java/GLFW) → 合成器 ─(grab 时)→ im2 客户端 → preedit/commit → text-input → App
+//! App 文本状态 → text-input commit → Relay → im2 客户端（反向同步）
+//! [未来] X11 应用 → XIM server → 内部 ImeEvent → 宿主 dbus-ibus
+//! [未来] ibus-wayland → im1 global → 内部 ImeEvent → 宿主 dbus-ibus
 //! ```
 
 mod input_method_v2;
@@ -43,24 +45,14 @@ pub use text_input_v3::TextInputV3State;
 use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::
     zwp_text_input_manager_v3::ZwpTextInputManagerV3;
 use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::{
-    zwp_input_method_v2::ZwpInputMethodV2, zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
+    zwp_input_method_v2::ZwpInputMethodV2,
+    zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
 };
 use smithay::reexports::wayland_server::{DisplayHandle, Resource};
 
 use crate::WLCState;
 use crate::seat::KeyboardAction;
 use crate::utils::{get_time, new_serial};
-
-/// 当前生效的输入法端点。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum Endpoint {
-    #[default]
-    None,
-    /// 游戏内 im2 客户端。
-    InProcess,
-    /// 宿主桌面输入法穿透。
-    Passthrough,
-}
 
 /// 输入法全局状态。挂在 `WLCState.ime` 上。
 #[derive(Default)]
@@ -69,17 +61,11 @@ pub struct ImeState {
     pub im2: InputMethodV2State,
     pub relay: Relay,
 
-    /// im2 客户端是否在位（无论是否为当前端点）。
+    /// im2 客户端是否在位。
     im2_bound: bool,
-    /// 宿主穿透是否就绪（由 lib.rs 在 SystemIme 初始化成功后调用 note_passthrough_ready）。
-    passthrough_ready: bool,
 
-    endpoint: Endpoint,
-
-    /// 发往穿透端点的命令出站队列；lib.rs 每帧取走交给 SystemIme 执行。
-    passthrough_outbox: Vec<ImeCommand>,
-
-    /// 最近一次候选窗快照（Java 每帧轮询，自绘候选窗用）。
+    /// 最近一次候选窗快照（Java 每帧轮询，自绘候选窗用；mod 自绘是过渡方案，
+    /// 未来改用桌面 IME 框架 kimpanel / ibus panel 渲染）。
     lookup_table: Option<LookupTableSnapshot>,
 }
 
@@ -105,19 +91,11 @@ impl ImeState {
         disp.create_global::<WLCState, ZwpInputMethodManagerV2, ()>(1, ());
         // 注：刻意不注册 text-input-v1 / input-method-v1 —— 现代协议栈
         // （ti3 + im2）是唯一受支持路径，避免 ibus 退回 v1 造成行为分叉。
+        // C 方案下一阶段：实现 im1 global（ibus-wayland 兼容）+ XIM server。
     }
 
-    // ── 端点生命周期 ──────────────────────────────────────────
-
-    fn recompute_endpoint(&mut self) -> Endpoint {
-        if self.im2_bound {
-            Endpoint::InProcess
-        } else if self.passthrough_ready {
-            Endpoint::Passthrough
-        } else {
-            Endpoint::None
-        }
-    }
+    // ── im2 客户端生命周期 ────────────────────────────────────
+    // （旧：im2 客户端 vs 宿主穿透端点，由 recompute_endpoint 仲裁 —— 已删）
 
     /// im2 客户端绑定（manager.get_input_method）。顶替旧实例。
     pub(crate) fn note_im2_bound(&mut self, im: ZwpInputMethodV2) {
@@ -133,7 +111,10 @@ impl ImeState {
         });
         let was = std::mem::replace(&mut self.im2_bound, true);
         if !was {
-            self.switch_endpoint();
+            // 首次绑定 im2：通知 Relay ime_present 切换
+            let _ = self.relay.set_ime_present(false);
+            let cmds = self.relay.set_ime_present(true);
+            self.execute_ime_commands(cmds);
         }
     }
 
@@ -146,50 +127,9 @@ impl ImeState {
         self.im2.instance = None;
         self.im2.grab = None;
         self.im2.popup = None;
-        self.switch_endpoint();
-    }
-
-    /// 宿主穿透就绪状态变化。由 lib.rs 驱动。
-    pub fn note_passthrough_ready(&mut self, ready: bool) {
-        if self.passthrough_ready == ready {
-            return;
-        }
-        self.passthrough_ready = ready;
-        self.switch_endpoint();
-    }
-
-    /// 端点切换：通知 Relay 重置计数并按需向新端点补发 Activate；
-    /// 旧端点若是穿透则先发 Deactivate 清场。
-    fn switch_endpoint(&mut self) {
-        let new_ep = self.recompute_endpoint();
-        if new_ep == self.endpoint {
-            // 同端点内的实例更替（如 fcitx5 重启）：让 Relay 复位计数。
-            if new_ep == Endpoint::InProcess {
-                let cmds = self.relay.set_ime_present(false);
-                debug_assert!(cmds.is_empty());
-                let cmds = self.relay.set_ime_present(true);
-                self.execute_ime_commands(cmds);
-            }
-            return;
-        }
-        match self.endpoint {
-            Endpoint::InProcess => {
-                // 旧 im2 即将不再是端点：无需 deactivate（对象即将 unavailable/已亡）。
-                let _ = self.relay.set_ime_present(false);
-            }
-            Endpoint::Passthrough => {
-                let cmds = self.relay.set_ime_present(false);
-                self.passthrough_outbox.extend(cmds);
-            }
-            Endpoint::None => {}
-        }
-        self.endpoint = new_ep;
-        let present = new_ep != Endpoint::None;
-        let cmds = self.relay.set_ime_present(present);
-        match new_ep {
-            Endpoint::Passthrough => self.passthrough_outbox.extend(cmds),
-            _ => self.execute_ime_commands(cmds),
-        }
+        // 通知 Relay ime_present 离开
+        let cmds = self.relay.set_ime_present(false);
+        self.execute_ime_commands(cmds);
     }
 
     // ── 焦点入口（bridge.rs keyboard_focus / keyboard_unfocus 调用）──
@@ -295,16 +235,13 @@ impl ImeState {
         inst.obj.done(count);
     }
 
-    // ── ImeCommand 执行（relay 输出的抽象命令 → 具体端点）──
+    // ── ImeCommand 执行（relay 输出的抽象命令 → im2 端点）────
 
-    /// 执行 relay 产出的命令序列：按当前端点分流到 im2 直发或穿透出站队列。
+    /// 执行 relay 产出的命令序列：当前唯一端点是 im2 直连
+    /// （C 方案成熟时还会加上 XIM server / im1 global / 宿主 dbus 桥接）。
     pub(crate) fn execute_ime_commands(&mut self, commands: Vec<ImeCommand>) {
         for cmd in commands {
-            match self.endpoint {
-                Endpoint::InProcess => self.exec_on_im2(cmd),
-                Endpoint::Passthrough => self.passthrough_outbox.push(cmd),
-                Endpoint::None => {}
-            }
+            self.exec_on_im2(cmd);
         }
     }
 
@@ -330,94 +267,14 @@ impl ImeState {
         }
     }
 
-    // ── 穿透数据通道 ──────────────────────────────────────────
-
-    /// 宿主穿透事件入站（lib.rs 每帧从 SystemIme 取出后灌入）。
-    ///
-    /// 保序处理：文本操作进 Relay 缓冲，Done 触发原子应用。
-    pub fn passthrough_events(
-        &mut self,
-        events: Vec<crate::system_ime::HostEvent>,
-    ) {
-        use crate::system_ime::HostEvent;
-        for ev in events {
-            match ev {
-                HostEvent::Enter | HostEvent::Leave => {
-                    // 焦点路由由 SystemIme 内部状态机消费（enable 门控），
-                    // 对游戏内会话无语义影响。
-                }
-                HostEvent::CommitString(t) => {
-                    self.relay.ime_op(ImeOp::CommitString(t))
-                }
-                HostEvent::PreeditString(t, b, e) => {
-                    self.relay.ime_op(ImeOp::Preedit(t, b, e))
-                }
-                HostEvent::DeleteSurroundingText(b, a) => {
-                    self.relay.ime_op(ImeOp::DeleteSurrounding(b, a))
-                }
-                HostEvent::LookupTable {
-                    candidates,
-                    labels,
-                    cursor_pos,
-                    cursor_visible,
-                    page_size,
-                    orientation,
-                    visible,
-                } => {
-                    // 候选窗数据：不进 relay 文本流，直接进 UI 快照供 Java 自绘候选窗。
-                    self.lookup_table = Some(LookupTableSnapshot {
-                        candidates,
-                        labels,
-                        cursor_pos,
-                        cursor_visible,
-                        page_size,
-                        orientation,
-                        visible,
-                    });
-                    crate::bridge::ime_log_write(&format!(
-                        "[waylandcraft][ime] lookup_table updated: {} candidates visible={}",
-                        self.lookup_table
-                            .as_ref()
-                            .map(|l| l.candidates.len())
-                            .unwrap_or(0),
-                        visible
-                    ));
-                }
-                HostEvent::Done(_) => {
-                    // 宿主批次完成。serial 校验已由宿主合成器对它的客户端
-                    // （即我们）完成，这里无条件应用缓冲。
-                    let fr = self.relay.ime_flush();
-                    if fr.applied {
-                        crate::bridge::ime_log_write(&format!(
-                            "[waylandcraft][ime] passthrough flush applied -> ti3 batch ({} cmds)",
-                            fr.commands.len()
-                        ));
-                        self.emit_ti_batch(fr.commands);
-                    } else {
-                        crate::bridge::ime_log_write(
-                            "[waylandcraft][ime] passthrough flush NOT applied（无激活会话或 serial 不符）",
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// 取走发往穿透端点的命令（lib.rs 每帧转交 SystemIme 执行）。
-    pub fn take_passthrough_outbox(&mut self) -> Vec<ImeCommand> {
-        std::mem::take(&mut self.passthrough_outbox)
-    }
+    // ── 内部 IME 事件流（协议无关）──
+    // C 方案下一阶段：所有 IME 事件流（XIM / im2 / im1）都翻译成 ImeEvent 内部流，
+    // 由 host_bridge 转发给宿主 dbus-ibus/dbus-fcitx5。
+    // 当前只有 im2 端点（游戏内直连），所以 im2 事件直接发 im2 协议。
 
     /// 是否有激活的文本输入会话（Java 侧驱动宿主 enable 门控）。
     pub fn app_active(&self) -> bool {
         self.relay.app_active()
-    }
-
-    /// 穿透端点是否需要接管原始按键（dbus 类宿主后端的 ProcessKeyEvent 路由）。
-    /// 条件：当前端点为穿透 && 游戏内有激活文本会话。
-    /// 后端自身是否就绪由驱动层结合 `system_ime` 实例状态判断（见 bridge.keyboard_input）。
-    pub fn passthrough_wants_keys(&self) -> bool {
-        self.endpoint == Endpoint::Passthrough && self.relay.app_active()
     }
 
     // ── 键盘路由（bridge.rs keyboard_input 调用）──────────────

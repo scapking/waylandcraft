@@ -1502,47 +1502,10 @@ fn keyboard_input<'local>(
         .ime
         .handle_key(scancode as u32, action, mods);
 
-    // 穿透端点的 dbus 类后端需要原始按键做 ProcessKeyEvent 往返：
-    // 接管该键（调用方不再立即投递），由后端在 poll 中裁决放行/丢弃。
-    if !handled && instance.state.ime.passthrough_wants_keys() {
-        if let Some(be) = instance.system_ime.as_mut() {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static KEY_SEQ: AtomicU64 = AtomicU64::new(1);
-            let key_u = scancode as u32;
-            // xkb keycode -> keysym：按当前修饰态/layout 解析（ibus keyval 语义）。
-            let keysym = instance
-                .state
-                .seat
-                .xkb_state
-                .key_get_one_sym(xkbcommon::xkb::Keycode::new(key_u))
-                .raw();
-            let seq = KEY_SEQ.fetch_add(1, Ordering::Relaxed);
-            // P0 可观测性：记录驱动层提交给后端的键（keysym 名 + press/release），
-            // 与后端 ProcessKeyEvent 日志配对，确认 ibus 收到的键是否与用户按键一致。
-            let sym_name = xkbcommon::xkb::keysym_get_name(xkbcommon::xkb::Keysym::new(keysym));
-            let act = if action == KeyboardAction::Release {
-                "release"
-            } else {
-                "press"
-            };
-            crate::bridge::ime_log_write(&format!(
-                "[waylandcraft][ime] submit_key seq={seq} scancode={key_u} keysym={keysym:#x}({sym_name}) {act}"
-            ));
-            handled = be.submit_key(crate::host_ime::SubmittedKey {
-                seq,
-                key: key_u,
-                keysym,
-                evdev: key_u.saturating_sub(8),
-                state: if action == KeyboardAction::Release {
-                    crate::host_ime::IBUS_RELEASE_MASK
-                } else {
-                    0
-                },
-                action,
-                mods,
-            });
-        }
-    }
+    // host_ime 穿透已删 —— 嵌套应用通过自己的 GdkIMContext（GTK/Qt）直接连
+    // 宿主 IME daemon。mod 不再接管键盘，键事件直投递给 seat。
+    // C 方案未来：XIM server / im1 global 在 [XIM server] / [im1 global] 模块
+    // 接管按键并转发给宿主 dbus-ibus。
 
     if !handled {
         instance.state.seat.keyboard_key(scancode as u32, action);
@@ -1701,12 +1664,10 @@ fn set_ime_log_file<'local>(
 fn notify_host_focus_gained<'local>(
     _env: &mut Env<'local>,
     _class: JClass<'local>,
-    instance: jlong,
+    _instance: jlong,
 ) -> Result<(), BridgeError> {
-    let instance = jptr_to_instance!(instance, "notifyHostFocusGained")?;
-    if let Some(si) = instance.system_ime.as_mut() {
-        si.notify_host_focus_gained();
-    }
+    // C 方案：host_ime 穿透已删，notifyHostFocusGained 不再需要中转。
+    // （嵌套应用通过自己的 GdkIMContext / im2 grab 处理焦点）
     Ok(())
 }
 
@@ -1714,27 +1675,19 @@ fn notify_host_focus_gained<'local>(
 ///
 /// action: `0`=选字（arg=当前页内下标） `1`=上一页 `2`=下一页。
 /// fcitx5 后端走专用 `SelectCandidate`/`PrevPage`/`NextPage` 方法；
-/// ibus portal 无候选方法，忽略（候选操作走按键通路）。
+/// C 方案：候选窗操作通过 im2 grab 通路自动处理（im2 客户端接收 PreeditString
+/// / CommitString 信号直接处理候选）。Java 端 candidateNav 不再需要中转。
+/// 保留函数签名兼容 Java 端调用（仅打印日志）。
 fn candidate_nav<'local>(
     _env: &mut Env<'local>,
     _class: JClass<'local>,
-    instance: jlong,
+    _instance: jlong,
     action: jint,
-    arg: jint,
+    _arg: jint,
 ) -> Result<(), BridgeError> {
-    let instance = jptr_to_instance!(instance, "candidateNav")?;
-    let nav = match action {
-        0 => crate::host_ime::CandidateNav::SelectCandidate(arg.max(0) as u32),
-        1 => crate::host_ime::CandidateNav::PrevPage,
-        2 => crate::host_ime::CandidateNav::NextPage,
-        other => {
-            eprintln!("[waylandcraft][bridge] candidateNav 未知 action {other}");
-            return Ok(());
-        }
-    };
-    if let Some(si) = instance.system_ime.as_mut() {
-        si.candidate_nav(nav);
-    }
+    eprintln!(
+        "[waylandcraft][bridge] candidateNav action={action}（C 方案已删此通路，候选由 im2 grab 处理）"
+    );
     Ok(())
 }
 
@@ -1757,21 +1710,18 @@ fn take_lookup_table<'local>(
     env.new_string(json).map_err(BridgeError::JniError)
 }
 
-/// updateCursorRect(instance, x, y, w, h) —— Java 上报焦点文本框光标屏幕坐标
-/// （桌面候选窗锚点，防漂移核心；fcitx5 SetCursorRect / ibus SetCursorLocationRelative）。
+/// C 方案：Java 端 CursorRectReporter 已不再需要（嵌套应用通过自己的 ti3
+/// SetCursorRectangle 直接报光标给候选窗）。保留函数签名兼容 Java 端调用。
 fn update_cursor_rect<'local>(
     _env: &mut Env<'local>,
     _class: JClass<'local>,
-    instance: jlong,
-    x: jint,
-    y: jint,
-    w: jint,
-    h: jint,
+    _instance: jlong,
+    _x: jint,
+    _y: jint,
+    _w: jint,
+    _h: jint,
 ) -> Result<(), BridgeError> {
-    let instance = jptr_to_instance!(instance, "updateCursorRect")?;
-    if let Some(si) = instance.system_ime.as_mut() {
-        si.update_cursor_rect((x, y, w, h));
-    }
+    // no-op: ti3 已替代
     Ok(())
 }
 
