@@ -1513,19 +1513,41 @@ fn keyboard_input<'local>(
     if !handled {
         if let Some(hb) = &mut instance.host_bridge {
             if hb.is_ready() {
-                use crate::ime::KeyEvent;
-                let keycode = scancode as u32;
-                let ke = KeyEvent {
-                    keycode,
-                    action: action, // crate::seat::KeyboardAction 重新导出在 ime
-                    mods,
-                };
-                crate::bridge::ime_log_write(&format!(
-                    "[waylandcraft][ime] bridge submit_key scancode={keycode} action={:?}",
-                    action
-                ));
-                hb.submit(crate::ime::DownEvent::Key(ke));
-                handled = true; // 吞下，不投递给 seat（避免双客户端）
+                use crate::ime::{KeyEvent};
+                use crate::seat::KeyboardAction as KA;
+                // v0.9.44 修法：只把 press / repeat 发给 host_bridge，
+                // release 立即放行给 seat（firefox 自己的 GdkIMContext 需要
+                // release 来消 preedit——只吞 press 会让 ibus 引擎收不到
+                // release 事件 → preedit 卡死 → "字母到窗口"）。
+                // 这一改动了"完全吞键"的策略：press 仍吞，release 放行。
+                match action {
+                    KA::Press | KA::Repeat => {
+                        let keycode = scancode as u32;
+                        let ke = KeyEvent {
+                            keycode,
+                            action: action,
+                            mods,
+                        };
+                        crate::bridge::ime_log_write(&format!(
+                            "[waylandcraft][ime] bridge submit_key scancode={keycode} action={:?}",
+                            action
+                        ));
+                        hb.submit(crate::ime::DownEvent::Key(ke));
+                        // press 也放行给 seat（firefox 自己的 ti3 也能看到键盘
+                        // 事件作为 raw text 流入）。这是**双路**：mod 转发给宿主
+                        // ibus（拿 commit/preedit）+ seat 转发给 firefox（拿 raw
+                        // 字母）。firefox 自己会用 im2 grab 截获 seat 端的按键
+                        // 并丢弃 raw text——只显示 commit 汉字。
+                        instance.state.seat.keyboard_key(scancode as u32, action);
+                        handled = true;
+                    }
+                    KA::Release => {
+                        // release 放行给 seat（firefox 自己的 ti3 需要它来
+                        // 完成 press-release 配对）。
+                        instance.state.seat.keyboard_key(scancode as u32, action);
+                        handled = true;
+                    }
+                }
             }
         }
     }

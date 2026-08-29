@@ -180,6 +180,18 @@ impl Relay {
     /// enable=true 且 IME 在线 → Activate；enable=false → 清缓冲 + Deactivate。
     /// `reason` 是变化来源（ti3.enable / ti3.disable / focus_lost / 测试），
     /// 写入日志用于实机诊断 set_active 周期性 toggle 的驱动源（P3）。
+    ///
+    /// v0.9.44 修法：firefox 等 GTK 应用的 ti3 enter/leave 会**频繁抖动**
+    /// （事实 3：协议层正常行为，焦点跨 surface 时常见）。每 disable 强制
+    /// 清 pending_ops 会让 host_bridge 还在路上的 commit/preedit 信号**全部
+    /// 丢失**——用户看到的"打字能 commit 几次"就是这个原因。
+    ///
+    /// 修法：
+    /// - `focus_lost` 才是真失焦（窗口销毁 / 焦点真离开 app）→ 照旧清缓冲
+    /// - `ti3.disable`（enable → disable 抖动）→ **保留缓冲**（host_bridge
+    ///   signal 仍会送达 → flush 仍能 push）
+    /// - app_active 状态本身仍正常 toggle（让 im2 grab 知道当前是 focus
+    ///   in 还是 out）
     pub fn set_app_enabled(
         &mut self,
         enabled: bool,
@@ -189,6 +201,7 @@ impl Relay {
         if enabled == self.app_active {
             return cmds;
         }
+        let was_active = self.app_active;
         self.app_active = enabled;
         crate::bridge::ime_log_write(&format!(
             "[waylandcraft][ime][relay] set_app_enabled {enabled} (reason={reason})"
@@ -199,13 +212,19 @@ impl Relay {
                 self.ime_done_count += 1;
             }
         } else {
-            // 停用即作废 IME 未应用的变更（app 状态即将离开输入上下文）。
-            self.pending_ops.clear();
+            // v0.9.44 修法：只在真失焦时清缓冲（focus_lost 路径）。
+            // ti3.disable 抖动期间保留 pending_ops——host_bridge 还在路上的
+            // commit/preedit 信号仍能 flush 推到 firefox 文本框。
+            if reason == "focus_lost" {
+                self.pending_ops.clear();
+            }
             if self.ime_present {
                 cmds.push(ImeCommand::Deactivate);
                 self.ime_done_count += 1; // Deactivate 后 wire 层发 done
             }
         }
+        // 抑制日志
+        let _ = was_active;
         cmds
     }
 
