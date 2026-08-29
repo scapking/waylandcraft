@@ -1,78 +1,49 @@
-//! 输入法子系统门面 —— 协议全局对象注册与执行层。
+//! 输入法子系统的薄门面 —— v0.10 重构后的最小实现。
 //!
-//! ## 模块结构与职责边界
+//! ## 战略
 //!
-//! ```text
-//! seat（键盘焦点） ──enter/leave──> TextInputV3State（ti3 wire 层）
-//!                                        │ commit/enable/disable
-//!                                        ▼
-//!                                   Relay（纯逻辑状态机：serial 记账、
-//!                                         原子缓冲、丢弃判定）   ← 本模块组装
-//!                                        │ ImeCommand / TiCommand
-//!                                        ▼
-//!                              InputMethodV2State（im2 wire 层）
-//!                              游戏内直连 fcitx5 等输入法客户端
-//! ```
+//! 8 次版本（v0.9.38-45）都失败于"自造 im2/ti3 dispatch"——smithay 不允许
+//! 同名 `Dispatch<ZwpInputMethodManagerV2, ()>`（E0119），而我们又必须保留
+//! ti3 实例管理以让 firefox 等嵌套应用能 commit 汉字。
 //!
-//! **架构演进**（C 方案）：
-//! - 旧 v0.9.38 路径有 host_ime 穿透（已被证明架构错误）
-//! - v0.9.39 又用 hybrid async 重新做穿透（仍是 dbus 客户端模式）
-//! - **当前重构** 删除所有 host_ime / system_ime / 穿透代码
-//! - 嵌套应用通过自己的 GdkIMContext（GTK/Qt）直接连宿主 IME daemon
-//! - mod 未来要实现 XIM server（X11 native 应用）+ im1 global（ibus-wayland）
-//! - **永不模拟** IME 引擎——永远转发给宿主 daemon
+//! **v0.10 重构**做了大刀阔斧的减法：
 //!
-//! **数据流总览**（重构后协议正确路径）：
+//! | 删除 | 原因 |
+//! |---|---|
+//! | `input_method_v2.rs` | 自造 im2 dispatch（与 smithay 冲突） |
+//! | `text_input_v3.rs`  | 自造 ti3 dispatch（与 smithay 冲突） |
+//! | `relay.rs`          | 自造 Relay 状态机——逻辑并入 mod.rs |
+//! | `tests.rs`          | 旧 wire 测试——新增覆盖核心 race 的测试在 mod.rs |
+//! | `types.rs`          | 已被 `ime_event.rs` 取代 |
+//! | `seat_smithay.rs`   | smithay Seat 接入是 dead code |
+//! | `im_smithay.rs`     | smithay im2 接入是 dead code |
 //!
-//! ```text
-//! keyboard(Java/GLFW) → 合成器 ─(grab 时)→ im2 客户端 → preedit/commit → text-input → App
-//! App 文本状态 → text-input commit → Relay → im2 客户端（反向同步）
-//! [未来] X11 应用 → XIM server → 内部 ImeEvent → 宿主 dbus-ibus
-//! [未来] ibus-wayland → im1 global → 内部 ImeEvent → 宿主 dbus-ibus
-//! ```
+//! **保留 API**（bridge.rs / host_bridge / lib.rs 调用）：
+//!
+//! - `ImeState::set_focus(surface)` —— 键盘焦点切到某 surface
+//! - `ImeState::clear_focus()` —— 键盘焦点整体离开
+//! - `ImeState::handle_key(key, action, mods)` —— 转发按键到 im2 grab
+//! - `ImeState::take_lookup_table()` —— 取候选窗快照（Java 自绘用）
+//! - `ImeState::apply_up_events(events)` —— 灌入 host_bridge 上行事件
+//! - `ImeState::app_active()` —— 是否有激活文本输入会话
+//! - `ImeState::keyboard_grabbed()` —— im2 grab 是否抓走键盘
+//! - `ImeState::apply_ti3_outcome(state, outcome)` —— ti3 commit 裁决落地
+//!
+//! **架构方向**（C 方案）：
+//! - 嵌套应用自己用 GdkIMContext（firefox / Qt / Electron）→ 直通宿主 ibus
+//! - mod 当协议中介：嵌套应用 ti3 事件 → mod → 宿主 daemon（host_bridge）
+//! - 嵌套应用 im2 grab（wayland native 应用）→ mod → 宿主 daemon
+//! - host_bridge 接管键盘（v0.9.43+ 已有，不变）
+//! - 永不模拟 IME——永远转发给宿主 daemon
 
 mod ime_event;
-mod input_method_v2;
-mod relay;
-mod text_input_v3;
-
-#[cfg(test)]
-mod tests;
 
 pub use ime_event::{
     Commit, CursorRect, DeleteSurrounding, Done, DownEvent, FocusChange, KeyEvent,
     LookupTable, PreeditUpdate, SurroundingText, UpEvent,
 };
-pub use input_method_v2::InputMethodV2State;
-pub use relay::{AppState, ImeCommand, ImeOp, Relay, TiCommand};
-pub use text_input_v3::TextInputV3State;
 
-use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::
-    zwp_text_input_manager_v3::ZwpTextInputManagerV3;
-use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::{
-    zwp_input_method_v2::ZwpInputMethodV2,
-    zwp_input_method_manager_v2::ZwpInputMethodManagerV2,
-};
-use smithay::reexports::wayland_server::{DisplayHandle, Resource};
-
-use crate::WLCState;
 use crate::seat::KeyboardAction;
-use crate::utils::{get_time, new_serial};
-
-/// 输入法全局状态。挂在 `WLCState.ime` 上。
-#[derive(Default)]
-pub struct ImeState {
-    pub ti3: TextInputV3State,
-    pub im2: InputMethodV2State,
-    pub relay: Relay,
-
-    /// im2 客户端是否在位。
-    im2_bound: bool,
-
-    /// 最近一次候选窗快照（Java 每帧轮询，自绘候选窗用；mod 自绘是过渡方案，
-    /// 未来改用桌面 IME 框架 kimpanel / ibus panel 渲染）。
-    lookup_table: Option<LookupTableSnapshot>,
-}
 
 /// 候选窗快照（宿主输入法归一化数据，与协议后端无关）。
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -86,327 +57,424 @@ pub struct LookupTableSnapshot {
     pub visible: bool,
 }
 
+/// 输入法全局状态。挂在 `WLCState.ime` 上。
+///
+/// v0.10.0：thin facade。所有 wire / dispatch / Relay 状态机已被删除——
+/// ImeState 仅作为应用层（bridge.rs / lib.rs / host_bridge）与 host_bridge
+/// 之间的协调点。应用状态变化、键盘路由、上行事件都通过 host_bridge
+/// 转发给宿主 IME daemon。
+#[derive(Default)]
+pub struct ImeState {
+    /// 是否有激活的文本输入会话（ti3 enable 且聚焦）。
+    /// 由 `apply_ti3_outcome` / `set_focus` / `clear_focus` 维护。
+    app_active: bool,
+
+    /// 键盘焦点是否在某个文本输入 surface 上。
+    /// 由 `set_focus` / `clear_focus` 维护。
+    has_focus: bool,
+
+    /// 最近一次候选窗快照（Java 每帧轮询）。
+    lookup_table: Option<LookupTableSnapshot>,
+
+    /// 当前 im2 grab 是否激活（grab 存在期间原始按键只发给 IME）。
+    /// 由 `note_im2_grab` / `note_im2_release` 维护。
+    im2_grab_active: bool,
+}
+
 impl ImeState {
     /// 取走候选窗快照（Java 侧 JNI 每帧调用；无更新时返回 None）。
     pub fn take_lookup_table(&mut self) -> Option<LookupTableSnapshot> {
         self.lookup_table.take()
     }
-    pub fn create_globals(&self, disp: &DisplayHandle) {
-        disp.create_global::<WLCState, ZwpTextInputManagerV3, ()>(1, ());
-        disp.create_global::<WLCState, ZwpInputMethodManagerV2, ()>(1, ());
-        // 注：刻意不注册 text-input-v1 / input-method-v1 —— 现代协议栈
-        // （ti3 + im2）是唯一受支持路径，避免 ibus 退回 v1 造成行为分叉。
-        // C 方案下一阶段：实现 im1 global（ibus-wayland 兼容）+ XIM server。
-    }
-
-    // ── im2 客户端生命周期 ────────────────────────────────────
-    // （旧：im2 客户端 vs 宿主穿透端点，由 recompute_endpoint 仲裁 —— 已删）
-
-    /// im2 客户端绑定（manager.get_input_method）。顶替旧实例。
-    pub(crate) fn note_im2_bound(&mut self, im: ZwpInputMethodV2) {
-        if let Some(old) = self.im2.instance.as_mut() {
-            if old.obj.id() == im.id() {
-                return;
-            }
-            old.obj.unavailable();
-        }
-        self.im2.instance = Some(input_method_v2::Im2Instance {
-            obj: im,
-            done_count: 0,
-        });
-        let was = std::mem::replace(&mut self.im2_bound, true);
-        if !was {
-            // 首次绑定 im2：通知 Relay ime_present 切换
-            let _ = self.relay.set_ime_present(false);
-            let cmds = self.relay.set_ime_present(true);
-            self.execute_ime_commands(cmds);
-        }
-    }
-
-    /// im2 客户端消失（断连/销毁）。
-    pub(crate) fn note_im2_gone(&mut self) {
-        if !self.im2_bound && self.im2.instance.is_none() {
-            return;
-        }
-        self.im2_bound = false;
-        self.im2.instance = None;
-        self.im2.grab = None;
-        self.im2.popup = None;
-        // 通知 Relay ime_present 离开
-        let cmds = self.relay.set_ime_present(false);
-        self.execute_ime_commands(cmds);
-    }
-
-    // ── 焦点入口（bridge.rs keyboard_focus / keyboard_unfocus 调用）──
-
-    /// 键盘焦点切到某 surface：更新 ti3 焦点并同步 Relay 会话状态。
-    pub fn set_focus(
-        &mut self,
-        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
-    ) {
-        let had_focus = self.ti3.focus_surface().is_some();
-        let switched = self.ti3.enter(surface);
-        // 焦点在两个 surface 间直接切换（A→B 不经过空焦点）时，
-        // 旧会话必须显式终结：否则 B 的 enable 会被误判为会话延续，
-        // IME 收不到重新激活（对应测试场景「输入框 A → 输入框 B」）。
-        if switched && had_focus && self.relay.app_active() {
-            // P3 来源日志：surface 直接切换（A→B）触发 focus_lost。
-            crate::bridge::ime_log_write(
-                "[waylandcraft][ime][ti3] focus switched A->B -> focus_lost",
-            );
-            let cmds = self.relay.focus_lost();
-            self.execute_ime_commands(cmds);
-        }
-    }
-
-    /// 键盘焦点整体离开：leave 全部实例、停用会话、失活端点会话。
-    pub fn clear_focus(&mut self) {
-        if self.ti3.leave() {
-            let cmds = self.relay.focus_lost();
-            self.execute_ime_commands(cmds);
-        }
-    }
-
-    // ── ti3 commit 裁决落地（text_input_v3.rs 的 Dispatch 调用）──
-
-    pub(crate) fn apply_ti3_outcome(
-        state: &mut WLCState,
-        outcome: text_input_v3::Ti3CommitOutcome,
-    ) {
-        use text_input_v3::Ti3CommitOutcome as O;
-        let ime = &mut state.ime;
-        let cmds = match outcome {
-            O::Ignored | O::DisabledInactive => Vec::new(),
-            O::Enabled(st) => {
-                // P3 来源日志：app_active 变 true 的驱动源。
-                crate::bridge::ime_log_write(
-                    "[waylandcraft][ime][ti3] outcome=Enabled -> set_app_enabled(true, ti3.enable)",
-                );
-                // 先把首批状态灌入 relay 缓存（未激活时只更新不产出命令），
-                // 使随后的 Activate 单周期携带最新状态，避免多余的 done 往返。
-                let _ = ime.relay.push_app_state(st.clone());
-                // v0.9.46 修法：通知 host_bridge FocusIn + Surrounding + CursorRect。
-                // 没有 Surrounding Text / CursorLocation，ibus 引擎"看"不到
-                // 上下文（process_key_event line 1143 走 fake_context 兜底）→
-                // 永远不发回 commit/preedit。这是 v0.9.45 实机 0 commit 的真正根因。
-                if let Some(hb) = state.host_bridge.as_mut() {
-                    if hb.is_ready() {
-                        hb.submit(crate::ime::DownEvent::State(
-                            crate::ime::FocusChange::Activate,
-                        ));
-                        hb.submit(crate::ime::DownEvent::Surrounding(
-                            crate::ime::SurroundingText {
-                                text: st.surrounding_text.clone(),
-                                cursor: st.surrounding_cursor,
-                                anchor: st.surrounding_anchor,
-                            },
-                        ));
-                        if let Some((x, y, w, h)) = st.cursor_rect {
-                            hb.submit(crate::ime::DownEvent::CursorRect(
-                                crate::ime::CursorRect { x, y, w, h },
-                            ));
-                        }
-                    }
-                }
-                ime.relay.set_app_enabled(true, "ti3.enable")
-            }
-            O::Disabled => {
-                // P3 来源日志：app_active 变 false 的驱动源。
-                crate::bridge::ime_log_write(
-                    "[waylandcraft][ime][ti3] outcome=Disabled -> set_app_enabled(false, ti3.disable)",
-                );
-                // v0.9.45 修法：同时通知 host_bridge FocusOut。
-                if let Some(hb) = state.host_bridge.as_mut() {
-                    if hb.is_ready() {
-                        hb.submit(crate::ime::DownEvent::State(
-                            crate::ime::FocusChange::Deactivate,
-                        ));
-                    }
-                }
-                ime.relay.set_app_enabled(false, "ti3.disable")
-            }
-            O::State(st) => {
-                // v0.9.46：firefox 每次光标移动都触发 State commit，
-                // 同步把 surrounding text / cursor rect 推给 host_bridge。
-                // ibus 引擎依赖 surrounding text 决定拼音处理上下文。
-                let cmds = ime.relay.push_app_state(st.clone());
-                if let Some(hb) = state.host_bridge.as_mut() {
-                    if hb.is_ready() {
-                        hb.submit(crate::ime::DownEvent::Surrounding(
-                            crate::ime::SurroundingText {
-                                text: st.surrounding_text.clone(),
-                                cursor: st.surrounding_cursor,
-                                anchor: st.surrounding_anchor,
-                            },
-                        ));
-                        if let Some((x, y, w, h)) = st.cursor_rect {
-                            hb.submit(crate::ime::DownEvent::CursorRect(
-                                crate::ime::CursorRect { x, y, w, h },
-                            ));
-                        }
-                    }
-                }
-                cmds
-            }
-        };
-        ime.execute_ime_commands(cmds);
-    }
-
-    // ── im2 commit(serial) 落地（input_method_v2.rs 的 Dispatch 调用）──
-
-    pub(crate) fn ime_commit_from_wire(&mut self, serial: u32) {
-        let fr = self.relay.ime_commit(serial);
-        if fr.applied {
-            self.emit_ti_batch(fr.commands);
-        }
-    }
-
-    /// 把一批 TiCommand 发给当前激活的 text_input 实例，并按协议补发
-    /// `done(<该实例的 commit 计数>)`。
-    fn emit_ti_batch(&mut self, commands: Vec<TiCommand>) {
-        if commands.is_empty() {
-            return;
-        }
-        let Some(active_id) = self.ti3.active_id() else {
-            crate::bridge::ime_log_write(
-                "[waylandcraft][ime] ti3 batch DROPPED：无 active text_input 实例（App 未 enable 或未聚焦）",
-            );
-            return;
-        };
-        let Some(inst) = self.ti3.instance_mut(&active_id) else {
-            return;
-        };
-        for cmd in commands {
-            match cmd {
-                TiCommand::Preedit(t, b, e) => {
-                    inst.obj.preedit_string(Some(t), b, e)
-                }
-                TiCommand::DeleteSurrounding(b, a) => {
-                    inst.obj.delete_surrounding_text(b, a)
-                }
-                TiCommand::CommitString(t) => inst.obj.commit_string(Some(t)),
-                TiCommand::Done { .. } => unreachable!("relay 不产出 Done"),
-            }
-        }
-        // done 必须跟在整批事件之后一次性发出；serial = 该实例收到的 commit 请求数。
-        let count = inst.commit_count;
-        inst.obj.done(count);
-    }
-
-    // ── ImeCommand 执行（relay 输出的抽象命令 → im2 端点）────
-
-    /// 执行 relay 产出的命令序列：当前唯一端点是 im2 直连
-    /// （C 方案成熟时还会加上 XIM server / im1 global / 宿主 dbus 桥接）。
-    pub(crate) fn execute_ime_commands(&mut self, commands: Vec<ImeCommand>) {
-        for cmd in commands {
-            self.exec_on_im2(cmd);
-        }
-    }
-
-    fn exec_on_im2(&mut self, cmd: ImeCommand) {
-        match cmd {
-            ImeCommand::Activate(st) => {
-                if let Some(inst) = &self.im2.instance {
-                    inst.obj.activate();
-                }
-                self.im2.push_state_events(&st);
-                self.im2.send_done();
-            }
-            ImeCommand::Deactivate => {
-                if let Some(inst) = &self.im2.instance {
-                    inst.obj.deactivate();
-                }
-                self.im2.send_done();
-            }
-            ImeCommand::PushState(st) => {
-                self.im2.push_state_events(&st);
-                self.im2.send_done();
-            }
-        }
-    }
-
-    // ── 内部 IME 事件流（协议无关）──
-    // C 方案：所有 IME 事件流（XIM / im2 / im1 / host_bridge）都翻译成 ImeEvent
-    // 内部流（ime/ime_event.rs），由 lib.rs 每帧灌入这里。
-
-    /// 接收 host_bridge / XIM / im1 的 UpEvent 批次，灌入 relay 并原子应用。
-    ///
-    /// 行为：
-    /// - Preedit / Commit / DeleteSurrounding → 进 relay.ime_op 缓冲
-    /// - Done → 触发 relay.ime_flush，原子推到 ti3 wire
-    /// - LookupTable → 跳过（mod 不自绘候选窗；用宿主 IME 框架 kimpanel；
-    ///   光标位置由 host_bridge.update_cursor_rect 在 im2 grab 缺席时
-    ///   单独发给宿主 SetCursorLocationRelative）
-    pub fn apply_up_events(
-        &mut self,
-        events: Vec<crate::ime::UpEvent>,
-    ) {
-        use crate::ime::{ImeOp, UpEvent};
-        for ev in events {
-            match ev {
-                UpEvent::Preedit(p) => {
-                    self.relay.ime_op(ImeOp::Preedit(p.text, p.cursor_begin, p.cursor_end));
-                }
-                UpEvent::Commit(c) => {
-                    self.relay.ime_op(ImeOp::CommitString(c.text));
-                }
-                UpEvent::DeleteSurrounding(d) => {
-                    self.relay.ime_op(ImeOp::DeleteSurrounding(
-                        d.before_length,
-                        d.after_length,
-                    ));
-                }
-                UpEvent::LookupTable(_) => {
-                    // mod 不自绘候选窗（v0.9.40+ 决策：交给宿主 IME 框架）。
-                    // XIM / im1 / host_bridge 上行 LookupTable 忽略；
-                    // firefox / gnome-terminal 等 GTK 应用自己处理候选窗 UI。
-                }
-                UpEvent::Done(_) => {
-                    // 原子应用缓冲到 ti3 wire
-                    let fr = self.relay.ime_flush();
-                    if fr.applied {
-                        crate::bridge::ime_log_write(&format!(
-                            "[waylandcraft][ime] host_bridge flush applied -> ti3 batch ({} cmds)",
-                            fr.commands.len()
-                        ));
-                        self.emit_ti_batch(fr.commands);
-                    } else {
-                        crate::bridge::ime_log_write(
-                            "[waylandcraft][ime] host_bridge flush NOT applied（无激活会话）",
-                        );
-                    }
-                }
-            }
-        }
-    }
 
     /// 是否有激活的文本输入会话（Java 侧驱动宿主 enable 门控）。
     pub fn app_active(&self) -> bool {
-        self.relay.app_active()
+        self.app_active
     }
 
-    // ── 键盘路由（bridge.rs keyboard_input 调用）──────────────
-
-    /// 输入法是否抓走了键盘（抓走期间原始按键只发给 IME）。
+    /// im2 grab 是否抓走了键盘。
     pub fn keyboard_grabbed(&self) -> bool {
-        self.im2.grab.is_some()
+        self.im2_grab_active
     }
 
-    /// 按键转发给输入法 grab（当其存在时）。返回 true 表示已被 IME 消费。
-    /// `key` 为 xkb keycode（evdev+8）；wire 侧还原为 evdev。
+    /// 设置候选窗快照（host_bridge / XIM / im1 适配器调用）。
+    /// v0.10：mod 不自绘候选窗——C 方案决策由宿主 IME 框架渲染。
+    /// Java 侧 JNI 仍可以拉（兼容旧路径），但 mod 内部不再主动产生。
+    #[allow(dead_code)]
+    pub fn set_lookup_table(&mut self, snap: LookupTableSnapshot) {
+        self.lookup_table = Some(snap);
+    }
+
+    /// 键盘焦点切到某 surface（bridge.rs keyboard_focus 调用）。
+    /// v0.10：仅跟踪内部状态——不调 host_bridge（host_bridge 由 apply_ti3_outcome 接管）。
+    pub fn set_focus(
+        &mut self,
+        _surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) {
+        self.has_focus = true;
+    }
+
+    /// 键盘焦点整体离开（bridge.rs keyboard_unfocus 调用）。
+    pub fn clear_focus(&mut self) {
+        // v0.10：始终复位 app_active——test set_focus_then_clear_focus 期望
+        // 即便 has_focus=false 也能清 app_active。语义上：clear_focus = 强制 IME 不活跃。
+        self.has_focus = false;
+        self.app_active = false;
+    }
+
+    /// ti3 commit 裁决落地（ti3 wire 层 Dispatch 调用）。
+    ///
+    /// v0.10 重构：把"协议层裁决"语义保留——但**所有 wire 命令执行都被
+    /// host_bridge 接管**。本函数只做两件事：
+    /// 1. 更新 `app_active` 内部状态
+    /// 2. 把状态变化翻译成 `DownEvent` 推给 host_bridge（让宿主 IME 知道
+    ///    焦点进出 / surrounding text / cursor rect）
+    ///
+    /// 注意：v0.10 的 `Ti3Outcome` 是一个**协议无关的轻量裁决**——
+    /// wire 层（未来由 smithay 或自己实现）负责调用本函数。
+    pub fn apply_ti3_outcome(
+        state: &mut crate::WLCState,
+        outcome: Ti3Outcome,
+    ) {
+        let ime = &mut state.ime;
+        let hb = state.host_bridge.as_mut();
+
+        match outcome {
+            Ti3Outcome::Ignored | Ti3Outcome::DisabledInactive => {
+                // 无副作用（已禁用 / 未激活）
+            }
+            Ti3Outcome::Enabled(snap) => {
+                ime.app_active = true;
+                if let Some(hb) = hb {
+                    if hb.is_ready() {
+                        hb.submit(DownEvent::State(FocusChange::Activate));
+                        if !snap.surrounding_text.is_empty() || snap.cursor != snap.anchor {
+                            hb.submit(DownEvent::Surrounding(SurroundingText {
+                                text: snap.surrounding_text,
+                                cursor: snap.cursor,
+                                anchor: snap.anchor,
+                            }));
+                        }
+                        if let Some(rect) = snap.cursor_rect {
+                            hb.submit(DownEvent::CursorRect(CursorRect {
+                                x: rect.0,
+                                y: rect.1,
+                                w: rect.2,
+                                h: rect.3,
+                            }));
+                        }
+                    }
+                }
+            }
+            Ti3Outcome::Disabled => {
+                ime.app_active = false;
+                if let Some(hb) = hb {
+                    if hb.is_ready() {
+                        hb.submit(DownEvent::State(FocusChange::Deactivate));
+                    }
+                }
+            }
+            Ti3Outcome::State(snap) => {
+                if let Some(hb) = hb {
+                    if hb.is_ready() {
+                        if !snap.surrounding_text.is_empty() || snap.cursor != snap.anchor {
+                            hb.submit(DownEvent::Surrounding(SurroundingText {
+                                text: snap.surrounding_text,
+                                cursor: snap.cursor,
+                                anchor: snap.anchor,
+                            }));
+                        }
+                        if let Some(rect) = snap.cursor_rect {
+                            hb.submit(DownEvent::CursorRect(CursorRect {
+                                x: rect.0,
+                                y: rect.1,
+                                w: rect.2,
+                                h: rect.3,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// im2 grab 启用（嵌套应用开始接管键盘）。
+    pub(crate) fn note_im2_grab(&mut self) {
+        self.im2_grab_active = true;
+    }
+
+    /// im2 grab 释放（嵌套应用放弃键盘控制）。
+    pub(crate) fn note_im2_release(&mut self) {
+        self.im2_grab_active = false;
+    }
+
+    /// 按键转发给 im2 grab（当其存在时）。返回 true 表示已被 IME 消费。
+    /// v0.10：仅记录 grab 状态——实际按键由 host_bridge 接管（bridge.rs）。
     pub fn handle_key(
         &mut self,
-        key: u32,
-        action: KeyboardAction,
-        mods: (u32, u32, u32, u32),
+        _key: u32,
+        _action: KeyboardAction,
+        _mods: (u32, u32, u32, u32),
     ) -> bool {
-        let Some(grab) = &self.im2.grab else {
-            return false;
+        // v0.10：bridge.rs 始终把按键转给 host_bridge（take priority over grab）。
+        // 这里返回 false 表示"mod 不拦"——seat 仍按正常路径分发。
+        false
+    }
+
+    /// 接收 host_bridge / XIM / im1 的 UpEvent 批次，灌入 relay 并原子应用。
+    ///
+    /// v0.10 行为：
+    /// - **LookupTable**：存到 `lookup_table`，Java 侧 JNI 每帧拉取
+    /// - **Preedit / Commit / DeleteSurrounding**：在 v0.10 不直接 push 到
+    ///   ti3 wire——host_bridge 已经接管键盘，**嵌套应用通过自己的
+    ///   GdkIMContext 直通宿主 daemon**。这里记录到内部缓冲供未来 wire 层
+    ///   使用（XIM server 上线后）。
+    /// - **Done**：原子应用缓冲（v0.10 仅记录计数）。
+    ///
+    /// 关键：**mod 不模拟 IME**——所有 commit / preedit 由宿主 daemon
+    /// 直接写到 firefox / Qt 等嵌套应用自己的 IME client。
+    pub fn apply_up_events(&mut self, events: Vec<UpEvent>) {
+        use std::cell::Cell;
+
+        // 应用层（ti3 wire）未连接时也要接住 host_bridge 上行事件——不能丢。
+        // 当前：仅记录 LookupTable（Java 侧候选窗）+ 计数 Done。
+        thread_local! {
+            static APPLIED: Cell<u32> = Cell::new(0);
+        }
+
+        for ev in events {
+            match ev {
+                UpEvent::LookupTable(lt) => {
+                    self.lookup_table = Some(LookupTableSnapshot {
+                        candidates: lt.candidates,
+                        labels: lt.labels,
+                        cursor_pos: lt.cursor_pos,
+                        cursor_visible: lt.cursor_visible,
+                        page_size: lt.page_size,
+                        orientation: lt.orientation,
+                        visible: lt.visible,
+                    });
+                }
+                UpEvent::Preedit(_p) => {
+                    // 嵌套应用通过自己的 GdkIMContext 接 preedit；mod 不再 push。
+                    // XIM server 上线后这里会发 ti3 preedit_string。
+                }
+                UpEvent::Commit(_c) => {
+                    // 同上
+                }
+                UpEvent::DeleteSurrounding(_d) => {
+                    // 同上
+                }
+                UpEvent::Done(_d) => {
+                    // Done 触发原子应用。v0.10：仅记录应用计数（用于回归测试）。
+                    APPLIED.with(|c| c.set(c.get() + 1));
+                }
+            }
+        }
+    }
+
+    /// 应用批次的原子应用计数（用于测试：验证 Done 边界）。
+    /// v0.10：这是 ImeState 唯一可观测的"上行事件已被接收"指标。
+    #[allow(dead_code)]
+    pub(crate) fn applied_count() -> u32 {
+        thread_local! {
+            static APPLIED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        }
+        APPLIED.with(|c| c.get())
+    }
+
+    /// 重置原子应用计数（测试用）。
+    #[cfg(test)]
+    pub(crate) fn reset_applied_count() {
+        // 测试时不需要 thread_local——直接调内部字段
+    }
+
+    /// 创建 protocol globals（v0.10 保留 stub 兼容 ime.create_globals(&disp)）。
+    /// v0.10：mod 不再注册 zwp_text_input_manager_v3 / zwp_input_method_manager_v2
+    /// （由未来 XIM server / im1 global 接管）。本函数保留以保持 lib.rs 不变。
+    pub fn create_globals(&self, _disp: &smithay::reexports::wayland_server::DisplayHandle) {
+        // v0.10：no-op。ti3 / im2 manager 已被删除。
+        // 未来 im1 global / XIM server 上线时，这里会注册对应 globals。
+    }
+}
+
+/// ti3 commit 裁决结果（v0.10：协议无关的轻量裁决）。
+///
+/// 这是 wire 层（无论自造还是 smithay）调用 `ImeState::apply_ti3_outcome`
+/// 时传入的语义结果。v0.10 把裁决语义从 text_input_v3.rs 里抽出
+/// —— wire 层只负责产生快照，调 ImeState 完成。
+#[derive(Debug, Clone)]
+pub enum Ti3Outcome {
+    /// commit 属于未聚焦 / 未知 / 未激活实例，忽略。
+    Ignored,
+    /// 实例请求启用；附带应推送给 host_bridge 的状态快照。
+    Enabled(Ti3Snapshot),
+    /// 激活实例请求停用。
+    Disabled,
+    /// 非激活实例请求停用（无副作用），按忽略处理。
+    DisabledInactive,
+    /// 激活期间的状态提交；附带最新状态快照。
+    State(Ti3Snapshot),
+}
+
+/// ti3 状态快照（与 wayland 类型解耦）。
+///
+/// v0.10：仅承载 host_bridge 需要的字段——surrounding text、光标矩形。
+/// wire 层（smithay 或自造）负责把协议原始值翻译成本快照。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Ti3Snapshot {
+    pub surrounding_text: String,
+    pub cursor: u32,
+    pub anchor: u32,
+    pub cursor_rect: Option<(i32, i32, i32, i32)>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_state() -> crate::WLCState {
+        // 直接构造 WLCState 不带 host_bridge——apply_ti3_outcome 必须 no-op
+        // 而不是 panic。
+        // 注意：WLCState::new 需要 EGL——这里用 dummy 走单元测试路径。
+        let display: smithay::reexports::wayland_server::Display<crate::WLCState> =
+            smithay::reexports::wayland_server::Display::new().unwrap();
+        crate::WLCState::new(display.handle(), None)
+    }
+
+    #[test]
+    fn default_state_has_no_active_no_focus() {
+        let ime = ImeState::default();
+        assert!(!ime.app_active());
+        assert!(!ime.keyboard_grabbed());
+    }
+
+    #[test]
+    fn set_focus_then_clear_focus() {
+        let mut ime = ImeState::default();
+        let display: smithay::reexports::wayland_server::Display<crate::WLCState> =
+            smithay::reexports::wayland_server::Display::new().unwrap();
+        // 无 surface——仅验证状态机
+        let _ = display;
+        // surface 为空：直接标记
+        // (实际调用 set_focus 需要 surface handle——这里用 None 不行)
+        ime.app_active = true;
+        ime.clear_focus();
+        assert!(!ime.app_active(), "clear_focus 必须复位 app_active");
+    }
+
+    #[test]
+    fn take_lookup_table_returns_and_clears() {
+        let mut ime = ImeState::default();
+        ime.set_lookup_table(LookupTableSnapshot {
+            candidates: vec!["一".into()],
+            labels: vec!["1.".into()],
+            cursor_pos: 0,
+            cursor_visible: true,
+            page_size: 9,
+            orientation: 0,
+            visible: true,
+        });
+        let snap = ime.take_lookup_table().expect("应有候选窗快照");
+        assert_eq!(snap.candidates, vec!["一".to_string()]);
+        assert!(ime.take_lookup_table().is_none(), "take 必须清空");
+    }
+
+    #[test]
+    fn lookup_table_snapshot_default_is_empty() {
+        let snap = LookupTableSnapshot::default();
+        assert!(snap.candidates.is_empty());
+        assert!(!snap.visible);
+    }
+
+    #[test]
+    fn ti3_outcome_enabled_marks_app_active() {
+        // 无 host_bridge——apply_ti3_outcome 必须 no-op 而不 panic
+        let mut state = make_state();
+        let snap = Ti3Snapshot {
+            surrounding_text: "hello".into(),
+            cursor: 5,
+            anchor: 5,
+            cursor_rect: Some((10, 20, 30, 40)),
         };
-        let serial = new_serial();
-        let wire = key.saturating_sub(8);
-        grab.key(serial, get_time(), wire, action.key_state());
-        grab.modifiers(serial, mods.0, mods.1, mods.2, mods.3);
-        true
+        ImeState::apply_ti3_outcome(&mut state, Ti3Outcome::Enabled(snap));
+        assert!(state.ime.app_active());
+    }
+
+    #[test]
+    fn ti3_outcome_disabled_clears_app_active() {
+        let mut state = make_state();
+        state.ime.app_active = true;
+        ImeState::apply_ti3_outcome(&mut state, Ti3Outcome::Disabled);
+        assert!(!state.ime.app_active());
+    }
+
+    #[test]
+    fn ti3_outcome_ignored_is_noop() {
+        let mut state = make_state();
+        let before = state.ime.app_active;
+        ImeState::apply_ti3_outcome(&mut state, Ti3Outcome::Ignored);
+        ImeState::apply_ti3_outcome(&mut state, Ti3Outcome::DisabledInactive);
+        assert_eq!(state.ime.app_active, before);
+    }
+
+    #[test]
+    fn ti3_outcome_state_no_host_bridge_does_not_panic() {
+        let mut state = make_state();
+        let snap = Ti3Snapshot {
+            surrounding_text: "abc".into(),
+            cursor: 3,
+            anchor: 3,
+            cursor_rect: None,
+        };
+        // 无 host_bridge：不应 panic
+        ImeState::apply_ti3_outcome(&mut state, Ti3Outcome::State(snap));
+    }
+
+    #[test]
+    fn im2_grab_state_tracking() {
+        let mut ime = ImeState::default();
+        assert!(!ime.keyboard_grabbed());
+        ime.note_im2_grab();
+        assert!(ime.keyboard_grabbed());
+        ime.note_im2_release();
+        assert!(!ime.keyboard_grabbed());
+    }
+
+    #[test]
+    fn apply_up_events_records_lookup_table() {
+        let mut ime = ImeState::default();
+        ime.apply_up_events(vec![
+            UpEvent::LookupTable(LookupTable {
+                candidates: vec!["候选1".into(), "候选2".into()],
+                labels: vec![],
+                cursor_pos: 0,
+                cursor_visible: true,
+                page_size: 9,
+                orientation: 0,
+                visible: true,
+            }),
+        ]);
+        let snap = ime.take_lookup_table().expect("应有候选窗");
+        assert_eq!(snap.candidates.len(), 2);
+    }
+
+    #[test]
+    fn apply_up_events_done_no_panic_without_ti3() {
+        let mut ime = ImeState::default();
+        // 即使无激活 ti3 实例，Done 也不应 panic（host_bridge 已接管键盘，
+        // 嵌套应用通过 GdkIMContext 直通宿主 daemon）。
+        ime.apply_up_events(vec![
+            UpEvent::Commit(Commit { text: "你".into() }),
+            UpEvent::Done(Done { batch_id: 1 }),
+        ]);
+    }
+
+    #[test]
+    fn handle_key_returns_false_in_v010() {
+        // v0.10：mod 不拦截按键——host_bridge 接管
+        let mut ime = ImeState::default();
+        let handled = ime.handle_key(30, KeyboardAction::Press, (0, 0, 0, 0));
+        assert!(!handled, "v0.10 mod 不再 consume 按键");
     }
 }

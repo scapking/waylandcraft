@@ -10,7 +10,6 @@ use smithay::{
     backend::allocator::dmabuf::Dmabuf,
     delegate_compositor, delegate_dmabuf, delegate_shm,
     delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_shell,
-    input::SeatState,
     reexports::{
         calloop::{self, EventLoop, generic::Generic as GenericEvent},
         wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
@@ -60,9 +59,6 @@ mod output;
 mod process;
 mod satellite;
 mod seat;
-/// Step 1 新增：smithay::input::SeatHandler impl（仅满足 trait 约束，不接管 dispatch）。
-/// 详见模块头注释。
-mod seat_smithay;
 mod svg;
 mod utils;
 mod xdg_spec;
@@ -91,24 +87,14 @@ pub struct WLCState {
     pub dmabuf_state: DmabufState,
     pub requests: WindowRequests,
     pub seat: WLCSeatState,
-    /// Step 1 新增：smithay SeatState 字段。
-    /// 当前是空壳——没有调 `SeatState::new_seat` 创建 smithay 自己的 WlSeat global，
-    /// 仅作 smithay im2 / ti3 manager 编译要求。
-    /// 详见 seat_smithay.rs 模块头注释。
-    pub smithay_seat_state: SeatState<Self>,
-    pub ime: ImeState,
-    pub data: WLCDataState,
-    pub output: WLCOutput,
     /// dmabuf 共享全局；无可用渲染节点时为 None（客户端自动回退 shm 路径）。
     pub dmabuf_global: Option<DmabufGlobal>,
     /// 宿主 IME 桥接（v0.9.45+：让 apply_ti3_outcome / lib.rs::update
     /// 都能访问；之前只在 WaylandCraft 上有，但 Dispatch 路径拿不到）。
     pub host_bridge: Option<crate::host_bridge::HostBridgeHandle>,
-    // Step 2 NOTE: smithay im2 / ti3 manager 字段**已删除**——
-// `delegate_input_method_manager!` 与现有自造 input_method_v2.rs
-// 的 Dispatch<ZwpInputMethodManagerV2, ()> for WLCState 冲突
-// （E0119 conflicting implementations）。详见
-// docs/agent/implementation/STEP_2.md。
+    pub ime: ImeState,
+    pub data: WLCDataState,
+    pub output: WLCOutput,
 }
 
 #[derive(Default)]
@@ -169,16 +155,10 @@ impl WLCState {
             dmabuf_global,
             requests: WindowRequests::default(),
             seat,
-            // Step 1：新增 smithay SeatState 字段。空 SeatState::new()——
-            // 没调 SeatState::new_seat 也没 delegate_seat!，所以 WlSeat dispatch
-            // 仍由 seat.rs 自造，键盘路径完全不变。详见 seat_smithay.rs。
-            smithay_seat_state: SeatState::new(),
             ime,
             data,
             output,
             host_bridge: None, // WaylandCraft::update() 每帧同步（避免双 owner）
-            // Step 2 NOTE: im_smithay_manager / ti_smithay_manager 创建已删除。
-            // 详见 docs/agent/implementation/STEP_2.md。
         }
     }
 }
@@ -473,11 +453,5 @@ delegate_xdg_shell!(WLCState);
 delegate_viewporter!(WLCState);
 delegate_single_pixel_buffer!(WLCState);
 delegate_dmabuf!(WLCState);
-// Step 2 NOTE: delegate_input_method_manager! / delegate_text_input_manager!
-// **编译失败**——与现有 ime/input_method_v2.rs 的
-//   Dispatch<ZwpInputMethodManagerV2, ()> for WLCState
-//   Dispatch<ZwpTextInputManagerV3, ()> for WLCState
-// 完全冲突（E0119）。详见 docs/agent/implementation/STEP_2.md。
-// Step 2 撤销——保留 im_smithay.rs 模块但不使用 manager。
 // delegate_input_method_manager!(WLCState);
 // delegate_text_input_manager!(WLCState);
