@@ -1495,17 +1495,40 @@ fn keyboard_input<'local>(
     let action = KeyboardAction::from_i32(action)
         .ok_or(BridgeError::UnknownKeyboardState(action))?;
 
-    // 输入法已 grab 键盘（游戏内 im2）→ 按键先发给 IME。
+    // 1) 输入法已 grab 键盘（游戏内 im2）→ 按键先发给 IME。
     let mods = instance.state.seat.modifiers_tuple();
     let mut handled = instance
         .state
         .ime
         .handle_key(scancode as u32, action, mods);
 
-    // host_ime 穿透已删 —— 嵌套应用通过自己的 GdkIMContext（GTK/Qt）直接连
-    // 宿主 IME daemon。mod 不再接管键盘，键事件直投递给 seat。
-    // C 方案未来：XIM server / im1 global 在 [XIM server] / [im1 global] 模块
-    // 接管按键并转发给宿主 dbus-ibus。
+    // 2) C 方案：host_bridge 接嵌套应用键盘事件，转发到宿主 dbus-ibus/dbus-fcitx5。
+    //    关键：嵌套应用（firefox/gnome-terminal）**不**用 GdkIMContext 直通——
+    //    mod 接管键盘，host_bridge 触发宿主引擎，commit/preedit 由 mod 通过 ti3
+    //    推到 firefox 文本框。这样**双客户端冲突消失**。
+    //
+    //    firefox 自己的 GdkIMContext 路径仍然可用（firefox 仍连宿主 ibus），
+    //    但**只在 host_bridge 没接管时**生效——目前 host_bridge 永远接管，
+    //    所以 firefox GdkIMContext 实际上**收不到键盘**。
+    if !handled {
+        if let Some(hb) = &mut instance.host_bridge {
+            if hb.is_ready() {
+                use crate::ime::KeyEvent;
+                let keycode = scancode as u32;
+                let ke = KeyEvent {
+                    keycode,
+                    action: action, // crate::seat::KeyboardAction 重新导出在 ime
+                    mods,
+                };
+                crate::bridge::ime_log_write(&format!(
+                    "[waylandcraft][ime] bridge submit_key scancode={keycode} action={:?}",
+                    action
+                ));
+                hb.submit(crate::ime::DownEvent::Key(ke));
+                handled = true; // 吞下，不投递给 seat（避免双客户端）
+            }
+        }
+    }
 
     if !handled {
         instance.state.seat.keyboard_key(scancode as u32, action);
