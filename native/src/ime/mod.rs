@@ -184,15 +184,28 @@ impl ImeState {
                 );
                 // 先把首批状态灌入 relay 缓存（未激活时只更新不产出命令），
                 // 使随后的 Activate 单周期携带最新状态，避免多余的 done 往返。
-                let _ = ime.relay.push_app_state(st);
-                // v0.9.45 修法：同时通知 host_bridge FocusIn。
-                // 没有 FocusIn，ibus 引擎收到 ProcessKeyEvent 但不处理
-                // （InputContext 状态 unfocused）→ 永远不发回 commit/preedit。
+                let _ = ime.relay.push_app_state(st.clone());
+                // v0.9.46 修法：通知 host_bridge FocusIn + Surrounding + CursorRect。
+                // 没有 Surrounding Text / CursorLocation，ibus 引擎"看"不到
+                // 上下文（process_key_event line 1143 走 fake_context 兜底）→
+                // 永远不发回 commit/preedit。这是 v0.9.45 实机 0 commit 的真正根因。
                 if let Some(hb) = state.host_bridge.as_mut() {
                     if hb.is_ready() {
                         hb.submit(crate::ime::DownEvent::State(
                             crate::ime::FocusChange::Activate,
                         ));
+                        hb.submit(crate::ime::DownEvent::Surrounding(
+                            crate::ime::SurroundingText {
+                                text: st.surrounding_text.clone(),
+                                cursor: st.surrounding_cursor,
+                                anchor: st.surrounding_anchor,
+                            },
+                        ));
+                        if let Some((x, y, w, h)) = st.cursor_rect {
+                            hb.submit(crate::ime::DownEvent::CursorRect(
+                                crate::ime::CursorRect { x, y, w, h },
+                            ));
+                        }
                     }
                 }
                 ime.relay.set_app_enabled(true, "ti3.enable")
@@ -212,7 +225,29 @@ impl ImeState {
                 }
                 ime.relay.set_app_enabled(false, "ti3.disable")
             }
-            O::State(st) => ime.relay.push_app_state(st),
+            O::State(st) => {
+                // v0.9.46：firefox 每次光标移动都触发 State commit，
+                // 同步把 surrounding text / cursor rect 推给 host_bridge。
+                // ibus 引擎依赖 surrounding text 决定拼音处理上下文。
+                let cmds = ime.relay.push_app_state(st.clone());
+                if let Some(hb) = state.host_bridge.as_mut() {
+                    if hb.is_ready() {
+                        hb.submit(crate::ime::DownEvent::Surrounding(
+                            crate::ime::SurroundingText {
+                                text: st.surrounding_text.clone(),
+                                cursor: st.surrounding_cursor,
+                                anchor: st.surrounding_anchor,
+                            },
+                        ));
+                        if let Some((x, y, w, h)) = st.cursor_rect {
+                            hb.submit(crate::ime::DownEvent::CursorRect(
+                                crate::ime::CursorRect { x, y, w, h },
+                            ));
+                        }
+                    }
+                }
+                cmds
+            }
         };
         ime.execute_ime_commands(cmds);
     }
