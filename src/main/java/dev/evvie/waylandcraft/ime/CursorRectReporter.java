@@ -14,6 +14,12 @@ import net.minecraft.client.gui.components.events.GuiEventListener;
  * 每 tick 检查当前 Screen 里聚焦的 EditBox，取其光标屏幕坐标，
  * 位置变化时经 JNI 上报 → Rust SetCursorRect（fcitx5）/
  * SetCursorLocationRelative（ibus），让桌面候选窗钉在光标处。
+ *
+ * C 方案（v0.9.39 之后）：mod 不再当 IME 引擎，光标上报仅在 XIM 路径
+ * （xterm 等纯 X11 应用）有效。当前 firefox 等 ti3 应用自己处理候选窗
+ * 锚点（通过 zwp_text_input_v3.set_cursor_rectangle）。本类调用的
+ * updateCursorRectNative 是 no-op 兼容函数 ——保留类是为不破坏 Java 端
+ * 旧调用，但实际不产生效果。
  */
 public final class CursorRectReporter {
 	private static int lastX = Integer.MIN_VALUE;

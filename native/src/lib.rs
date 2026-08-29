@@ -69,6 +69,10 @@ pub(crate) struct WaylandCraft<'a> {
     pub bridge: BridgeState,
     pub egl: EGLHelper,
     pub xdg: XDGSpecHelper,
+    /// 宿主 IME 桥接（dbus-ibus / dbus-fcitx5）。
+    /// 启动时探测一次；连接断开后由 update() 重建。
+    /// 当前用途：C 方案 Layer 3 等待 XIM server 上线后启用。
+    pub host_bridge: Option<crate::host_bridge::HostBridgeHandle>,
 }
 
 pub struct WLCState {
@@ -325,9 +329,31 @@ pub(crate) fn wlc_init(
     // （wayland-ti3 → dbus-ibus → …）。全部不可用为结构性不支持（不再重试）；
     // 暂时性失败（连接/总线问题）会在 update() 里自动重试。
     let mut ime_ready = false;
-    // host_ime/system_ime 穿透已删 —— 嵌套应用通过自己的 GdkIMContext
-    // 直接连宿主 IME daemon（ibus / fcitx5）。本进程不再当中间人。
-    eprintln!("[waylandcraft] 嵌套合成器模式：app 通过原生 IME 协议直接连宿主");
+    // C 方案：探测宿主 IME daemon（dbus-ibus / dbus-fcitx5）。
+    // 启动成功仅记录日志——当前 firefox 通过 GdkIMContext 直通宿主，
+    // 不需要 mod 介入。XIM server 上线后 host_bridge 才真正被使用。
+    let host_bridge = match crate::host_bridge::probe() {
+        crate::host_bridge::BridgeInit::Ready(b) => {
+            eprintln!(
+                "[waylandcraft][host_bridge] OK -> {} (C 方案 Layer 3)",
+                b.name()
+            );
+            ime_ready = true;
+            Some(crate::host_bridge::HostBridgeHandle::new(b))
+        }
+        crate::host_bridge::BridgeInit::Transient(msg) => {
+            eprintln!(
+                "[waylandcraft][host_bridge] TRANSIENT: {msg}（无宿主 IME daemon；XIM server 上线后将不可用）"
+            );
+            None
+        }
+        crate::host_bridge::BridgeInit::Unsupported(msg) => {
+            eprintln!(
+                "[waylandcraft][host_bridge] UNSUPPORTED: {msg}（无 ibus/fcitx5 守护进程）"
+            );
+            None
+        }
+    };
 
     // Start xwayland-satellite to provide an X11 display for X11-only apps
     match satellite::start_satellite(&state.socket) {
@@ -374,6 +400,7 @@ pub(crate) fn wlc_init(
         bridge: BridgeState::new(),
         egl,
         xdg,
+        host_bridge,
     };
     Ok(instance)
 }
@@ -383,7 +410,14 @@ impl<'a> WaylandCraft<'a> {
         // 嵌套合成器更新：嵌套应用通过原生 IME 协议（XIM / im2 / im1）
         // 直接连宿主 IME daemon。mod 不参与 IME 桥接。
         // 待办：实现 XIM server（X11 应用）+ im1 global（ibus-wayland）
-        //       + host_bridge（统一把 XIM/im2/im1 转给宿主 dbus-ibus/fcitx5）
+        //       + host_bridge 跟 im2 grab / XIM / im1 三路对接
+
+        // host_bridge 每帧 drain 上行事件（commit/preedit/delete/lookup）。
+        // C 方案 XIM server 上线后这些事件会通过这里灌入 relay；当前 no-op。
+        if let Some(hb) = &mut self.host_bridge {
+            let _batches = hb.take_up_events_batched();
+            // TODO: 把 batches 通过 ime.apply_im_events() 灌入 relay
+        }
 
         let state = &mut self.state;
         let event_loop = &mut self.event_loop;
