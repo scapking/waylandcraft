@@ -52,6 +52,7 @@ mod desktop_windows;
 mod portal_capture;
 mod audio_capture;
 mod egl;
+mod host_bridge;
 mod ime;
 mod java_types;
 mod output;
