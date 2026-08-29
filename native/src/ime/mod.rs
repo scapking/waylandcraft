@@ -31,6 +31,7 @@
 //! [未来] ibus-wayland → im1 global → 内部 ImeEvent → 宿主 dbus-ibus
 //! ```
 
+mod ime_event;
 mod input_method_v2;
 mod relay;
 mod text_input_v3;
@@ -38,6 +39,10 @@ mod text_input_v3;
 #[cfg(test)]
 mod tests;
 
+pub use ime_event::{
+    Commit, CursorRect, DeleteSurrounding, Done, DownEvent, FocusChange, KeyEvent,
+    LookupTable, PreeditUpdate, SurroundingText, UpEvent,
+};
 pub use input_method_v2::InputMethodV2State;
 pub use relay::{AppState, ImeCommand, ImeOp, Relay, TiCommand};
 pub use text_input_v3::TextInputV3State;
