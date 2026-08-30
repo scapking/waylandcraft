@@ -47,6 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod bridge;
+mod diagnostic;
 mod ddm;
 mod desktop_windows;
 mod portal_capture;

@@ -364,6 +364,11 @@ bind_java_type! {
             name = "setImeLogFileNative",
             fn = set_ime_log_file,
         },
+        static extern fn run_ime_diagnostic {
+            sig = (instance: jlong) -> JString,
+            name = "runImeDiagnosticNative",
+            fn = run_ime_diagnostic,
+        },
         static extern fn native_version {
             sig = () -> JString,
             name = "nativeVersionNative",
@@ -1702,6 +1707,20 @@ fn set_ime_log_file<'local>(
     }
 }
 
+/// runImeDiagnostic(instance) —— 跑完整输入法故障链诊断（v0.11.0+）。
+///
+/// 返回 JSON 字符串（含 [PASS]/[FAIL] + 根因 + 修复建议）。
+/// Java 端可在控制台 `wl ime diagnostic` 调用，结果在 Minecraft log 显示。
+fn run_ime_diagnostic<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "runImeDiagnostic")?;
+    let report = instance.state.run_diagnostic();
+    env.new_string(report).map_err(BridgeError::JniError)
+}
+
 /// notifyHostFocusGained(instance) —— Minecraft 窗口重新获得 OS 键盘焦点。
 ///
 /// 供输入法穿透的事件驱动焦点重协商使用：若穿透 text_input 因创建晚于
@@ -2598,3 +2617,69 @@ fn get_desktop_windows<'local>(
 
     Ok(result_array)
 }
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    use crate::diagnostic::{CheckStatus, DiagnosticCheck, DiagnosticReport};
+
+    #[test]
+    fn diagnostic_check_pass_render() {
+        let check = DiagnosticCheck::pass("test_layer", "test detail");
+        assert_eq!(check.status, CheckStatus::Pass);
+        assert_eq!(check.layer, "test_layer");
+        assert_eq!(check.detail, "test detail");
+        assert!(check.root_cause.is_none());
+        assert!(check.suggestion.is_none());
+    }
+
+    #[test]
+    fn diagnostic_check_fail_has_root_cause() {
+        let check = DiagnosticCheck::fail(
+            "test_layer", "detail", "ROOT CAUSE", "SUGGESTION",
+        );
+        assert_eq!(check.status, CheckStatus::Fail);
+        assert_eq!(check.root_cause.as_deref(), Some("ROOT CAUSE"));
+        assert_eq!(check.suggestion.as_deref(), Some("SUGGESTION"));
+    }
+
+    #[test]
+    fn diagnostic_check_warn_has_suggestion() {
+        let check = DiagnosticCheck::warn("test", "detail", "fix it");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert_eq!(check.suggestion.as_deref(), Some("fix it"));
+    }
+
+    #[test]
+    fn diagnostic_check_skip_no_cause() {
+        let check = DiagnosticCheck::skip("test", "detail");
+        assert_eq!(check.status, CheckStatus::Skip);
+    }
+
+    #[test]
+    fn diagnostic_render_includes_all_layers() {
+        let report = DiagnosticReport {
+            checks: vec![
+                DiagnosticCheck::pass("layer_a", "detail_a"),
+                DiagnosticCheck::fail("layer_b", "detail_b", "rc", "sug"),
+            ],
+        };
+        let rendered = report.render();
+        assert!(rendered.contains("[PASS] layer_a: detail_a"));
+        assert!(rendered.contains("[FAIL] layer_b: detail_b"));
+        assert!(rendered.contains("Root cause: rc"));
+        assert!(rendered.contains("Suggestion: sug"));
+        assert!(rendered.contains("RESULT: INPUT METHOD BROKEN"));
+    }
+
+    #[test]
+    fn diagnostic_render_pass_healthy() {
+        let report = DiagnosticReport {
+            checks: vec![DiagnosticCheck::pass("l1", "ok")],
+        };
+        let rendered = report.render();
+        assert!(rendered.contains("[PASS] l1: ok"));
+        assert!(rendered.contains("RESULT: INPUT METHOD HEALTHY"));
+    }
+}
+
