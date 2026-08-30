@@ -1251,21 +1251,21 @@ fn update_surface_tree<'local>(
                 0
             };
 
-            surface.set_parent_handle(env, parent_handle).unwrap();
+            if let Err(e) = surface.set_parent_handle(env, parent_handle) { eprintln!("[bridge] set_parent_handle: {e:?}"); };
 
             // Set last child to point to this current surface
             if !last_child.is_null() {
-                last_child.set_next_child(env, &surface).unwrap();
+                if let Err(e) = last_child.set_next_child(env, &surface) { eprintln!("[bridge] set_next_child: {e:?}"); };
             }
 
             // Set this surfaces nextChild to null
-            surface.set_next_child(env, WLCSurface::null()).unwrap();
+            if let Err(e) = surface.set_next_child(env, WLCSurface::null()) { eprintln!("[bridge] set_next_child null: {e:?}"); };
 
             // Set this surfaces prevChild to the last child
-            surface.set_prev_child(env, &last_child).unwrap();
+            if let Err(e) = surface.set_prev_child(env, &last_child) { eprintln!("[bridge] set_prev_child: {e:?}"); };
 
             // Mark this surface as visited
-            surface.set_visited(env, true).unwrap();
+            if let Err(e) = surface.set_visited(env, true) { eprintln!("[bridge] set_visited: {e:?}"); };
 
             // Set subsurface location
             let (sx, sy) = if data.cached_state.has::<SubsurfaceCachedState>() {
@@ -1277,8 +1277,8 @@ fn update_surface_tree<'local>(
                 (0, 0)
             };
 
-            surface.set_xoff(env, sx).unwrap();
-            surface.set_yoff(env, sy).unwrap();
+            if let Err(e) = surface.set_xoff(env, sx) { eprintln!("[bridge] set_xoff: {e:?}"); };
+            if let Err(e) = surface.set_yoff(env, sy) { eprintln!("[bridge] set_yoff: {e:?}"); };
 
             last_child = surface;
         },
