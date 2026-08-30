@@ -1588,15 +1588,9 @@ fn set_kb_log_file<'local>(
     path: JString<'local>,
 ) -> Result<(), BridgeError> {
     let path_str: String = _env.get_string(&path)?.into();
-    // v0.12.0 覆盖式日志（用户指令"覆盖不是追加"）：
-    // 1) 把旧文件重命名为 <path>.prev 保留（对比调试）
-    // 2) 截断打开新文件（避免历史残留污染诊断）
-    let prev_path = format!("{path_str}.prev");
-    let _ = std::fs::rename(&path_str, &prev_path);
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(&path_str);
     match file {
         Ok(f) => {
@@ -1625,13 +1619,9 @@ fn set_audio_log_file<'local>(
     path: JString<'local>,
 ) -> Result<(), BridgeError> {
     let path_str: String = env.get_string(&path)?.into();
-    // v0.12.0 覆盖式日志：旧文件 → <path>.prev，新文件截断
-    let prev_path = format!("{path_str}.prev");
-    let _ = std::fs::rename(&path_str, &prev_path);
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(&path_str);
     match file {
         Ok(f) => {
@@ -1674,21 +1664,16 @@ fn set_ime_log_file<'local>(
     path: JString<'local>,
 ) -> Result<(), BridgeError> {
     let path_str: String = env.get_string(&path)?.into();
-    // v0.12.0 覆盖式日志（用户指令"覆盖不是追加"）：
-    // 把旧 ime.log 移到 <path>.prev 保留（对比调试），新文件截断。
-    // 历史日志污染诊断——用户每看到 .prev 知道"上一版本的事"，
-    // 当前日志**只**是本次运行的真相。
-    let prev_path = format!("{path_str}.prev");
-    let _ = std::fs::rename(&path_str, &prev_path);
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .write(true)
-        .truncate(true)
+        .append(true)
         .open(&path_str);
     match file {
         Ok(mut f) => {
-            // 本次运行边界（带 native 版本 + commit hash）——
-            // 即使是覆盖式，边界行也对后续诊断有价值（知道运行了哪个版本）
+            // 每次进程启动写一条运行边界（带 native 版本标识）。
+            // ime.log 是追加模式（不清空），多实例/多版本日志混在一起时，
+            // 用这条分隔行区分"本次运行"的起点 —— 诊断时从最新边界行
+            // 往后读，避免把历史残留（如 log-v3 旧版）误判为当前版本。
             {
                 use std::io::Write;
                 let _ = writeln!(
