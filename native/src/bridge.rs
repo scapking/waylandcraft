@@ -1590,9 +1590,13 @@ fn set_kb_log_file<'local>(
     path: JString<'local>,
 ) -> Result<(), BridgeError> {
     let path_str: String = _env.get_string(&path)?.into();
+    // v0.11.4 覆盖式日志（用户指令"覆盖不是追加"）：
+    // 旧文件 → <path>.prev 保留（诊断对比）
+    let _ = std::fs::rename(&path_str, &format!("{path_str}.prev"));
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&path_str);
     match file {
         Ok(f) => {
@@ -1621,9 +1625,11 @@ fn set_audio_log_file<'local>(
     path: JString<'local>,
 ) -> Result<(), BridgeError> {
     let path_str: String = env.get_string(&path)?.into();
+    let _ = std::fs::rename(&path_str, &format!("{path_str}.prev"));
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&path_str);
     match file {
         Ok(f) => {
@@ -1666,9 +1672,11 @@ fn set_ime_log_file<'local>(
     path: JString<'local>,
 ) -> Result<(), BridgeError> {
     let path_str: String = env.get_string(&path)?.into();
+    let _ = std::fs::rename(&path_str, &format!("{path_str}.prev"));
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
+        .truncate(true)
         .open(&path_str);
     match file {
         Ok(mut f) => {
