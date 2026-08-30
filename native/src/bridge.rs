@@ -1558,10 +1558,12 @@ fn keyboard_input<'local>(
         }
     }
 
-    if !handled {
-        instance.state.seat.keyboard_key(scancode as u32, action);
-    }
-
+    // v0.11.3 修：v0.11.0 commit message 说"删 Path B"——但代码 fall through
+    // `if !handled { seat.keyboard_key() }` 仍存在。**真删**——host_bridge
+    // 是唯一键盘通道。如果 host_bridge 没接管，按键**丢失**（GNOME 原生
+    // IME daemon 死亡时一样行为）。也修了一个隐藏 bug——fall through
+    // 可能调 seat.keyboard_key 时 xkb_state 未就绪（user 报告"创建窗口
+    // 或放置时崩溃"的可能根因之一）。
     Ok(())
 }
 
