@@ -1515,19 +1515,20 @@ fn keyboard_input<'local>(
             if hb.is_ready() {
                 use crate::ime::{KeyEvent};
                 use crate::seat::KeyboardAction as KA;
-                // v0.9.44 修法：只把 press / repeat 发给 host_bridge，
-                // release 立即放行给 seat（firefox 自己的 GdkIMContext 需要
-                // release 来消 preedit——只吞 press 会让 ibus 引擎收不到
-                // release 事件 → preedit 卡死 → "字母到窗口"）。
-                // 这一改动了"完全吞键"的策略：press 仍吞，release 放行。
+                // v0.11.0：mod 接管键盘（仅 mod 转发给宿主 ibus）。
+                // 删 v0.9.43-v0.10.2 的双路（seat.keyboard_key）——**双路**
+                // 导致 firefox GdkIMContext 与 mod 独立工作：
+                //   - 字母键到窗口（Path B：firefox GdkIMContext）
+                //   - 拼音+数字到窗口（Path B 主导）
+                //   - 偶尔 commit 进（Path A：mod ti3 推）
+                // v0.11 删 Path B：mod 完全吞键——firefox 不再收到 raw key——
+                // firefox 自己的 GdkIMContext 不工作——**只有** mod 通过 ti3 推
+                // commit 文本到 firefox 文本框。
+                // 候选窗由宿主 ibus kimpanel 显示（独立窗口，不嵌入 firefox）。
                 match action {
-                    KA::Press | KA::Repeat => {
+                    KA::Press | KA::Repeat | KA::Release => {
                         let keycode = scancode as u32;
-                        // v0.10.2 修：必须用 xkb 解码 keysym 传给 host_bridge。
-                        // 之前传 keysym=0 硬编码（v0.9.40 笔记"调用方预解析"
-                        // 从未实现）——ibus 引擎不知道按了什么键——0 commit。
-                        // seat.xkb_state 不更新 state（key_get_one_sym 是纯 query），
-                        // 可以安全调用。
+                        // v0.10.2：xkb 解码 keysym（不是 evdev，是 ibus keyval）
                         let keysym = instance
                             .state
                             .seat
@@ -1545,19 +1546,7 @@ fn keyboard_input<'local>(
                             action
                         ));
                         hb.submit(crate::ime::DownEvent::Key(ke));
-                        // press 也放行给 seat（firefox 自己的 ti3 也能看到键盘
-                        // 事件作为 raw text 流入）。这是**双路**：mod 转发给宿主
-                        // ibus（拿 commit/preedit）+ seat 转发给 firefox（拿 raw
-                        // 字母）。firefox 自己会用 im2 grab 截获 seat 端的按键
-                        // 并丢弃 raw text——只显示 commit 汉字。
-                        instance.state.seat.keyboard_key(scancode as u32, action);
-                        handled = true;
-                    }
-                    KA::Release => {
-                        // release 放行给 seat（firefox 自己的 ti3 需要它来
-                        // 完成 press-release 配对）。
-                        instance.state.seat.keyboard_key(scancode as u32, action);
-                        handled = true;
+                        handled = true; // **v0.11 完全吞**——不调 seat.keyboard_key
                     }
                 }
             }

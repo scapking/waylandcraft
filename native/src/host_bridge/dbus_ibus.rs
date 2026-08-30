@@ -394,10 +394,24 @@ fn command_loop(
                 .map_err(|e| e.to_string()),
             ToWorker::ProcessKey { keysym, evdev, state } => {
                 // 同步调 ProcessKeyEvent（不等 reply——commit 驱动模式）
-                let _ = ic_conns
+                // v0.11.0 修：之前 `let _ = ...` 静默丢弃 zbus 错误——
+                // 49 次 submit / 0 ProcessKeyEvent 日志就是这 bug。
+                // 现在显式记录 zbus 调用结果（成功 + consumed、失败）。
+                let call_result = ic_conns
                     .ic
                     .call::<_, _, bool>("ProcessKeyEvent", &(keysym, evdev, state));
-                // reply 不重要（hybrid async 100% 超时实测）；不发送 FromWorker
+                match call_result {
+                    Ok(consumed) => {
+                        ime_log!(
+                            "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent keysym={keysym:#x} evdev={evdev} state={state:#x} -> consumed={consumed}"
+                        );
+                    }
+                    Err(e) => {
+                        ime_log!(
+                            "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent 失败 keysym={keysym:#x} evdev={evdev} state={state:#x}: {e}"
+                        );
+                    }
+                }
                 Ok(())
             }
             ToWorker::Ping => Ok(()),
