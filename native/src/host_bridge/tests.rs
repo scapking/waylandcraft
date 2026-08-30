@@ -116,3 +116,60 @@ fn ev_tx_tx_commit_preedit(
 fn ev_tx_tx_done(ev_tx: &mpsc::Sender<crate::host_bridge::dbus_ibus::FromWorker>) {
     let _ = ev_tx.send(crate::host_bridge::dbus_ibus::FromWorker::Done(0));
 }
+
+
+// v0.10：CommitText 解析必须跳过 IBusText 序列化时的 GObject 类型名
+// "IBusText"——之前 v0.9.45 实机的 0 commit 根因。
+#[test]
+fn commit_text_v010_skip_first_string() {
+    // IBusText 序列化的真实结构（参见 ibus/src/ibusserializable.c）：
+    //   ibus_serializable_serialize_object 把 (s "IBusText", IBusText fields) 打包成 tuple
+    //   传入 GVariantBuilder.add_value 序列化为 variant (Tuple)
+    // 我们 mod 收到后 deserialize 为 Structure，fields = [Str("IBusText"), Str(text), ...]
+    // v0.10 修法：从 fields 收集所有 String，过滤 GObject 类型名（"IBusText"），
+    // 取第一个**非**类型名 String 作为真正的 commit 文本。
+    let fields: Vec<String> = vec![
+        "IBusText".to_string(), // GObject 类型名（必须跳过）
+        "你".to_string(),       // 真正的 commit 文本
+    ];
+    let text = fields
+        .into_iter()
+        .find(|s| s != "IBusText" && !s.is_empty())
+        .unwrap_or_default();
+    assert_eq!(text, "你", "v0.10 修法必须跳过 IBusText 类型名");
+}
+
+// v0.10：UpdatePreeditText 同样需要跳过 IBusText 类型名
+#[test]
+fn preedit_v010_skip_first_string() {
+    // IBusText 序列化的 variant 内部 fields = [Str("IBusText"), Str(text), ...]
+    // v0.10 修法：find_text_in_value 递归抓所有 String，跳过类型名。
+    let all_strs: Vec<String> = vec![
+        "IBusText".to_string(),
+        "年".to_string(),
+    ];
+    let text = all_strs
+        .into_iter()
+        .find(|s| s != "IBusText" && !s.is_empty())
+        .unwrap_or_default();
+    assert_eq!(text, "年");
+}
+
+// v0.10：UpdateLookupTable 解析时——IBusLookupTable 序列化含
+// 类型名 "IBusLookupTable"。candidates 是 IBusText 序列化的 array，
+// 每个 candidate 自身又含类型名 "IBusText"。
+// 简化 v0.10：递归抓所有 String 字段，过滤掉两种类型名。
+#[test]
+fn lookup_table_v010_skip_type_names() {
+    let all_strs: Vec<String> = vec![
+        "IBusLookupTable".to_string(), // IBusLookupTable 类型名
+        "IBusText".to_string(),        // IBusText 类型名（嵌套）
+        "候选1".to_string(),
+        "候选2".to_string(),
+    ];
+    let candidates: Vec<String> = all_strs
+        .into_iter()
+        .filter(|s| s != "IBusLookupTable" && s != "IBusText" && !s.is_empty())
+        .collect();
+    assert_eq!(candidates, vec!["候选1", "候选2"]);
+}

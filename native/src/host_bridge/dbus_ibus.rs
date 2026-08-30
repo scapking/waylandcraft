@@ -496,14 +496,25 @@ fn handle_signal(
 
     match name {
         "CommitText" => {
-            // body 是 IBusText 序列化的 variant；简化：直接在结构体里抓字符串字段
+            // body 是 IBusText 序列化的 variant（参见 ibus/src/ibusserializable.c
+            // ibus_serializable_serialize_object）：
+            //   GVariant 是 Tuple (s, ...)  —— 第一个 String 是 GObject 类型名
+            //   （如 "IBusText"），后随 IBusText 字段（text: s, attrs: aav...）。
+            // v0.10 修法：**跳过第一个 String**（GObject 类型名）——取**第二个**
+            // String（真正的 commit 文本）。原 v0.9.45 之前实现错误地取了第一
+            // 个 String，所以 commit 文本 = "IBusText"（用户日志可见）。
             let text = if let Ok(s) = body.deserialize::<zbus::zvariant::Structure>() {
-                s.fields()
+                let strs: Vec<String> = s
+                    .fields()
                     .iter()
-                    .find_map(|f| match f {
+                    .filter_map(|f| match f {
                         zbus::zvariant::Value::Str(s) => Some(s.to_string()),
                         _ => None,
                     })
+                    .collect();
+                // 第一个是 GObject 类型名（"IBusText"），跳过；第二个是 IBusText.text
+                strs.into_iter()
+                    .find(|s| s != "IBusText" && !s.is_empty())
                     .unwrap_or_default()
             } else {
                 String::new()
@@ -520,17 +531,23 @@ fn handle_signal(
                     return Err(format!("UpdatePreeditText fields: {e}"));
                 }
             };
-            // 第一个字段是 variant (IBusText 序列化)
-            // 简化：当作字符串提取（已有逻辑参考旧 host_ime）
-            // 这里只做简化版：抓第一个字符串字段
+            // v0.10 修法：IBusText 序列化的 variant 内部结构——
+            // GVariant Tuple (s, IBusText fields)。第一个 String 是 GObject 类型名
+            // （"IBusText"），后随 IBusText 实际字段（text: s, attrs: aav...）。
+            // find_text_in_value 递归抓**任何** String 字段——但跳
+            // 过类型名。
             let text = if !fields_iter.is_empty() {
                 OwnedValue::try_from(&fields_iter[0])
                     .ok()
                     .and_then(|v| find_text_in_value(&v))
+                    .filter(|s| s != "IBusText" && !s.is_empty())
                     .unwrap_or_default()
             } else {
                 String::new()
             };
+            // wire (vub)：variant(text, cursor: u32, visible: bool)；
+            // 或 (vubu)：+ mode: u32。cursor 在 variant 之外的字段。
+            // v0.10：cursor_pos 直接取 wire 第 2 个字段（如果存在）。
             let cursor_begin = if fields_iter.len() > 1 {
                 find_int_in_value(&fields_iter[1]).unwrap_or(text.chars().count() as i64) as i32
             } else {
@@ -675,36 +692,36 @@ fn find_bool_in_value(v: &zbus::zvariant::Value<'_>) -> Option<bool> {
 
 /// 解析 IBusLookupTable 序列化的 variant 字段。
 ///
-/// 简化版：只取前 10 个候选文本（ibus LookupTable 结构复杂，完整解析需要
-/// 走 IBusText 反序列化器；这里只取最常用字段）。
+/// IBusLookupTable 序列化（参见 ibus/src/ibuslookuptable.c）：
+///   1. parent class serialize 加 (s, "IBusLookupTable")
+///   2. (u, page_size), (u, cursor_pos), (b, cursor_visible), (b, round)
+///   3. (i, orientation)
+///   4. (aav, candidates) —— 每个 candidate 是 IBusText 序列化的 variant
+///
+/// v0.10 修法：递归 find_text_in_value 抓所有 String 字段，**跳过
+/// GObject 类型名**（"IBusLookupTable" / "IBusText"）——这些是序列化
+/// 协议要求，不是用户内容。
 fn parse_lookup_table_v(
     v: &zbus::zvariant::Value<'_>,
 ) -> Option<(Vec<String>, u32)> {
     use zbus::zvariant::Value;
-    // 期待一个 Structure
     let s = match v {
         Value::Structure(s) => s,
         _ => return None,
     };
     let fields = s.fields();
-    // 第一个字段是 candidates 数组
     if fields.is_empty() {
         return Some((Vec::new(), 0));
     }
-    let arr = match &fields[0] {
-        Value::Array(a) => a,
-        _ => return Some((Vec::new(), 0)),
-    };
-    let mut candidates = Vec::new();
-    for item in arr.iter() {
-        if candidates.len() >= 10 {
-            break;
-        }
-        if let Some(s) = find_text_in_value(item) {
-            candidates.push(s);
-        }
-    }
-    // cursor_pos 通常在结构体某字段
+    // 抓所有 String 字段（递归），过滤掉 GObject 类型名
+    let all_strs: Vec<String> = fields
+        .iter()
+        .filter_map(find_text_in_value)
+        .filter(|s| s != "IBusLookupTable" && s != "IBusText" && !s.is_empty())
+        .collect();
+    // 前 10 个当 candidates
+    let candidates: Vec<String> = all_strs.into_iter().take(10).collect();
+    // cursor_pos：u32 字段之一（page_size, cursor_pos, ...）
     let cursor_pos = fields
         .iter()
         .find_map(find_int_in_value)
