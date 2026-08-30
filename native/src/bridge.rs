@@ -1226,9 +1226,22 @@ fn update_surface_tree<'local>(
     let instance = jptr_to_instance!(instance, "updateSurfaceTrees")?;
 
     let handle = surface.handle(env)?;
-    let surface = jptr_to_ref::<WlSurface>(handle).ok_or_else(|| {
-        BridgeError::Null("updateSufaceTree: surface is not alive")
-    })?;
+    // v0.12.4 修：之前 `?` 在 surface 已死（两次 native 调用之间被 Wayland 销毁，
+    // 比如窗口被关闭）时抛 `RuntimeException` → 一路冒到 MC tick → 致命崩溃。
+    // 现实：surface 死亡在 wayland 异步模型下完全合法（用户按 X 关窗口）。
+    // 这里把"surface not alive"降级——记日志后返回 null surface，让 Java 侧的
+    // `toplevel.lastChild = null` 自然处理（外层 update 下一 tick 会清理）。
+    // 配合 Java 侧 `updateSurfaceTree` 的 try/catch 双层防御，再也不会炸游戏。
+    let surface = match jptr_to_ref::<WlSurface>(handle) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "[waylandcraft][bridge] updateSurfaceTrees: surface handle=0x{:x} not alive（跳过此 surface，常见于 toplevel 关闭帧）",
+                handle
+            );
+            return Ok(WLCSurface::null());
+        }
+    };
 
     let mut last_child = WLCSurface::null();
 

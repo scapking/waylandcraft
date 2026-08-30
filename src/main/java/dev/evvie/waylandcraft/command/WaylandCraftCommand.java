@@ -292,6 +292,12 @@ public class WaylandCraftCommand {
 						.executes(WaylandCraftCommand::audioStatus)
 					)
 				)
+				// 输入法故障链诊断（Rust 端 v0.11.0+ 已实现，Java 端 v0.12.4 接入）：跑 Rust run_diagnostic，返回 JSON
+				.then(ClientCommands.literal("ime")
+					.then(ClientCommands.literal("diagnostic")
+						.executes(WaylandCraftCommand::imeDiagnostic)
+					)
+				)
 				.then(ClientCommands.literal("pos")
 					.then(ClientCommands.argument("handle", StringArgumentType.word())
 						.executes(WaylandCraftCommand::posWindow)
@@ -2531,6 +2537,40 @@ public class WaylandCraftCommand {
 
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
 		source.sendFeedback(Component.literal(" §7Rust 侧全链路日志文件: §ewaylandcraft-audio.log§r"));
+		return 1;
+	}
+
+	// ===== 输入法故障链诊断（Rust 端 v0.11.0+ 已实现，Java 端 v0.12.4 接入）=====
+
+	private static int imeDiagnostic(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+		if(wlc.bridge == null) {
+			source.sendError(Component.literal("§c✘ native bridge not available (Android/unsupported platform)§r"));
+			return 0;
+		}
+
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal("§6 §lIME Diagnostic §7(Rust run_diagnostic JSON)§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+
+		String json = wlc.bridge.runImeDiagnostic();
+		if(json == null) {
+			source.sendFeedback(Component.literal(" §crunImeDiagnostic returned null (native unavailable or instance==0)§r"));
+			return 0;
+		}
+		if(json.isEmpty()) {
+			source.sendFeedback(Component.literal(" §a[OK] 全部 [PASS] — IME 链路无故障§r"));
+		} else {
+			for(String line : json.split("\\n")) {
+				source.sendFeedback(Component.literal(" §7" + line + "§r"));
+			}
+		}
+		source.sendFeedback(Component.literal(" §7Rust 侧全链路日志文件: §ewaylandcraft-ime.log§r"));
 		return 1;
 	}
 }

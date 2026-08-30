@@ -587,34 +587,52 @@ public class WaylandCraftBridge {
 		for(long handle : toplevelHandles) {
 			WLCToplevel toplevel = getOrCreateToplevel(handle);
 			WLCSurface root = toplevel.getSurfaceTree();
-			toplevel.lastChild = updateSurfaceTree(this.instance, root);
-			
+			// v0.12.4 修：双层防御。Rust 侧 `update_surface_tree` 已把"surface not alive"
+			// 降级为返回 null，但 wayland 异步模型下 surface 在两次 native 调用间
+			// 仍可能暴毙（用户关窗口）。这里再加 try/catch：失败仅跳过本 toplevel，
+			// **不**让 RuntimeException 一路冒到 MC tick 致命崩溃（之前 v0.10 早期
+			// 真实炸过——日志里"FATAL updateSufaceTree: surface is not alive"）。
+			try {
+				toplevel.lastChild = updateSurfaceTree(this.instance, root);
+			} catch (RuntimeException e) {
+				System.err.println("[waylandcraft] updateSurfaceTree(toplevel) failed: " + e.getMessage() + "（跳过此 toplevel）");
+				toplevel.lastChild = null;
+				continue;
+			}
+
 			updateGeometry(toplevel);
 			toplevel.title = toplevelTitle(toplevel.getHandle());
 			toplevel.appID = toplevelAppID(toplevel.getHandle());
 			toplevel.pid = toplevelPid(this.instance, toplevel.getHandle());
-			
+
 			if(ArrayUtils.contains(minimizeRequests, handle)) toplevel.requests.minimize = true;
 			if(ArrayUtils.contains(maximizeRequests, handle)) toplevel.requests.maximize= true;
 			if(ArrayUtils.contains(unmaximizeRequests, handle)) toplevel.requests.unmaximize = true;
 			if(ArrayUtils.contains(fullscreenRequests, handle)) toplevel.requests.fullscreen = true;
 			if(ArrayUtils.contains(unfullscreenRequests, handle)) toplevel.requests.unfullscreen = true;
-			
+
 			toplevel.fullscreen = ArrayUtils.contains(fullscreened, handle);
 		}
-		
+
 		// Create new popups when necessary
 		// Update surface tree geometry, parent relationships and offsets of all popups
 		for(long handle : popupHandles) {
 			WLCPopup popup = getOrCreatePopup(handle);
 			findPopupParent(popup);
-			
+
 			int[] offset = popupOffset(handle);
 			popup.offsetX = offset[0];
 			popup.offsetY = offset[1];
-			
+
 			WLCSurface root = popup.getSurfaceTree();
-			popup.lastChild = updateSurfaceTree(this.instance, root);
+			// 同上防御：popup surface 暴毙是合法 wayland 事件
+			try {
+				popup.lastChild = updateSurfaceTree(this.instance, root);
+			} catch (RuntimeException e) {
+				System.err.println("[waylandcraft] updateSurfaceTree(popup) failed: " + e.getMessage() + "（跳过此 popup）");
+				popup.lastChild = null;
+				continue;
+			}
 			updateGeometry(popup);
 		}
 		
@@ -938,6 +956,24 @@ public class WaylandCraftBridge {
 		setImeLogFileNative(path);
 	}
 
+	/** 跑完整输入法故障链诊断（Rust 端 v0.11.0+ 已实现，Java 端 v0.12.4 接入）。
+	 *
+	 * 返回 JSON 字符串（含 [PASS]/[FAIL] + 根因 + 修复建议）。返回 null 表示
+	 * bridge 未初始化或 instance 无效；返回空串表示诊断跑完无问题。
+	 *
+	 * 关键：仅声明 native 方法不够——必须也提供 wrapper 给 Java 代码调用，
+	 * 否则 `wl ime diagnostic` 命令接入不到。
+	 */
+	public String runImeDiagnostic() {
+		if(!nativeAvailable || instance == 0) return null;
+		try {
+			return runImeDiagnosticNative(instance);
+		} catch (UnsatisfiedLinkError | RuntimeException e) {
+			WaylandCraftCommon.LOGGER.warn("runImeDiagnostic unavailable: {}", e.toString());
+			return null;
+		}
+	}
+
 	/** Minecraft 窗口重新获得 OS 键盘焦点时调用（GLFW focus 回调驱动）。
 	 * 输入法穿透层据此做一次性事件驱动的焦点重协商：
 	 * 若穿透 text_input 因创建晚于宿主焦点分配而收不到 enter
@@ -1195,6 +1231,22 @@ public class WaylandCraftBridge {
 	
 	// Set Rust-side [system_ime] log file path (eprintln also written to this file)
 	private static native void setImeLogFileNative(String path);
+
+	/** 跑完整输入法故障链诊断（Rust 端 v0.11.0+ 已实现，Java 端 v0.12.4 接入）。
+	 *
+	 * 返回 JSON 字符串（含 [PASS]/[FAIL] + 根因 + 修复建议）。
+	 * Java 端在控制台 `wl ime diagnostic` 调用，结果在 Minecraft log 显示。
+	 *
+	 * 关键：必须声明此 native 方法——Rust 端 `bind_java_type! native_methods` 块
+	 * 声明了 `name = "runImeDiagnosticNative"`。jni-rs 的 `RegisterNatives` 对
+	 * native_methods 数组做**原子注册**：任何一个 callback 在 Java 端找不到对应
+	 * `native` 声明 → 整体失败 → `Err(NoSuchMethod("... runImeDiagnosticNative ..."))`。
+	 * 这个错误被 `bind_java_type! API::get()` 返回，导致所有 Java→Rust 通道
+	 * （`get_or_create_surface`、`update` 等）首次调用即抛错，日志每帧刷屏：
+	 *   [waylandcraft][bridge] updateSurfaceTrees: get_or_create_surface 失败:
+	 *     NoSuchMethod("... runImeDiagnosticNative ...")
+	 */
+	private static native String runImeDiagnosticNative(long instance);
 	/** native 构建标识（"0.1.0 (git <short-hash>)"），用于诊断确认实际加载的
 	 * native 库版本 —— 若与 mod 版本对应的 git hash 不符，说明 jar 内 native
 	 * 未更新或加载了系统残留旧库。 */

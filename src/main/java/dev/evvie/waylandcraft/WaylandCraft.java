@@ -244,11 +244,24 @@ public class WaylandCraft implements ClientModInitializer {
 		if(bridge == null) {
 			return;
 		}
-		bridge.update();
-		
+		// v0.12.4 修：bridge.update() 内部调多个 native 方法（update / updateSurfaceTree /
+		// updateSurfaceData 等），native 抛 RuntimeException 会穿透到 MC tick 致命崩溃。
+		// 现实：wayland 异步模型下 surface 在两次 native 调用间暴毙（关窗口）是合法事件，
+		// 不应该炸游戏。这里包一层 try/catch：失败仅本帧跳过更新，**不**致命。
+		// 详见 bridge.update() 内部的细粒度 try/catch。
+		try {
+			bridge.update();
+		} catch (RuntimeException e) {
+			WaylandCraftCommon.LOGGER.error("[waylandcraft] bridge.update failed: {}", e.toString());
+		}
+
 		// 更新窗口共享（捕获+发送图像）
 		if(windowShareManager != null) {
-			windowShareManager.update();
+			try {
+				windowShareManager.update();
+			} catch (RuntimeException e) {
+				WaylandCraftCommon.LOGGER.error("[waylandcraft] windowShareManager.update failed: {}", e.toString());
+			}
 		}
 		
 		// 更新共享窗口音频（poll native PCM + 发送）
