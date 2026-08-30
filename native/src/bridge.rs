@@ -1523,13 +1523,25 @@ fn keyboard_input<'local>(
                 match action {
                     KA::Press | KA::Repeat => {
                         let keycode = scancode as u32;
+                        // v0.10.2 修：必须用 xkb 解码 keysym 传给 host_bridge。
+                        // 之前传 keysym=0 硬编码（v0.9.40 笔记"调用方预解析"
+                        // 从未实现）——ibus 引擎不知道按了什么键——0 commit。
+                        // seat.xkb_state 不更新 state（key_get_one_sym 是纯 query），
+                        // 可以安全调用。
+                        let keysym = instance
+                            .state
+                            .seat
+                            .xkb_state
+                            .key_get_one_sym(xkbcommon::xkb::Keycode::new(keycode))
+                            .raw() as u32;
                         let ke = KeyEvent {
+                            keysym,
                             keycode,
                             action: action,
                             mods,
                         };
                         crate::bridge::ime_log_write(&format!(
-                            "[waylandcraft][ime] bridge submit_key scancode={keycode} action={:?}",
+                            "[waylandcraft][ime] bridge submit_key scancode={keycode} keysym={keysym:#x} action={:?}",
                             action
                         ));
                         hb.submit(crate::ime::DownEvent::Key(ke));

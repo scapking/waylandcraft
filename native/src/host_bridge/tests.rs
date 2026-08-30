@@ -61,6 +61,7 @@ fn submit_propagates_to_all_event_types() {
     // 6 种 DownEvent
     h.submit(DownEvent::State(FocusChange::Activate));
     h.submit(DownEvent::Key(KeyEvent {
+        keysym: 0x69, // 'i'
         keycode: 31,
         action: crate::seat::KeyboardAction::Press,
         mods: (0, 0, 0, 0),
@@ -174,3 +175,47 @@ fn lookup_table_v010_skip_type_names() {
     assert_eq!(candidates, vec!["候选1", "候选2"]);
 }
 
+
+// v0.10.2：bridge::keyboard_input 必须用 xkb 解码 keysym 传给 host_bridge。
+// 之前传 keysym=0 硬编码（v0.9.40 笔记"调用方预解析"从未实现）——
+// ibus 引擎不知道按了什么键，0 commit。
+// 本测试验证：构造 KeyEvent 时不传 keysym=0，host_bridge 不应丢弃。
+#[test]
+fn submit_key_with_valid_keysym_passes_through() {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (_ev_tx, ev_rx) = mpsc::channel();
+    let mut b = crate::host_bridge::dbus_ibus::DbusIbusBridge::from_channels(cmd_tx, ev_rx);
+    b.submit(DownEvent::Key(KeyEvent {
+        keysym: 0x69, // 'i'
+        keycode: 31,
+        action: crate::seat::KeyboardAction::Press,
+        mods: (0, 0, 0, 0),
+    }));
+    // 应该收到 ProcessKey with keysym=0x69
+    match cmd_rx.recv().unwrap() {
+        crate::host_bridge::dbus_ibus::ToWorker::ProcessKey { keysym, evdev, .. } => {
+            assert_eq!(keysym, 0x69, "v0.10.2 必须传 keysym（不是 0）");
+            assert_eq!(evdev, 23);
+        }
+        other => panic!("expected ProcessKey, got {other:?}"),
+    }
+}
+
+// v0.10.2：submit 时如果 keysym=0 必须丢弃（防止 ibus 引擎收到无法识别的键）。
+#[test]
+fn submit_key_with_zero_keysym_is_dropped() {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (_ev_tx, ev_rx) = mpsc::channel();
+    let mut b = crate::host_bridge::dbus_ibus::DbusIbusBridge::from_channels(cmd_tx, ev_rx);
+    b.submit(DownEvent::Key(KeyEvent {
+        keysym: 0, // 故意 0——必须被拒
+        keycode: 31,
+        action: crate::seat::KeyboardAction::Press,
+        mods: (0, 0, 0, 0),
+    }));
+    // 应该**没有** ProcessKey 发出——cmd_rx 立即返回 Disconnected
+    assert!(
+        cmd_rx.try_recv().is_err(),
+        "keysym=0 的 Key 必须被丢弃，cmd_rx 不应收到 ProcessKey"
+    );
+}

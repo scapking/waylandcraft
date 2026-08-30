@@ -119,11 +119,17 @@ impl HostBridge for DbusFcitx5Bridge {
         let cmd = match ev {
             DownEvent::State(crate::ime::FocusChange::Activate) => Some(ToWorker::FocusIn),
             DownEvent::State(crate::ime::FocusChange::Deactivate) => Some(ToWorker::FocusOut),
-            DownEvent::Key(KeyEvent { keycode, action, mods: _ }) => {
+            DownEvent::Key(KeyEvent { keysym, keycode, action, mods: _ }) => {
                 let evdev = keycode.saturating_sub(8);
                 let release = matches!(action, crate::seat::KeyboardAction::Release);
                 let state = if release { 1u32 << 30 } else { 0 };
-                Some(ToWorker::ProcessKey { keysym: 0, evdev, state, release })
+                if keysym == 0 {
+                    crate::host_bridge::ime_log!(
+                        "[waylandcraft][host_bridge][dbus-fcitx5] submit Key keysym=0 拒绝"
+                    );
+                    return;
+                }
+                Some(ToWorker::ProcessKey { keysym, evdev, state, release })
             }
             DownEvent::Surrounding(SurroundingText { text, cursor, anchor }) => {
                 Some(ToWorker::SetSurrounding { text, cursor, anchor })
@@ -431,6 +437,7 @@ mod tests {
         let (_ev_tx, ev_rx) = mpsc::channel();
         let mut b = DbusFcitx5Bridge::from_channels(cmd_tx, ev_rx);
         b.submit(DownEvent::Key(KeyEvent {
+            keysym: 0x69, // 'i'
             keycode: 31, // i = evdev 23 + 8
             action: crate::seat::KeyboardAction::Press,
             mods: (0, 0, 0, 0),

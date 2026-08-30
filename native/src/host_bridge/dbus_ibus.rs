@@ -212,18 +212,24 @@ impl HostBridge for DbusIbusBridge {
             DownEvent::State(crate::ime::FocusChange::Deactivate) => {
                 Some(ToWorker::FocusOut)
             }
-            DownEvent::Key(KeyEvent { keycode, action, mods: _ }) => {
+            DownEvent::Key(KeyEvent { keysym, keycode, action, mods: _ }) => {
                 let evdev = keycode.saturating_sub(8);
                 let state = match action {
                     crate::seat::KeyboardAction::Press => 0u32,
                     crate::seat::KeyboardAction::Release => 1u32 << 30,
                     crate::seat::KeyboardAction::Repeat => 0u32, // repeat 当 press 处理
                 };
-                // keysym：xkb 解码为 ibus keyval
-                // （host_bridge 不持有 xkb_state；调用方在 submit 之前
-                //  已经把 keysym 计算好传入；这里简化为传 evdev 反查）
+                // v0.10.2 修：使用 bridge::keyboard_input 通过 xkb 解码的 keysym
+                // （不是 0，不是 evdev keycode——ibus 引擎按 keysym 决定处理）。
+                // 之前 v0.10.1 之前传 keysym=0 导致 ibus 引擎不知道按了什么键——
+                // 不发回 commit/preedit。这是 v0.9.40 笔记"调用方预解析"从未
+                // 实现的根因。
+                if keysym == 0 {
+                    ime_log!("[waylandcraft][host_bridge][dbus-ibus] submit Key keysym=0 拒绝（防止引擎不识别）");
+                    return; // 吞下：不要给 ibus 一个它无法识别的 keysym
+                }
                 Some(ToWorker::ProcessKey {
-                    keysym: 0, // 见 bridge.rs 改造：调用方预解析
+                    keysym,
                     evdev,
                     state,
                 })

@@ -42,7 +42,11 @@ pub enum FocusChange {
 /// 这里只传 raw key，IME 自己解释）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct KeyEvent {
-    /// XKB keycode（= evdev + 8）。所有协议层都翻译到这一种表达。
+    /// XKB keysym（ibus keyval 语义）——必须非 0，否则 ibus 引擎不知道按了什么键。
+    /// v0.10.2 修：bridge::keyboard_input 必须**用 xkb 解码** scancode → keysym
+    /// 后构造 KeyEvent。**不要**传 0 或 evdev keycode。
+    pub keysym: u32,
+    /// XKB keycode（= evdev + 8）。保留作诊断/debug 用。
     pub keycode: u32,
     /// 按下还是释放。
     pub action: KeyboardAction,
