@@ -659,11 +659,33 @@ fn handle_signal(
 }
 
 /// 在 zvariant::Value 里找字符串。
+/// 递归在 zvariant::Value 中找 String。
+///
+/// IBusText 序列化的 variant 内部可能是嵌套 Structure。v0.10 改：递归
+/// 搜所有 String 字段，调用方过滤 GObject 类型名。
+///
+/// zbus 0.32 Value 不暴露 Variant 变体——所以直接用 Structure 递归。
 fn find_text_in_value(v: &zbus::zvariant::Value<'_>) -> Option<String> {
     use zbus::zvariant::Value;
     match v {
         Value::Str(s) => Some(s.to_string()),
         Value::ObjectPath(p) => Some(p.to_string()),
+        Value::Structure(s) => {
+            for f in s.fields() {
+                if let Some(s) = find_text_in_value(f) {
+                    return Some(s);
+                }
+            }
+            None
+        }
+        Value::Array(a) => {
+            for item in a.iter() {
+                if let Some(s) = find_text_in_value(item) {
+                    return Some(s);
+                }
+            }
+            None
+        }
         _ => None,
     }
 }

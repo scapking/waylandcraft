@@ -173,3 +173,4 @@ fn lookup_table_v010_skip_type_names() {
         .collect();
     assert_eq!(candidates, vec!["候选1", "候选2"]);
 }
+
