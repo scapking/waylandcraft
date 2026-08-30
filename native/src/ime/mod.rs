@@ -68,6 +68,10 @@ pub struct ImeState {
     /// 是否有激活的文本输入会话（ti3 enable 且聚焦）。
     /// 由 `apply_ti3_outcome` / `set_focus` / `clear_focus` 维护。
     app_active: bool,
+    /// 状态机（v0.12.0 第 12 章）：DISCONNECTED → CONNECTING → CONNECTED →
+    /// FOCUSED → IDLE → COMPOSING → CANDIDATE → COMMITTING → IDLE。
+    /// 任何错误 → ERROR → RECOVERING → CONNECTED。
+    state: ImeStateMachine,
 
     /// 键盘焦点是否在某个文本输入 surface 上。
     /// 由 `set_focus` / `clear_focus` 维护。
@@ -476,5 +480,107 @@ mod tests {
         let mut ime = ImeState::default();
         let handled = ime.handle_key(30, KeyboardAction::Press, (0, 0, 0, 0));
         assert!(!handled, "v0.10 mod 不再 consume 按键");
+    }
+}
+// ── 状态机（v0.12.0 第 12 章）──
+
+/// IME 端点状态机（覆盖 waycraftcraft 整个 IME 桥接生命周期）。
+///
+/// 正常流：
+///   DISCONNECTED → CONNECTING → CONNECTED → FOCUSED → IDLE
+///   任何时刻进入 composing：
+///   IDLE → COMPOSING → CANDIDATE → IDLE
+///   或 IDLE → COMPOSING → COMMITTING → IDLE
+///
+/// 错误流：
+///   {任何状态} → ERROR → RECOVERING → CONNECTED
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImeStateMachine {
+    /// 初始状态——host_bridge 未启动
+    #[default]
+    Disconnected,
+    /// 探测中（host_bridge::probe 在跑）
+    Connecting,
+    /// host_bridge READY——但嵌套应用无焦点
+    Connected,
+    /// 嵌套应用已 enable ti3——可以接收按键
+    Focused,
+    /// Focused + 无 composing
+    Idle,
+    /// Focused + 拼音预编辑中
+    Composing,
+    /// Focused + 候选窗显示
+    Candidate,
+    /// Focused + commit 中
+    Committing,
+    /// 错误状态——自动恢复中
+    Error,
+    /// 恢复中
+    Recovering,
+}
+
+impl ImeStateMachine {
+    /// 状态转换 + 记录日志（IME_STATE: <from> -> <to>）。
+    pub fn transition(&mut self, to: Self) {
+        if *self != to {
+            crate::bridge::ime_log_write(&format!(
+                "IME_STATE: {:?} -> {:?}",
+                self,
+                to
+            ));
+            *self = to;
+        }
+    }
+}
+#[cfg(test)]
+mod state_machine_tests {
+    use super::*;
+
+    #[test]
+    fn state_machine_default_is_disconnected() {
+        let m = ImeStateMachine::default();
+        assert_eq!(m, ImeStateMachine::Disconnected);
+    }
+
+    #[test]
+    fn state_machine_transition_records_change() {
+        let mut m = ImeStateMachine::default();
+        m.transition(ImeStateMachine::Connecting);
+        assert_eq!(m, ImeStateMachine::Connecting);
+        m.transition(ImeStateMachine::Connected);
+        assert_eq!(m, ImeStateMachine::Connected);
+        m.transition(ImeStateMachine::Focused);
+        assert_eq!(m, ImeStateMachine::Focused);
+    }
+
+    #[test]
+    fn state_machine_same_state_no_change() {
+        let mut m = ImeStateMachine::Idle;
+        m.transition(ImeStateMachine::Idle);
+        assert_eq!(m, ImeStateMachine::Idle);
+    }
+
+    #[test]
+    fn state_machine_composing_flow() {
+        let mut m = ImeStateMachine::Idle;
+        m.transition(ImeStateMachine::Composing);
+        m.transition(ImeStateMachine::Candidate);
+        m.transition(ImeStateMachine::Idle);
+        assert_eq!(m, ImeStateMachine::Idle);
+    }
+
+    #[test]
+    fn state_machine_error_recovery() {
+        let mut m = ImeStateMachine::Focused;
+        m.transition(ImeStateMachine::Error);
+        m.transition(ImeStateMachine::Recovering);
+        m.transition(ImeStateMachine::Connected);
+        assert_eq!(m, ImeStateMachine::Connected);
+    }
+
+    #[test]
+    fn ime_state_has_state_field() {
+        let ime = ImeState::default();
+        assert_eq!(ime.state, ImeStateMachine::Disconnected);
     }
 }
