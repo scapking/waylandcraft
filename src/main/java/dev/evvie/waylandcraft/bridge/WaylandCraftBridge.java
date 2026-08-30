@@ -624,7 +624,11 @@ public class WaylandCraftBridge {
 			if(dndIcon != null && dndIcon.surface != dndIconSurface) dndIcon = null;
 			if(dndIcon == null) dndIcon = new IconSurface(dndIconSurface);
 			
-			updateSurfaceData(instance, dndIcon.surface);
+			try {
+				updateSurfaceData(instance, dndIcon.surface);
+			} catch (RuntimeException e) {
+				System.err.println("[waylandcraft] updateSurfaceData(dndIcon) failed: " + e.getMessage());
+			}
 			dndIcon.surface.visited = true;
 		}
 		else {
@@ -651,7 +655,11 @@ public class WaylandCraftBridge {
 		for(WLCAbstractWindow window : allWindows) {
 			WLCSurface root = window.getSurfaceTree();
 			for(WLCSurface surface = root; surface != null; surface = surface.getNextChild()) {
-				updateSurfaceData(instance, surface);
+				try {
+					updateSurfaceData(instance, surface);
+				} catch (RuntimeException e) {
+					System.err.println("[waylandcraft] updateSurfaceData failed: " + e.getMessage());
+				}
 				calculateSubpos(surface);
 			}
 		}

@@ -1046,9 +1046,20 @@ fn update_surface_data<'local>(
     let instance = jptr_to_instance!(instance, "updateSurfaceData")?;
 
     let handle = jsurface.handle(env)?;
-    let surface = jptr_to_ref::<WlSurface>(handle).ok_or_else(|| {
-        BridgeError::Null("updateSufaceData: surfaceHandle is null")
-    })?;
+    // v0.12.3 修：之前 surfaceHandle is null 时返回 Err → Java 端
+    // throw RuntimeException → MC 崩。改成 log + return Ok——surface 还没
+    // 关联 wayland surface（创建中）时跳过本 surface，**不**是错误。
+    let surface = match jptr_to_ref::<WlSurface>(handle) {
+        Some(s) => s,
+        None => {
+            eprintln!(
+                "[waylandcraft][bridge] updateSurfaceData: surface handle={} \
+                 not yet associated with WlSurface（跳过此 surface）",
+                handle
+            );
+            return Ok(());
+        }
+    };
 
     with_states(surface, |data| {
         let mut attr_guard = data.cached_state.get::<SurfaceAttributes>();
