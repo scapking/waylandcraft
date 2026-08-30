@@ -1230,7 +1230,19 @@ fn update_surface_tree<'local>(
         |surface, data, parent| {
             let handle =
                 insert_get_handle(&mut instance.bridge.surfaces, surface);
-            let surface = this.get_or_create_surface(env, handle).unwrap();
+            // v0.12.1 修：之前 `.unwrap()` 在 Java 端没提供 `get_or_create_surface`
+            // 方法时 panic（NoSuchMethodErr）。改成错误吞掉——v0.11.x +
+            // v0.10.x 之间 Java 端 jar 不兼容也只导致 surface tree 失败，
+            // **不**导致 MC 崩溃。
+            let surface = match this.get_or_create_surface(env, handle) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!(
+                        "[waylandcraft][bridge] updateSurfaceTrees: get_or_create_surface 失败: {e:?}（跳过此 surface）"
+                    );
+                    return;
+                }
+            };
 
             // Set the WLCSurface parentHandle
             let parent_handle = if let Some(p) = parent {
