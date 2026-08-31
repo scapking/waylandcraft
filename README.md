@@ -353,6 +353,7 @@ A: This fork adds multi-player window sharing, the permission system, pure CLI m
 
 1. **Constrained window movement** — windows are locked to the vertical axis and the bottom edge stays ≥ 0.4 blocks above the floor. This is a deliberate simplification; freer placement may come later.
 2. **Quality vs latency tradeoff in sharing** — to keep the UI size identical to the sharer, only JPEG quality is lowered (never resolution) when frames exceed the limit; high-resolution windows still put pressure on weak servers/phones during relay and decode.
+3. **⚠️ IME in nested wayland clients (v1.2.5+)** — firefox / chromium / other wayland-native apps **running inside** waylandcraft cannot use ibus / fcitx for Chinese/Japanese/Korean input. Cause: ibus's global focus state is bound to the host session (mutter / sway / KDE), and the host compositor cannot see focus changes inside waylandcraft's nested wayland session. Affects: v1.2.5 / 1.2.6 / 1.2.7. **Workaround**: use v1.2.4; run firefox natively in your host session and stream it in; or launch X11 apps (which auto-fall-back to XIM). See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for details.
 
 ---
 
