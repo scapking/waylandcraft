@@ -365,33 +365,50 @@ fn command_loop(
     // 命令处理循环
     while let Ok(cmd) = cmd_rx.recv() {
         let res: Result<(), String> = match cmd {
-            ToWorker::FocusIn => ic_conns
-                .ic
-                .call::<_, _, ()>("FocusIn", &())
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            ToWorker::FocusOut => ic_conns
-                .ic
-                .call::<_, _, ()>("FocusOut", &())
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            ToWorker::SetCursorLocationRelative { x, y, w, h } => ic_conns
-                .ic
-                .call::<_, _, ()>("SetCursorLocationRelative", &(x, y, w, h))
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
+            ToWorker::FocusIn => {
+                ime_log!("[waylandcraft][host_bridge][dbus-ibus] FocusIn -> ibus-daemon");
+                ic_conns
+                    .ic
+                    .call::<_, _, ()>("FocusIn", &())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+            ToWorker::FocusOut => {
+                ime_log!("[waylandcraft][host_bridge][dbus-ibus] FocusOut -> ibus-daemon");
+                ic_conns
+                    .ic
+                    .call::<_, _, ()>("FocusOut", &())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+            ToWorker::SetCursorLocationRelative { x, y, w, h } => {
+                ime_log!(
+                    "[waylandcraft][host_bridge][dbus-ibus] SetCursorLocationRelative x={x} y={y} w={w} h={h}"
+                );
+                ic_conns
+                    .ic
+                    .call::<_, _, ()>("SetCursorLocationRelative", &(x, y, w, h))
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
             ToWorker::SetSurroundingText {
                 text,
                 cursor_pos,
                 anchor_pos,
-            } => ic_conns
-                .ic
-                .call::<_, _, ()>(
-                    "SetSurroundingText",
-                    &(text, cursor_pos, anchor_pos),
-                )
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
+            } => {
+                ime_log!(
+                    "[waylandcraft][host_bridge][dbus-ibus] SetSurroundingText text=\"{}\" cursor={cursor_pos} anchor={anchor_pos}",
+                    text.chars().take(16).collect::<String>()
+                );
+                ic_conns
+                    .ic
+                    .call::<_, _, ()>(
+                        "SetSurroundingText",
+                        &(text, cursor_pos, anchor_pos),
+                    )
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
             ToWorker::ProcessKey { keysym, evdev, state } => {
                 // 同步调 ProcessKeyEvent（不等 reply——commit 驱动模式）
                 // v0.11.0 修：之前 `let _ = ...` 静默丢弃 zbus 错误——

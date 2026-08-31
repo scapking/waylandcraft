@@ -212,13 +212,18 @@ impl ImeState {
                             "[waylandcraft][ime] apply_ti3_outcome Enabled: hb NOT ready（无法 FocusIn）"
                         );
                     }
-                    if !snap.surrounding_text.is_empty() || snap.cursor != snap.anchor {
-                        hb.submit(DownEvent::Surrounding(SurroundingText {
-                            text: snap.surrounding_text,
-                            cursor: snap.cursor,
-                            anchor: snap.anchor,
-                        }));
-                    }
+                    // v0.13.2 修复：始终发 Surrounding/CursorRect 给 ibus
+                    // （即使 text 为空）——ibus 引擎需要 surrounding 上下文才能
+                    // 决定 ProcessKeyEvent 是否 consumed。否则 firefox 调
+                    // enable+surrounding_text("")+cursor==anchor 时，ibus
+                    // 一直不消费按键（consumed=false）。
+                    // v0.13.1 之前条件 `!text.is_empty() || cursor != anchor`
+                    // 在这两种情况下都不发 → ibus 拒收所有按键。
+                    hb.submit(DownEvent::Surrounding(SurroundingText {
+                        text: snap.surrounding_text.clone(),
+                        cursor: snap.cursor,
+                        anchor: snap.anchor,
+                    }));
                     if let Some(rect) = snap.cursor_rect {
                         hb.submit(DownEvent::CursorRect(CursorRect {
                             x: rect.0,
@@ -252,13 +257,12 @@ impl ImeState {
                 ));
                 if let Some(hb) = hb {
                     if hb.is_ready() {
-                        if !snap.surrounding_text.is_empty() || snap.cursor != snap.anchor {
-                            hb.submit(DownEvent::Surrounding(SurroundingText {
-                                text: snap.surrounding_text,
-                                cursor: snap.cursor,
-                                anchor: snap.anchor,
-                            }));
-                        }
+                        // v0.13.2 修复：始终发 Surrounding（与 Enabled 路径一致）。
+                        hb.submit(DownEvent::Surrounding(SurroundingText {
+                            text: snap.surrounding_text.clone(),
+                            cursor: snap.cursor,
+                            anchor: snap.anchor,
+                        }));
                         if let Some(rect) = snap.cursor_rect {
                             hb.submit(DownEvent::CursorRect(CursorRect {
                                 x: rect.0,
