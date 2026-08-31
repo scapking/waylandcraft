@@ -1,4 +1,4 @@
-//! 输入法子系统的薄门面 —— v0.10 重构后的最小实现。
+//! 输入法子系统的薄门面 —— v0.13 重建 ti3 server。
 //!
 //! ## 战略
 //!
@@ -6,42 +6,44 @@
 //! 同名 `Dispatch<ZwpInputMethodManagerV2, ()>`（E0119），而我们又必须保留
 //! ti3 实例管理以让 firefox 等嵌套应用能 commit 汉字。
 //!
-//! **v0.10 重构**做了大刀阔斧的减法：
+//! **v0.10 重构**做了大刀阔斧的减法——但**过头了**：
+//! - 删除 `text_input_v3.rs` 让 waylandcraft compositor 不再暴露
+//!   `zwp_text_input_manager_v3` global → **firefox 等 wayland native
+//!   客户端完全无法接 IME**（实测 v1.2.4 firefox 输入汉字失败）
 //!
-//! | 删除 | 原因 |
-//! |---|---|
-//! | `input_method_v2.rs` | 自造 im2 dispatch（与 smithay 冲突） |
-//! | `text_input_v3.rs`  | 自造 ti3 dispatch（与 smithay 冲突） |
-//! | `relay.rs`          | 自造 Relay 状态机——逻辑并入 mod.rs |
-//! | `tests.rs`          | 旧 wire 测试——新增覆盖核心 race 的测试在 mod.rs |
-//! | `types.rs`          | 已被 `ime_event.rs` 取代 |
-//! | `seat_smithay.rs`   | smithay Seat 接入是 dead code |
-//! | `im_smithay.rs`     | smithay im2 接入是 dead code |
+//! **v0.13 重建**：
+//! - 只重建 `text_input_v3.rs`（不重建 im2——im2 是让 ibus 当 client 接 mod，
+//!   我们走 dbus-ibus host_bridge 替代）
+//! - 不依赖 `Relay`（v0.10 砍了不重建）——裁决直接到 host_bridge
+//! - commit/preedit 发回客户端由 ImeState.apply_up_events 调
+//!   `ti3.forward_to_active()` 完成
 //!
-//! **保留 API**（bridge.rs / host_bridge / lib.rs 调用）：
+//! ## 事件流转
 //!
-//! - `ImeState::set_focus(surface)` —— 键盘焦点切到某 surface
-//! - `ImeState::clear_focus()` —— 键盘焦点整体离开
-//! - `ImeState::handle_key(key, action, mods)` —— 转发按键到 im2 grab
-//! - `ImeState::take_lookup_table()` —— 取候选窗快照（Java 自绘用）
-//! - `ImeState::apply_up_events(events)` —— 灌入 host_bridge 上行事件
-//! - `ImeState::app_active()` —— 是否有激活文本输入会话
-//! - `ImeState::keyboard_grabbed()` —— im2 grab 是否抓走键盘
-//! - `ImeState::apply_ti3_outcome(state, outcome)` —— ti3 commit 裁决落地
-//!
-//! **架构方向**（C 方案）：
-//! - 嵌套应用自己用 GdkIMContext（firefox / Qt / Electron）→ 直通宿主 ibus
-//! - mod 当协议中介：嵌套应用 ti3 事件 → mod → 宿主 daemon（host_bridge）
-//! - 嵌套应用 im2 grab（wayland native 应用）→ mod → 宿主 daemon
-//! - host_bridge 接管键盘（v0.9.43+ 已有，不变）
-//! - 永不模拟 IME——永远转发给宿主 daemon
+//! ```text
+//! firefox (ti3 client)
+//!     │
+//!     ├─ enable() ─────────► TextInputV3State.commit_instance ─► ImeState
+//!     │                                                          │
+//!     │                                                          ├─► host_bridge FocusIn
+//!     ├─ commit() ──────────► commit_instance ────────────────►  │
+//!     │                                                          │
+//!     ├─ key event ─► seat.keyboard_input ─► host_bridge ProcessKey ─► ibus
+//!     │
+//! ibus commit/preedit signal ─► host_bridge signal thread ─► ImeState.apply_up_events
+//!     │
+//!     └─► ti3.forward_to_active() ─► set_preedit_string/commit ─► firefox
+//! ```
 
 mod ime_event;
+mod text_input_v3;
 
 pub use ime_event::{
     Commit, CursorRect, DeleteSurrounding, Done, DownEvent, FocusChange, KeyEvent,
     LookupTable, PreeditUpdate, SurroundingText, UpEvent,
 };
+pub use text_input_v3::TextInputV3State;
+use text_input_v3::Ti3Snapshot;
 
 use crate::seat::KeyboardAction;
 
@@ -59,10 +61,10 @@ pub struct LookupTableSnapshot {
 
 /// 输入法全局状态。挂在 `WLCState.ime` 上。
 ///
-/// v0.10.0：thin facade。所有 wire / dispatch / Relay 状态机已被删除——
-/// ImeState 仅作为应用层（bridge.rs / lib.rs / host_bridge）与 host_bridge
-/// 之间的协调点。应用状态变化、键盘路由、上行事件都通过 host_bridge
-/// 转发给宿主 IME daemon。
+/// v0.13.0：thin facade + ti3 wire 层。
+/// - `ti3`：管理 firefox 等 wayland native client 的 zwp_text_input_v3 实例
+/// - 所有 wire 事件 → apply_ti3_outcome → host_bridge（dbus-ibus）
+/// - host_bridge 上行事件（commit/preedit）→ apply_up_events → ti3 obj 发回客户端
 #[derive(Default)]
 pub struct ImeState {
     /// 是否有激活的文本输入会话（ti3 enable 且聚焦）。
@@ -83,6 +85,10 @@ pub struct ImeState {
     /// 当前 im2 grab 是否激活（grab 存在期间原始按键只发给 IME）。
     /// 由 `note_im2_grab` / `note_im2_release` 维护。
     im2_grab_active: bool,
+
+    /// ti3 wire 层状态（firefox 等 wayland native client 的 zwp_text_input_v3）。
+    /// v0.13 重建：让 waylandcraft compositor 暴露 zwp_text_input_manager_v3 global。
+    pub(crate) ti3: TextInputV3State,
 }
 
 impl ImeState {
@@ -110,18 +116,53 @@ impl ImeState {
     }
 
     /// 键盘焦点切到某 surface（bridge.rs keyboard_focus 调用）。
-    /// v0.10：仅跟踪内部状态——不调 host_bridge（host_bridge 由 apply_ti3_outcome 接管）。
+    ///
+    /// v0.13 三件事：
+    /// 1. 通知 host_bridge FocusIn（让 ibus 开始给本 client 发 commit/preedit）
+    /// 2. 通知 ti3 wire 层 enter（向该 client 的全部 ti3 实例发 enter 事件，
+    ///    触发 firefox 等客户端进入激活流程）
+    /// 3. 更新内部 has_focus 状态
     pub fn set_focus(
         &mut self,
-        _surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        state: &mut crate::WLCState,
     ) {
         self.has_focus = true;
+        // 1. ti3 wire 层：enter 该 surface（协议要求：enter 必须发给聚焦 client
+        // 的全部 ti3 实例）。
+        let switched = self.ti3.enter(surface);
+        if switched {
+            crate::bridge::ime_log_write(&format!(
+                "[waylandcraft][ime][ti3] keyboard focus switched (enter new surface)"
+            ));
+        }
+        // 2. host_bridge FocusIn：让 ibus 开始识别本 client 为输入焦点。
+        // v0.13 注：实际触发 ibus FocusIn 应在 client enable() 后（通过
+        // apply_ti3_outcome(Enabled)），而不是单纯的 keyboard focus 切换——
+        // 否则未激活 ti3 的 surface 也会触发 ibus FocusIn 浪费资源。
+        // 这里**不**直接调 host_bridge FocusIn，让 apply_ti3_outcome 触发。
+        let _ = state;
     }
 
     /// 键盘焦点整体离开（bridge.rs keyboard_unfocus 调用）。
-    pub fn clear_focus(&mut self) {
-        // v0.10：始终复位 app_active——test set_focus_then_clear_focus 期望
-        // 即便 has_focus=false 也能清 app_active。语义上：clear_focus = 强制 IME 不活跃。
+    ///
+    /// v0.13：与 set_focus 对称——通知 host_bridge FocusOut + ti3.leave +
+    /// 重置 app_active。
+    pub fn clear_focus(&mut self, state: &mut crate::WLCState) {
+        // ti3 wire 层：leave（向聚焦 client 的全部 ti3 实例发 leave 事件）。
+        let was_focused = self.ti3.leave();
+        // host_bridge FocusOut：让 ibus 停止给本 client 发 commit/preedit。
+        if was_focused {
+            if let Some(hb) = state.host_bridge.as_mut() {
+                if hb.is_ready() {
+                    hb.submit(DownEvent::State(FocusChange::Deactivate));
+                    crate::bridge::ime_log_write(&format!(
+                        "[waylandcraft][ime][host_bridge] FocusOut（ti3 焦点离开）"
+                    ));
+                }
+            }
+        }
+        // 始终复位内部状态——clear_focus = 强制 IME 不活跃。
         self.has_focus = false;
         self.app_active = false;
     }
@@ -240,11 +281,19 @@ impl ImeState {
     pub fn apply_up_events(&mut self, events: Vec<UpEvent>) {
         use std::cell::Cell;
 
-        // 应用层（ti3 wire）未连接时也要接住 host_bridge 上行事件——不能丢。
-        // 当前：仅记录 LookupTable（Java 侧候选窗）+ 计数 Done。
+        // v0.13 简化：移除了 archived 的 thread_local applied_count——这里
+        // 只在 batched 时记录一次。保留用于回归测试。
         thread_local! {
             static APPLIED: Cell<u32> = Cell::new(0);
         }
+
+        // v0.13：host_bridge 上行事件（commit/preedit/delete）→ 真转发给
+        // 当前激活的 ti3 实例。firefox 等 client 通过 wire 事件收到 commit/preedit。
+        // 先在循环外查询 active instance（避免多次借用冲突）。
+        let active_obj = self.ti3.active_instance_for_focus().map(|i| i.obj.clone());
+        let mut last_commit: Option<String> = None;
+        let mut last_preedit: Option<(String, i32, i32)> = None; // (text, cursor_begin, cursor_end)
+        let mut last_delete: Option<(u32, u32)> = None;
 
         for ev in events {
             match ev {
@@ -259,21 +308,56 @@ impl ImeState {
                         visible: lt.visible,
                     });
                 }
-                UpEvent::Preedit(_p) => {
-                    // 嵌套应用通过自己的 GdkIMContext 接 preedit；mod 不再 push。
-                    // XIM server 上线后这里会发 ti3 preedit_string。
+                UpEvent::Preedit(p) => {
+                    // v0.13：缓存到 batch 末尾统一发给 firefox。PreeditUpdate
+                    // 已经在构造时把 clear / set 翻译好了。
+                    if p.text.is_empty() && p.cursor_begin == 0 && p.cursor_end == 0 {
+                        // 视为清空
+                        last_preedit = Some((String::new(), 0, 0));
+                    } else {
+                        last_preedit = Some((p.text, p.cursor_begin as i32, p.cursor_end as i32));
+                    }
                 }
-                UpEvent::Commit(_c) => {
-                    // 同上
+                UpEvent::Commit(c) => {
+                    last_commit = Some(c.text);
                 }
-                UpEvent::DeleteSurrounding(_d) => {
-                    // 同上
+                UpEvent::DeleteSurrounding(d) => {
+                    last_delete = Some((d.before_length, d.after_length));
                 }
                 UpEvent::Done(_d) => {
-                    // Done 触发原子应用。v0.10：仅记录应用计数（用于回归测试）。
                     APPLIED.with(|c| c.set(c.get() + 1));
                 }
             }
+        }
+
+        // 批量应用：先发 preedit / delete_surrounding，再发 commit。
+        // 顺序参照 wayland text_input_v3 协议：
+        //   preedit_string / delete_surrounding_text / commit_string
+        // 这些事件全部需要被 client 收到 done() 后才会真正写入 text field。
+        if let Some(obj) = &active_obj {
+            if let Some((text, cur_begin, cur_end)) = last_preedit.as_ref() {
+                // wayland-scanner 用 protocol 里 event 的 name 直接作为方法名
+                // （snake_case），所以是 `preedit_string` 不是
+                // `set_preedit_string`。
+                // 协议 v0.13 简化：preedit_string 没有 serial 参数。
+                // text 必须是 Option<String>：None 表示清空 preedit。
+                // cursor_begin/end 是 i32。
+                let text_opt = if text.is_empty() {
+                    None
+                } else {
+                    Some(text.clone())
+                };
+                obj.preedit_string(text_opt, *cur_begin, *cur_end);
+            }
+            if let Some((before, after)) = last_delete {
+                // delete_surrounding_text 是 u32。
+                obj.delete_surrounding_text(before, after);
+            }
+            if let Some(text) = last_commit.as_ref() {
+                obj.commit_string(Some(text.clone()));
+            }
+            // done 收尾——serial 在 v0.13 简化中不重要（firefox 不强校验）。
+            obj.done(0);
         }
     }
 
@@ -293,12 +377,19 @@ impl ImeState {
         // 测试时不需要 thread_local——直接调内部字段
     }
 
-    /// 创建 protocol globals（v0.10 保留 stub 兼容 ime.create_globals(&disp)）。
-    /// v0.10：mod 不再注册 zwp_text_input_manager_v3 / zwp_input_method_manager_v2
-    /// （由未来 XIM server / im1 global 接管）。本函数保留以保持 lib.rs 不变。
-    pub fn create_globals(&self, _disp: &smithay::reexports::wayland_server::DisplayHandle) {
-        // v0.10：no-op。ti3 / im2 manager 已被删除。
-        // 未来 im1 global / XIM server 上线时，这里会注册对应 globals。
+    /// 创建 protocol globals（v0.13 重建 ti3 server）。
+    /// v0.13：注册 `zwp_text_input_manager_v3` global——让 firefox 等 wayland
+    /// native client 能 bind 出 zwp_text_input_v3 实例，接 mod → host_bridge →
+    /// ibus 链路。
+    /// v0.13 **不**注册 `zwp_input_method_manager_v2`——im2 是让 ibus 当
+    /// client 接 mod（替代 dbus-ibus），v0.13 走 dbus-ibus host_bridge 替代。
+    pub fn create_globals(&self, disp: &smithay::reexports::wayland_server::DisplayHandle) {
+        use smithay::reexports::wayland_protocols::wp::text_input::zv3::server::zwp_text_input_manager_v3::ZwpTextInputManagerV3;
+        use smithay::reexports::wayland_server::GlobalDispatch;
+        disp.create_global::<crate::WLCState, ZwpTextInputManagerV3, ()>(1, ());
+        crate::bridge::ime_log_write(&format!(
+            "[waylandcraft][ime] zwp_text_input_manager_v3 global 已注册 v0.13"
+        ));
     }
 }
 
@@ -319,18 +410,6 @@ pub enum Ti3Outcome {
     DisabledInactive,
     /// 激活期间的状态提交；附带最新状态快照。
     State(Ti3Snapshot),
-}
-
-/// ti3 状态快照（与 wayland 类型解耦）。
-///
-/// v0.10：仅承载 host_bridge 需要的字段——surrounding text、光标矩形。
-/// wire 层（smithay 或自造）负责把协议原始值翻译成本快照。
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Ti3Snapshot {
-    pub surrounding_text: String,
-    pub cursor: u32,
-    pub anchor: u32,
-    pub cursor_rect: Option<(i32, i32, i32, i32)>,
 }
 
 #[cfg(test)]
@@ -363,7 +442,10 @@ mod tests {
         // surface 为空：直接标记
         // (实际调用 set_focus 需要 surface handle——这里用 None 不行)
         ime.app_active = true;
-        ime.clear_focus();
+        // v0.13：clear_focus 需要 &mut WLCState（拿 host_bridge）；
+        // 测试用 dummy state——host_bridge = None，clear_focus 不调 hb。
+        let mut state = crate::WLCState::new(display.handle(), None);
+        state.ime.clear_focus(&mut state);
         assert!(!ime.app_active(), "clear_focus 必须复位 app_active");
     }
 

@@ -1461,11 +1461,20 @@ fn keyboard_focus<'local>(
 
     match surface {
         Some(s) => {
-            instance.state.ime.set_focus(&s);
+            // v0.13：set_focus 内部需要 &mut state（拿 host_bridge），
+            // 但同时调用方已经在 `instance.state.ime.set_focus(...)` 里
+            // 借了 state.ime。NLL 不允许——把 ime std::mem::take 出来，调
+            // 完放回。
+            let mut ime = std::mem::take(&mut instance.state.ime);
+            ime.set_focus(&s, &mut instance.state);
+            instance.state.ime = ime;
             instance.state.seat.keyboard_focus(s);
         }
         None => {
-            instance.state.ime.clear_focus();
+            // 同上拆分借用
+            let mut ime = std::mem::take(&mut instance.state.ime);
+            ime.clear_focus(&mut instance.state);
+            instance.state.ime = ime;
             instance.state.seat.keyboard_unfocus();
         }
     };

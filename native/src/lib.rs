@@ -9,7 +9,8 @@ use crate::xdg_spec::XDGSpecHelper;
 use smithay::{
     backend::allocator::dmabuf::Dmabuf,
     delegate_compositor, delegate_dmabuf, delegate_shm,
-    delegate_single_pixel_buffer, delegate_viewporter, delegate_xdg_shell,
+    delegate_single_pixel_buffer, delegate_viewporter,
+    delegate_xdg_shell,
     reexports::{
         calloop::{self, EventLoop, generic::Generic as GenericEvent},
         wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
@@ -454,5 +455,8 @@ delegate_xdg_shell!(WLCState);
 delegate_viewporter!(WLCState);
 delegate_single_pixel_buffer!(WLCState);
 delegate_dmabuf!(WLCState);
-// delegate_input_method_manager!(WLCState);
-// delegate_text_input_manager!(WLCState);
+// v0.13 ti3 server：**自己实现** Dispatch（见 ime/text_input_v3.rs），
+// **不**用 `delegate_text_input_manager!`——后者要求 `WLCState: SeatHandler`
+// trait bound（smithay 标准 seat 接入），我们的 WLCSeat 是自定义的。
+// 自己写 Dispatch 绕过这个限制。
+// 不实现 `delegate_input_method_manager!`——v0.13 走 dbus-ibus host_bridge。
