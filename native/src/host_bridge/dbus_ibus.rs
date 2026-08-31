@@ -539,6 +539,7 @@ fn handle_signal(
             } else {
                 String::new()
             };
+            ime_log!("[waylandcraft][host_bridge][dbus-ibus] handle_signal: CommitText text={:?}", text);
             let _ = ev_tx.send(FromWorker::Commit(text));
             let _ = ev_tx.send(FromWorker::Done(0));
         }

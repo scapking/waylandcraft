@@ -137,11 +137,20 @@ impl ImeState {
             ));
         }
         // 2. host_bridge FocusIn：让 ibus 开始识别本 client 为输入焦点。
-        // v0.13 注：实际触发 ibus FocusIn 应在 client enable() 后（通过
-        // apply_ti3_outcome(Enabled)），而不是单纯的 keyboard focus 切换——
-        // 否则未激活 ti3 的 surface 也会触发 ibus FocusIn 浪费资源。
-        // 这里**不**直接调 host_bridge FocusIn，让 apply_ti3_outcome 触发。
-        let _ = state;
+        // v0.13 修正：实测 firefox 调 enable + set_surrounding_text 后**不调 commit**
+        // ——因此依赖 commit_instance → apply_ti3_outcome(Enabled) 发 FocusIn
+        // 永远不会被触发。改为：keyboard_focus 切到带 ti3 instance 的 surface 时
+        // 立即发 FocusIn（firefox enable 之后 ibus 立刻能识别这个 client 是输入焦点）。
+        // apply_ti3_outcome 仍会再发一次，但 host_bridge submit 是幂等的。
+        if let Some(hb) = state.host_bridge.as_mut() {
+            if hb.is_ready() {
+                crate::bridge::ime_log_write(&format!(
+                    "[waylandcraft][ime][host_bridge] FocusIn（set_focus 路径，switched={}）",
+                    switched
+                ));
+                hb.submit(DownEvent::State(FocusChange::Activate));
+            }
+        }
     }
 
     /// 键盘焦点整体离开（bridge.rs keyboard_unfocus 调用）。
@@ -190,29 +199,45 @@ impl ImeState {
             }
             Ti3Outcome::Enabled(snap) => {
                 ime.app_active = true;
+                crate::bridge::ime_log_write(&format!(
+                    "[waylandcraft][ime] apply_ti3_outcome Enabled -> host_bridge FocusIn (surrounding='{}' cursor={} anchor={} rect={:?})",
+                    &snap.surrounding_text.chars().take(8).collect::<String>(),
+                    snap.cursor, snap.anchor, snap.cursor_rect
+                ));
                 if let Some(hb) = hb {
                     if hb.is_ready() {
                         hb.submit(DownEvent::State(FocusChange::Activate));
-                        if !snap.surrounding_text.is_empty() || snap.cursor != snap.anchor {
-                            hb.submit(DownEvent::Surrounding(SurroundingText {
-                                text: snap.surrounding_text,
-                                cursor: snap.cursor,
-                                anchor: snap.anchor,
-                            }));
-                        }
-                        if let Some(rect) = snap.cursor_rect {
-                            hb.submit(DownEvent::CursorRect(CursorRect {
-                                x: rect.0,
-                                y: rect.1,
-                                w: rect.2,
-                                h: rect.3,
-                            }));
-                        }
+                    } else {
+                        crate::bridge::ime_log_write(
+                            "[waylandcraft][ime] apply_ti3_outcome Enabled: hb NOT ready（无法 FocusIn）"
+                        );
                     }
+                    if !snap.surrounding_text.is_empty() || snap.cursor != snap.anchor {
+                        hb.submit(DownEvent::Surrounding(SurroundingText {
+                            text: snap.surrounding_text,
+                            cursor: snap.cursor,
+                            anchor: snap.anchor,
+                        }));
+                    }
+                    if let Some(rect) = snap.cursor_rect {
+                        hb.submit(DownEvent::CursorRect(CursorRect {
+                            x: rect.0,
+                            y: rect.1,
+                            w: rect.2,
+                            h: rect.3,
+                        }));
+                    }
+                } else {
+                    crate::bridge::ime_log_write(
+                        "[waylandcraft][ime] apply_ti3_outcome Enabled: host_bridge=None（probe 失败）"
+                    );
                 }
             }
             Ti3Outcome::Disabled => {
                 ime.app_active = false;
+                crate::bridge::ime_log_write(
+                    "[waylandcraft][ime] apply_ti3_outcome Disabled -> host_bridge FocusOut"
+                );
                 if let Some(hb) = hb {
                     if hb.is_ready() {
                         hb.submit(DownEvent::State(FocusChange::Deactivate));
@@ -220,6 +245,11 @@ impl ImeState {
                 }
             }
             Ti3Outcome::State(snap) => {
+                crate::bridge::ime_log_write(&format!(
+                    "[waylandcraft][ime] apply_ti3_outcome State (surrounding='{}' cursor={} anchor={} rect={:?})",
+                    &snap.surrounding_text.chars().take(8).collect::<String>(),
+                    snap.cursor, snap.anchor, snap.cursor_rect
+                ));
                 if let Some(hb) = hb {
                     if hb.is_ready() {
                         if !snap.surrounding_text.is_empty() || snap.cursor != snap.anchor {

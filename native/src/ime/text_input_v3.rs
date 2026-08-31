@@ -264,6 +264,10 @@ impl Dispatch<ZwpTextInputV3, ()> for crate::WLCState {
 
         // commit 是唯一触发裁决流程的请求。
         if matches!(request, zwp_text_input_v3::Request::Commit) {
+            crate::bridge::ime_log_write(&format!(
+                "[waylandcraft][ime][ti3] commit_instance obj={} -> apply_ti3_outcome",
+                obj_id
+            ));
             let outcome = state.ime.ti3.commit_instance(ti);
             super::ImeState::apply_ti3_outcome(state, outcome);
             return;
