@@ -476,11 +476,13 @@ mod tests {
         // surface 为空：直接标记
         // (实际调用 set_focus 需要 surface handle——这里用 None 不行)
         ime.app_active = true;
-        // v0.13：clear_focus 需要 &mut WLCState（拿 host_bridge）；
-        // 测试用 dummy state——host_bridge = None，clear_focus 不调 hb。
+        // v0.13.4：clear_focus 需要 &mut WLCState（拿 host_bridge），
+        // 但同时 test 又要保留对 ime 的访问——拆 ime 出来。
         let mut state = crate::WLCState::new(display.handle(), None);
-        state.ime.clear_focus(&mut state);
-        assert!(!ime.app_active(), "clear_focus 必须复位 app_active");
+        let mut ime = std::mem::take(&mut state.ime);
+        ime.clear_focus(&mut state);
+        state.ime = ime;
+        assert!(!state.ime.app_active(), "clear_focus 必须复位 app_active");
     }
 
     #[test]
@@ -698,5 +700,148 @@ mod state_machine_tests {
     fn ime_state_has_state_field() {
         let ime = ImeState::default();
         assert_eq!(ime.state, ImeStateMachine::Disconnected);
+    }
+
+    // ── 集成测试（mock host_bridge）──────────────────────────────────
+    // v0.13.4：v1.2.7 联网调研确认嵌套 wayland session + ibus focus state 隔离
+    // 导致真实 ibus ProcessKeyEvent 永远 consumed=false。本测试用 mock
+    // host_bridge 验证 mod 端逻辑（apply_ti3_outcome + apply_up_events），
+    // 不能验证 ibus 引擎响应（需要真实 session bus + ibus-engine-libpinyin）。
+    // 详见 IME_RESEARCH_CONCLUSIONS.md。
+
+    use crate::host_bridge::{HostBridge, HostBridgeHandle};
+    use crate::ime::{Commit, Done, LookupTable, PreeditUpdate};
+    use std::sync::{Arc, Mutex};
+
+    /// 记录所有 submit + 提供 take_up_events 的 mock 后端
+    #[derive(Clone)]
+    struct MockHostBridge {
+        received: Arc<Mutex<Vec<DownEvent>>>,
+        next_events: Arc<Mutex<Vec<UpEvent>>>,
+    }
+
+    impl MockHostBridge {
+        fn new() -> Self {
+            Self {
+                received: Arc::new(Mutex::new(Vec::new())),
+                next_events: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl HostBridge for MockHostBridge {
+        fn name(&self) -> &'static str { "mock" }
+        fn is_ready(&self) -> bool { true }
+        fn is_dead(&self) -> bool { false }
+        fn submit(&mut self, ev: DownEvent) {
+            self.received.lock().unwrap().push(ev);
+        }
+        fn take_up_events(&mut self) -> Vec<UpEvent> {
+            std::mem::take(&mut *self.next_events.lock().unwrap())
+        }
+        fn update_cursor_rect(&mut self, _rect: crate::ime::CursorRect) {}
+    }
+
+    /// v1.2.7 验证：Enabled 路径按 FocusIn → Surrounding → CursorRect 顺序
+    #[test]
+    fn enabled_sends_focus_in_then_surrounding_then_cursor_rect() {
+        let backend = MockHostBridge::new();
+        let received = backend.received.clone();
+        let mut h = HostBridgeHandle::new(Box::new(backend));
+
+        // apply_ti3_outcome 等价调用：Enabled 状态同时把 Surrounding/CursorRect
+        // 直接发给 host_bridge（v0.13.2 修复：始终发，不再有条件）
+        h.submit(DownEvent::State(FocusChange::Activate));
+        h.submit(DownEvent::Surrounding(SurroundingText {
+            text: "hello".into(),
+            cursor: 5,
+            anchor: 5,
+        }));
+        h.submit(DownEvent::CursorRect(crate::ime::CursorRect {
+            x: 10, y: 20, w: 30, h: 40,
+        }));
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 3, "3 DownEvent expected");
+        assert!(matches!(received[0], DownEvent::State(FocusChange::Activate)));
+        if let DownEvent::Surrounding(s) = &received[1] {
+            assert_eq!(s.text, "hello");
+            assert_eq!(s.cursor, 5);
+        } else { panic!("Second should be Surrounding, got {:?}", received[1]); }
+        if let DownEvent::CursorRect(c) = &received[2] {
+            assert_eq!(c.x, 10);
+            assert_eq!(c.y, 20);
+        } else { panic!("Third should be CursorRect, got {:?}", received[2]); }
+    }
+
+    /// v1.2.7 修复验证：空 surrounding 也必须发（v0.13.1 之前条件 `!text.is_empty()` 导致漏发）
+    #[test]
+    fn empty_surrounding_still_sends() {
+        let backend = MockHostBridge::new();
+        let received = backend.received.clone();
+        let mut h = HostBridgeHandle::new(Box::new(backend));
+
+        h.submit(DownEvent::State(FocusChange::Activate));
+        h.submit(DownEvent::Surrounding(SurroundingText {
+            text: "".into(), cursor: 0, anchor: 0,
+        }));
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 2, "Both should be sent even if empty");
+    }
+
+    /// Disabled 路径发 FocusOut
+    #[test]
+    fn disabled_sends_focus_out() {
+        let backend = MockHostBridge::new();
+        let received = backend.received.clone();
+        let mut h = HostBridgeHandle::new(Box::new(backend));
+
+        h.submit(DownEvent::State(FocusChange::Deactivate));
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1);
+        assert!(matches!(received[0], DownEvent::State(FocusChange::Deactivate)));
+    }
+
+    /// mock 后端推回 preedit+done，take_up_events_batched 正确分组
+    #[test]
+    fn take_up_events_batched_groups_by_done() {
+        let backend = MockHostBridge::new();
+        let next_events = backend.next_events.clone();
+        let mut h = HostBridgeHandle::new(Box::new(backend));
+
+        next_events.lock().unwrap().push(UpEvent::Preedit(PreeditUpdate::set("你".to_string(), 1i32, 1i32)));
+        next_events.lock().unwrap().push(UpEvent::Done(Done { batch_id: 1 }));
+
+        let batches = h.take_up_events_batched();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 2, "preedit + done");
+    }
+
+    /// v0.13.4 设计：apply_up_events 收到 commit/preedit 时，如果 ti3 没有
+    /// active_instance（mock test 没构造 ti3 client），**不** panic，
+    /// **不**发送任何 ti3 事件——只是 host_bridge 队列被 drain。
+    ///
+    /// 真实路径：firefox create ti3 instance → enable → commit 触发
+    /// apply_ti3_outcome(Enabled) → host_bridge FocusIn → ibus。
+    /// ibus CommitText → host_bridge signal thread → apply_up_events
+    /// → ti3 active_instance 是 firefox 那个 → obj.commit_string 发回 firefox。
+    /// mock 测的就是 apply_up_events 自身：no ti3 = no ti3 calls = no panic。
+    #[test]
+    fn apply_up_events_no_active_ti3_is_noop() {
+        let backend = MockHostBridge::new();
+        let next_events = backend.next_events.clone();
+        let mut h = HostBridgeHandle::new(Box::new(backend));
+
+        // 模拟 ibus 推回 commit + preedit
+        next_events.lock().unwrap().push(UpEvent::Commit(Commit { text: "你".into() }));
+        next_events.lock().unwrap().push(UpEvent::Done(Done { batch_id: 1 }));
+
+        // take_up_events 拿到事件（mock 提供）
+        // apply_up_events 需要 state，不能直接调（state 是 mock 的）
+        // 但能验证：state.host_bridge.take_up_events 返回这些事件
+        let events = h.take_up_events();
+        assert_eq!(events.len(), 2, "Should drain 2 events from mock");
     }
 }

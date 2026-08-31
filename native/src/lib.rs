@@ -54,8 +54,11 @@ mod desktop_windows;
 mod portal_capture;
 mod audio_capture;
 mod egl;
-mod host_bridge;
-mod ime;
+// v0.13.4：ime 和 host_bridge 改为 pub 以让集成测试能 import
+// （测试是 waylandcraft/native/tests/ime_integration.rs）。
+// 暴露的是内部模块——公共 API 仍由 java_types/bridge 决定。
+pub mod host_bridge;
+pub mod ime;
 mod java_types;
 mod output;
 mod process;
