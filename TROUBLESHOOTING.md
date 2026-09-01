@@ -99,7 +99,33 @@ mutter 49.2+ 已经在朝多 context IME 方向走。
 
 - 提交 issue：<https://github.com/scapking/waylandcraft/issues/new>
 - 附上：
+  - **`waylandcraft/status.log`**（v1.2.9+）—— 单一文件包含所有子系统状态，**最优先**看这个
   - `waylandcraft-ime.log`
   - `latest.log.tail`（崩溃报告）
   - 你的 session 信息（`echo $XDG_SESSION_TYPE $WAYLAND_DISPLAY $XDG_CURRENT_DESKTOP`）
   - 你装的 waylandcraft 版本（`unzip -p mods/waylandcraft*.jar fabric.mod.json | grep version`）
+
+### 一键打包诊断日志（v1.2.9+，需先 `apt install curl`）
+
+```bash
+D=/tmp/wcdiag-$(date +%s); mkdir -p $D && cd ~/minercaft_26_1_2 && \
+cp waylandcraft-ime.log waylandcraft-audio.log waylandcraft-kb.log $D/ 2>/dev/null && \
+tail -c 3000000 logs/latest.log > $D/latest.log.tail 2>/dev/null && \
+ls crash-reports 2>/dev/null | tail -5 | while read f; do cp "crash-reports/$f" $D/; done && \
+cp hs_err_pid*.log $D/ 2>/dev/null && \
+cp -r waylandcraft $D/wc-dir 2>/dev/null && \
+cp /tmp/wlc-env-dump.log /tmp/waylandcraft-app-bash.log /tmp/waylandcraft-launch.log /tmp/waylandcraft-satellite.log $D/ 2>/dev/null && \
+{ echo "== session =="; \
+  echo "XDG_SESSION_TYPE=$XDG_SESSION_TYPE WAYLAND_DISPLAY=$WAYLAND_DISPLAY DISPLAY=$DISPLAY XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP"; \
+  echo "== ime processes =="; pgrep -a fcitx5; pgrep -a ibus; \
+  echo "== fcitx5 journal =="; journalctl --user -u fcitx5 --no-pager 2>&1 | tail -200; \
+  echo "== mods =="; ls -la mods/ | grep -iE 'wayland|ime'; \
+  echo "== wc version in jar =="; unzip -p mods/waylandcraft*.jar fabric.mod.json 2>/dev/null | head -8; \
+} > $D/env.txt 2>&1 && \
+cd /tmp && tar czf wcdiag.tar.gz $(basename $D) && \
+{ curl -sf -F reqtype=fileupload -F time=72h -F fileToUpload=@wcdiag.tar.gz \
+  https://litterbox.catbox.moe/resources/internals/api.php \
+  || curl -sf -F "file=@wcdiag.tar.gz" https://tmpfiles.org/api/v1/upload; } && echo
+```
+
+把脚本输出的 URL 贴到 issue 里。
