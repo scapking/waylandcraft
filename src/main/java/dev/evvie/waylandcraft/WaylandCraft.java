@@ -153,6 +153,14 @@ public class WaylandCraft implements ClientModInitializer {
 	private double lastSharedMouseX = Double.NaN;
 	private double lastSharedMouseY = Double.NaN;
 	private long lastSharedMouseSend = 0;
+
+	// v0.13.4：状态日志——一个文件包含所有子系统状态（覆盖式）
+	// 写入：每 STATUS_REFRESH_INTERVAL_MS 刷一次；初始化时立即刷一次。
+	// 文件路径：<gameDir>/waylandcraft/status.log
+	// v0.13.5 fallback：<gameDir>/waylandcraft-status.log（兼容老 user 没 waylandcraft/ 子目录）
+	private File statusLogFile = null;
+	private long lastStatusRefreshMs = 0;
+	private static final long STATUS_REFRESH_INTERVAL_MS = 30_000; // 30 秒
 	
 	public KeyboardCaptureMode keyboardCaptureMode = KeyboardCaptureMode.NONE;
 	
@@ -272,6 +280,59 @@ public class WaylandCraft implements ClientModInitializer {
 		// 更新 Portal 桌面捕获帧
 		if(captureManager != null) {
 			captureManager.tick();
+		}
+
+		// v0.13.4：状态日志——每 30s 刷一次 status.log（覆盖式）
+		refreshStatusLogIfNeeded();
+	}
+
+	/**
+	 * v0.13.4：把当前 native + Java 子系统状态写入覆盖式 status.log。
+	 * 一个文件包含全部子系统状态（native lib / egl / host_bridge /
+	 * ime_ti3 / xwayland-satellite / audio / portal）——排查问题不必再
+	 * 切 4 个独立日志。
+	 * <p>每 {@link #STATUS_REFRESH_INTERVAL_MS} 刷一次；第一次调用时
+	 * （bridge 刚初始化后）立即刷。
+	 * <p>写入失败不抛异常——日志写不出不能影响游戏运行。
+	 */
+	private void refreshStatusLogIfNeeded() {
+		if(bridge == null) return;
+		long now = System.currentTimeMillis();
+		boolean firstTime = (statusLogFile == null);
+		if(!firstTime && (now - lastStatusRefreshMs) < STATUS_REFRESH_INTERVAL_MS) return;
+		lastStatusRefreshMs = now;
+		if(statusLogFile == null) {
+			// v0.13.5：fallback 路径——优先 waylandcraft/status.log，失败回退到 gameDir 根。
+			// 一些老 user 没 waylandcraft/ 子目录权限，FileWriter 写不进。
+			File primary = new File(Minecraft.getInstance().gameDirectory, "waylandcraft/status.log");
+			File fallback = new File(Minecraft.getInstance().gameDirectory, "waylandcraft-status.log");
+			statusLogFile = primary.canWrite() || canCreateParentDir(primary) ? primary : fallback;
+		}
+		try {
+			String json = bridge.getStatusReport(Thread.currentThread().getName());
+			// v0.13.5：写前确保父目录存在（防御 gameDir 没 waylandcraft/ 子目录）。
+			File parent = statusLogFile.getParentFile();
+			if(parent != null && !parent.exists()) parent.mkdirs();
+			// 覆盖式写入：FileWriter(file, false) = 不 append，直接覆盖。
+			try (java.io.FileWriter w = new java.io.FileWriter(statusLogFile, false)) {
+				w.write(json);
+			}
+		} catch (Throwable t) {
+			// 日志写不出不影响游戏——但用最高级日志（ERROR）以便 grep
+			WaylandCraftCommon.LOGGER.error("[waylandcraft] status.log write failed: {}", t.toString());
+		}
+	}
+
+	/** v0.13.5：检查能否创建给定文件的父目录（写权限 + 可创建）。 */
+	private static boolean canCreateParentDir(File f) {
+		File parent = f.getParentFile();
+		if(parent == null) return false;
+		if(parent.exists()) return parent.canWrite();
+		// 父目录不存在——试创建
+		try {
+			return parent.mkdirs() || parent.exists();
+		} catch (SecurityException e) {
+			return false;
 		}
 	}
 	
