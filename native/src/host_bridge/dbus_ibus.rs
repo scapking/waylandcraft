@@ -400,11 +400,21 @@ fn command_loop(
                     "[waylandcraft][host_bridge][dbus-ibus] SetSurroundingText text=\"{}\" cursor={cursor_pos} anchor={anchor_pos}",
                     text.chars().take(16).collect::<String>()
                 );
+                // v0.13.7 修：ibus SetSurroundingText 签名是 (vuu)——text 是 variant
+                // (Maybe String)，不是 String。waylandcraft v1.2.11 之前用 `&(String, u32, u32)`
+                // → zbus 生成 (suu) 签名 → ibus 报 InvalidArgs 类型不匹配。
+                // 改用 zvariant::Optional（生成 variant 序列化）。
+                use zbus::zvariant::Optional;
+                let text_v = if text.is_empty() {
+                    Optional::from(None::<String>)
+                } else {
+                    Optional::from(Some(text))
+                };
                 ic_conns
                     .ic
                     .call::<_, _, ()>(
                         "SetSurroundingText",
-                        &(text, cursor_pos, anchor_pos),
+                        &(text_v, cursor_pos, anchor_pos),
                     )
                     .map(|_| ())
                     .map_err(|e| e.to_string())
