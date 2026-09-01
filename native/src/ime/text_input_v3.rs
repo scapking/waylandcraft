@@ -146,6 +146,12 @@ impl TextInputV3State {
         self.focus_surface.is_some()
     }
 
+    /// v0.13.4：当前活着的 ti3 实例数（firefox 之类客户端的 zwp_text_input_v3 对象数）。
+    /// status.rs 用于判断嵌套 IME 是否被启用。
+    pub fn instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
     /// 处理一个实例的 commit：应用 double-buffer，返回裁决结果。
     /// commit 计数无条件递增（协议按「该对象发出的请求」计数）。
     pub(crate) fn commit_instance(&mut self, obj: &ZwpTextInputV3) -> Ti3CommitOutcome {

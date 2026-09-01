@@ -107,10 +107,10 @@ pub fn ime_log_write(s: &str) {
 #[allow(clippy::vec_box)]
 pub(crate) struct BridgeState {
     /* Handle collections */
-    toplevels: Vec<Box<ToplevelSurface>>,
-    popups: Vec<Box<PopupSurface>>,
-    surfaces: Vec<Box<WlSurface>>,
-    dmabufs: Vec<Box<WeakDmabuf>>,
+    pub(crate) toplevels: Vec<Box<ToplevelSurface>>,
+    pub(crate) popups: Vec<Box<PopupSurface>>,
+    pub(crate) surfaces: Vec<Box<WlSurface>>,
+    pub(crate) dmabufs: Vec<Box<WeakDmabuf>>,
 }
 
 impl BridgeState {
@@ -373,6 +373,11 @@ bind_java_type! {
             sig = () -> JString,
             name = "nativeVersionNative",
             fn = native_version,
+        },
+        static extern fn get_status_report {
+            sig = (instance: jlong, java_thread: JString) -> JString,
+            name = "getStatusReportNative",
+            fn = get_status_report,
         },
         static extern fn notify_host_focus_gained {
             sig = (instance: jlong),
@@ -1707,6 +1712,32 @@ fn native_version<'local>(
         env!("CARGO_PKG_VERSION"),
         env!("WAYLANDCRAFT_GIT_HASH")
     ))?)
+}
+
+/// getStatusReportNative(instance, javaThread) —— 返回 JSON 状态报告。
+///
+/// Java 端每 N 帧调用一次，把结果写入覆盖式 `status.log`——一个文件包含
+/// 全部子系统状态（native lib / egl / wayland globals / host_bridge / ime /
+/// xwayland-satellite / audio / portal / ...），不必再切 4 个独立日志。
+///
+/// v0.13.4 新增。mod_version 硬编码 "1.2.9"（与 gradle.properties 同步）；
+/// 后续 bump version 时记得改这里。
+fn get_status_report<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    java_thread: JString<'local>,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "getStatusReport")?;
+    let thread_name: String = java_thread
+        .try_to_string(env)
+        .map_err(|e| BridgeError::JniError(e))?;
+    let report = crate::status::StatusReport::gather(
+        &instance,
+        thread_name,
+        "1.2.9", // mod_version — 与 waylandcraft/gradle.properties 同步
+    );
+    Ok(env.new_string(report.to_json())?)
 }
 
 /// setImeLogFile(path) —— 让 Rust 侧 [system_ime] 行同时写入文件（默认只进 stderr）。

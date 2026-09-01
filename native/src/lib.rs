@@ -60,6 +60,7 @@ mod egl;
 pub mod host_bridge;
 pub mod ime;
 mod java_types;
+mod status;
 mod output;
 mod process;
 mod satellite;
@@ -78,6 +79,9 @@ pub(crate) struct WaylandCraft<'a> {
     /// 启动时探测一次；连接断开后由 update() 重建。
     /// 当前用途：C 方案 Layer 3 等待 XIM server 上线后启用。
     pub host_bridge: Option<crate::host_bridge::HostBridgeHandle>,
+    /// 启动时间（v0.13.4 status.rs 用）。`Instant` 而非 `SystemTime`——
+    /// 状态报告关心"uptime 秒数"，不关心 wall clock。
+    pub start_time: std::time::Instant,
 }
 
 pub struct WLCState {
@@ -410,6 +414,7 @@ pub(crate) fn wlc_init(
         egl,
         xdg,
         host_bridge,
+        start_time: std::time::Instant::now(),
     };
     Ok(instance)
 }

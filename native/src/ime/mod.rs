@@ -77,7 +77,8 @@ pub struct ImeState {
 
     /// 键盘焦点是否在某个文本输入 surface 上。
     /// 由 `set_focus` / `clear_focus` 维护。
-    has_focus: bool,
+    /// v0.13.4 改为 pub(crate) 让 status.rs 读取（之前私有+有 has_focus() 方法）。
+    pub(crate) has_focus: bool,
 
     /// 最近一次候选窗快照（Java 每帧轮询）。
     lookup_table: Option<LookupTableSnapshot>,
@@ -100,6 +101,11 @@ impl ImeState {
     /// 是否有激活的文本输入会话（Java 侧驱动宿主 enable 门控）。
     pub fn app_active(&self) -> bool {
         self.app_active
+    }
+
+    /// v0.13.4：当前是否有 ti3 / keyboard 焦点（status.rs 用）。
+    pub fn has_focus(&self) -> bool {
+        self.has_focus
     }
 
     /// im2 grab 是否抓走了键盘。
