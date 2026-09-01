@@ -444,9 +444,15 @@ fn command_loop(
             ToWorker::Ping => Ok(()),
         };
         if let Err(e) = res {
-            ime_log!("[waylandcraft][host_bridge][dbus-ibus] 命令失败: {e}");
-            let _ = ev_tx.send(FromWorker::Fatal(e));
-            return;
+            // v0.13.7 修：原代码 send FATAL → 主线程 `self.dead = Some(msg)`
+            // → `is_ready()` 永远 false → 后续 ProcessKeyEvent 全失败。
+            // 根因：dbus 错误（InvalidArgs、网络瞬断、SetSurroundingText 类型不匹配等）
+            // 是**临时**的，ibus 引擎不需要重连。把这些错误降级为普通错误：
+            // - 记日志（IME 诊断可见）
+            // - **不**设 dead → 后续命令仍能发送
+            // - worker 继续循环（return → 下次 cmd 还能接）
+            ime_log!("[waylandcraft][host_bridge][dbus-ibus] 命令失败（不影响 host_bridge）: {e}");
+            // 不发 FATAL，不设 dead
         }
     }
 }
