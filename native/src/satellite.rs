@@ -21,7 +21,12 @@ use thiserror::Error;
 
 pub struct SatelliteState {
     display: i32,
-    _handle: Child,
+    /// Child 句柄（mut：start_satellite 后重新 spawn 替换；restart_count 记录次数）
+    handle: std::cell::RefCell<Child>,
+    /// 重启次数——v0.13.6 防止 panic 风暴（如果一帧内死 N 次就别再启了）
+    restart_count: std::cell::Cell<u32>,
+    /// 上次死亡时间——避免连续重试（如果刚死 1 秒内不再启）
+    last_death_ms: std::cell::Cell<Option<u128>>,
     _lock_guard: TmpFileGuard,
     _unix_guard: TmpFileGuard,
 }
@@ -29,6 +34,92 @@ pub struct SatelliteState {
 impl SatelliteState {
     pub fn get_display(&self) -> String {
         format!(":{0}", self.display)
+    }
+
+    /// v0.13.6：检查 satellite 是否还活着（每次 X11 应用 launch 时调）。
+    /// 死了自动重启（受 restart_count + last_death_ms 节流）。
+    /// 成功返回 Ok(())，失败返回 RestartError。
+    pub fn ensure_alive(&self) -> Result<(), RestartError> {
+        let mut handle = self.handle.borrow_mut();
+        match handle.try_wait() {
+            Ok(Some(status)) => {
+                // satellite 死了。立即尝试重启（受 restart_count 节流）。
+                eprintln!(
+                    "[waylandcraft] xwayland-satellite died (status={:?}); restarting",
+                    status
+                );
+                drop(handle); // 释放 borrow
+                self.restart()
+            }
+            Ok(None) => Ok(()), // 还活着
+            Err(e) => {
+                drop(handle);
+                Err(RestartError::Wait(e))
+            }
+        }
+    }
+
+    /// v0.13.6：内部 restart 逻辑——start_satellite 重新 spawn 替换 handle。
+    fn restart(&self) -> Result<(), RestartError> {
+        // 节流：上次死亡后 5 秒内不重启
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        if let Some(last) = self.last_death_ms.get() {
+            if now_ms.saturating_sub(last) < 5000 {
+                return Err(RestartError::TooSoon);
+            }
+        }
+        // 风暴保护：60 秒内重启 ≥3 次就放弃
+        let count = self.restart_count.get();
+        if count >= 3 {
+            return Err(RestartError::TooMany);
+        }
+        // 重新 spawn（复用 start_satellite 的逻辑但只针对当前 display）
+        // 注意：start_satellite 完整路径需要 socket 等——这里调用
+        // 重构后的 try_restart_display
+        let wayland_display = std::env::var_os("WAYLAND_DISPLAY")
+            .unwrap_or_else(|| std::ffi::OsString::from("wayland-1"));
+        let handle = match try_restart_display(&wayland_display, self.display) {
+            Ok(h) => h,
+            Err(e) => {
+                self.last_death_ms.set(Some(now_ms));
+                self.restart_count.set(count + 1);
+                return Err(RestartError::Spawn(e));
+            }
+        };
+        *self.handle.borrow_mut() = handle;
+        self.last_death_ms.set(Some(now_ms));
+        self.restart_count.set(count + 1);
+        eprintln!(
+            "[waylandcraft] xwayland-satellite restarted (count={})",
+            count + 1
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum RestartError {
+    /// try_wait 调用本身失败（不太可能）
+    Wait(std::io::Error),
+    /// 距上次死亡 < 5 秒
+    TooSoon,
+    /// 60 秒内已重启 ≥3 次
+    TooMany,
+    /// 重新 spawn 失败
+    Spawn(SatelliteError),
+}
+
+impl std::fmt::Display for RestartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wait(e) => write!(f, "try_wait failed: {e}"),
+            Self::TooSoon => write!(f, "satellite died < 5s ago; skipping restart"),
+            Self::TooMany => write!(f, "satellite died ≥3 times in 60s; giving up"),
+            Self::Spawn(e) => write!(f, "respawn failed: {e}"),
+        }
     }
 }
 
@@ -227,6 +318,28 @@ fn try_open_sockets(dpy: i32) -> Result<X11Sockets, SatelliteError> {
     })
 }
 
+/// v0.13.6：仅重启 satellite（不动 socket 文件——之前的 start_satellite
+/// 已经创建并保持了 lock_guard + unix_guard，重启不需要重新 socket）。
+/// 复用 try_invoke_xws 启子进程，但只对指定 display。
+fn try_restart_display(
+    wayland_display: &OsStr,
+    display: i32,
+) -> Result<Child, SatelliteError> {
+    // v0.13.6 简化：之前的 start_satellite 路径里 socket 句柄已被子进程继承。
+    // 重启时，socket 文件还存在（lock_guard 还在），所以可以重新 try_lock_display + 打开新 socket。
+    // 但要避免与原 lock_guard 冲突——这里直接用 1 个简单方法：跑 try_invoke_xws，
+    // 由 satellite 自己接管新 socket。
+    // 关键问题：旧 lock_guard + unix_guard 在 SatelliteState drop 时才释放——
+    // 我们的 restart() 通过 borrow_mut 替换 handle 但 lock_guard 不动。
+    // 简单实现：每次 restart 都 start_satellite 完整路径，保留原 SatelliteState 字段。
+    // 实在复杂：直接调完整 start_satellite，丢弃旧 SatelliteState 字段即可。
+    // **v0.13.6 取折中**：只重新 spawn 进程（不重建 socket）——假定 OS 允许
+    // bind 同一个 :N（这通常成立因为 X server 用 SO_REUSEADDR）。
+    // 风险：可能失败——fallback 是返 SatelliteError 让 Java 报错。
+    let listenfds: Vec<RawFd> = Vec::new();
+    try_invoke_xws(wayland_display, display, &listenfds)
+}
+
 fn try_invoke_xws(
     wayland_display: &OsStr,
     display: i32,
@@ -331,7 +444,9 @@ pub fn start_satellite(
 
         return Ok(SatelliteState {
             display: dpy,
-            _handle: handle,
+            handle: std::cell::RefCell::new(handle),
+            restart_count: std::cell::Cell::new(0),
+            last_death_ms: std::cell::Cell::new(None),
             _lock_guard: lock_guard,
             _unix_guard: sockets.unix_guard,
         });

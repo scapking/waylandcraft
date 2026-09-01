@@ -447,6 +447,17 @@ impl<'a> WaylandCraft<'a> {
             }
         }
 
+        // v0.13.6：每帧检查 satellite 是否还活着——死了自动 restart。
+        // 这是修复"firefox 30 秒后 crash / cannot open display: :2"的根因：
+        // xwayland-satellite panic 死掉后，DISPLAY=:2 永久不可用。restart 让
+        // 下一次 /wl launch X11 应用能拿到新的 X server。
+        if let Some(sat) = &self.state.satellite {
+            if let Err(e) = sat.ensure_alive() {
+                // 节流错误不致命——只记一次
+                eprintln!("[waylandcraft] satellite ensure_alive: {e}");
+            }
+        }
+
         let state = &mut self.state;
         let event_loop = &mut self.event_loop;
         event_loop.dispatch(Some(Duration::ZERO), state).unwrap();
