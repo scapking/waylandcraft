@@ -49,10 +49,18 @@ ibus **接到按键**但**引擎没激活** → 返回 `consumed=false`。
 
 #### 方案 1：用稳定版 v1.2.4（推荐）
 
-v1.2.4 崩溃修复是稳定的，IME 部分行为和 v1.2.5/6/7 **一样**（因为问题不在 waylandcraft）。
-直接用 v1.2.4 避免下载可能带已知 issue 警告的版本。
+**v1.2.4 是当前推荐的 stable**。崩溃修复是稳定的，IME 部分行为和 v1.2.5+
+**一样**（嵌套 IME 限制是生态问题，单 mod 改不动）。直接用 v1.2.4 避免 v1.2.5+
+release page 顶部那条"嵌套 IME 限制"警告噪声。
 
 下载：<https://github.com/scapking/waylandcraft/releases/tag/v1.2.4>
+
+> **v1.2.5-v1.2.14 都**有"嵌套 IME 限制"问题——只有 v1.2.4 之前的 release 行为相同。
+> v1.2.4 之后改的 (v1.2.5+): ti3 server 重启 + SetSurroundingText 类型修复 + satellite restart。
+> 这些修的都是 waylandcraft 自己的协议逻辑——issue #1 嵌套 wayland + ibus focus
+> state 隔离是 mutter/ibus/portal 三方问题，**单 mod 改不动**。
+>
+> **所以 v1.2.4 是最好的选择**——所有崩溃 bug 修了，所有 IME 限制保持原样。
 
 #### 方案 2：在 host session 直接跑 firefox
 
@@ -105,27 +113,19 @@ mutter 49.2+ 已经在朝多 context IME 方向走。
   - 你的 session 信息（`echo $XDG_SESSION_TYPE $WAYLAND_DISPLAY $XDG_CURRENT_DESKTOP`）
   - 你装的 waylandcraft 版本（`unzip -p mods/waylandcraft*.jar fabric.mod.json | grep version`）
 
-### 一键打包诊断日志（v1.2.9+，需先 `apt install curl`）
+### 一键打包诊断日志（v1.2.15+，需先 `apt install curl python3`）
 
 ```bash
-D=/tmp/wcdiag-$(date +%s); mkdir -p $D && cd ~/minercaft_26_1_2 && \
-cp waylandcraft-ime.log waylandcraft-audio.log waylandcraft-kb.log $D/ 2>/dev/null && \
-tail -c 3000000 logs/latest.log > $D/latest.log.tail 2>/dev/null && \
-ls crash-reports 2>/dev/null | tail -5 | while read f; do cp "crash-reports/$f" $D/; done && \
-cp hs_err_pid*.log $D/ 2>/dev/null && \
-cp -r waylandcraft $D/wc-dir 2>/dev/null && \
-cp /tmp/wlc-env-dump.log /tmp/waylandcraft-app-bash.log /tmp/waylandcraft-launch.log /tmp/waylandcraft-satellite.log $D/ 2>/dev/null && \
-{ echo "== session =="; \
-  echo "XDG_SESSION_TYPE=$XDG_SESSION_TYPE WAYLAND_DISPLAY=$WAYLAND_DISPLAY DISPLAY=$DISPLAY XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP"; \
-  echo "== ime processes =="; pgrep -a fcitx5; pgrep -a ibus; \
-  echo "== fcitx5 journal =="; journalctl --user -u fcitx5 --no-pager 2>&1 | tail -200; \
-  echo "== mods =="; ls -la mods/ | grep -iE 'wayland|ime'; \
-  echo "== wc version in jar =="; unzip -p mods/waylandcraft*.jar fabric.mod.json 2>/dev/null | head -8; \
-} > $D/env.txt 2>&1 && \
-cd /tmp && tar czf wcdiag.tar.gz $(basename $D) && \
-{ curl -sf -F reqtype=fileupload -F time=72h -F fileToUpload=@wcdiag.tar.gz \
-  https://litterbox.catbox.moe/resources/internals/api.php \
-  || curl -sf -F "file=@wcdiag.tar.gz" https://tmpfiles.org/api/v1/upload; } && echo
+# v0.13.11 改进版（推荐用这个）
+bash waylandcraft/diag/wcdiag.sh
 ```
+
+输出：`/tmp/wcdiag-<timestamp>.tar.gz` + catbox/tmpfiles URL。
+
+**包含**（v0.13.11 改进）：
+- `mods/waylandcraft*.jar`（v1.2.13 缺失——v0.13.11 修）
+- `waylandcraft/satellite.log`（v0.13.10 satellite 子目录化）
+- 系统诊断（wayland-scanner / Xwayland / java / glxinfo / gpu）
+- catbox 失败自动 fallback tmpfiles
 
 把脚本输出的 URL 贴到 issue 里。
