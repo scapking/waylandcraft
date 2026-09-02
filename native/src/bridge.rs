@@ -1720,8 +1720,9 @@ fn native_version<'local>(
 /// 全部子系统状态（native lib / egl / wayland globals / host_bridge / ime /
 /// xwayland-satellite / audio / portal / ...），不必再切 4 个独立日志。
 ///
-/// v0.13.4 新增。mod_version 硬编码 "1.2.9"（与 gradle.properties 同步）；
-/// 后续 bump version 时记得改这里。
+/// v0.13.4 新增。mod_version 硬编码 "1.2.13"（与 gradle.properties 同步）；
+/// v0.13.9 修：之前 v0.13.5/7/8 bump version 时忘记同步这里——导致 status.log
+/// 一直显示 "1.2.9"。后续 bump version 时记得改这里（+ gradle.properties）。
 fn get_status_report<'local>(
     env: &mut Env<'local>,
     _class: JClass<'local>,
@@ -1735,7 +1736,7 @@ fn get_status_report<'local>(
     let report = crate::status::StatusReport::gather(
         &instance,
         thread_name,
-        "1.2.9", // mod_version — 与 waylandcraft/gradle.properties 同步
+        "1.2.13", // mod_version — 与 waylandcraft/gradle.properties 同步
     );
     Ok(env.new_string(report.to_json())?)
 }

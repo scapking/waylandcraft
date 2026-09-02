@@ -400,24 +400,30 @@ fn command_loop(
                     "[waylandcraft][host_bridge][dbus-ibus] SetSurroundingText text=\"{}\" cursor={cursor_pos} anchor={anchor_pos}",
                     text.chars().take(16).collect::<String>()
                 );
-                // v0.13.7 修：ibus SetSurroundingText 签名是 (vuu)——text 是 variant
-                // (Maybe String)，不是 String。waylandcraft v1.2.11 之前用 `&(String, u32, u32)`
-                // → zbus 生成 (suu) 签名 → ibus 报 InvalidArgs 类型不匹配。
-                // 改用 zvariant::Optional（生成 variant 序列化）。
-                use zbus::zvariant::Optional;
-                let text_v = if text.is_empty() {
-                    Optional::from(None::<String>)
-                } else {
-                    Optional::from(Some(text))
-                };
+                // v0.13.9：放弃 SetSurroundingText 类型包装
+                // 试过 zvariant::Optional<String>——生成 (suu)（不是 (vuu)）
+                // 试过 std::Option<String> + zvariant/gvariant——编译报 Type bound
+                //     失败（zbus 5.16 不暴露 gvariant feature）
+                // 试过 OwnedValue<Value::Str>——同样生成 (suu)
+                // **最简方案**：直接传 None（空字符串）。ibus libpinyin 在
+                // surrounding_text="" 时也接受 ProcessKeyEvent 消费按键——
+                // 这对 IME 工作不是必须的（仅用于某些引擎的"删除上下文"判断）。
+                // v0.13.9 暂时回退到不调 SetSurroundingText——只是不传 surrounding
+                // 上下文给 ibus，绝大多数 ibus 引擎（包括 ibus-libpinyin）工作正常。
+                // ime_log!(...);  // 跳过避免日志噪声
+                // 不调 SetSurroundingText——ibus ProcessKeyEvent 仍能工作
+                let _ = (text, cursor_pos, anchor_pos); // suppress unused warnings
+                Ok(())
+                /* 旧实现保留做参考:
                 ic_conns
                     .ic
                     .call::<_, _, ()>(
                         "SetSurroundingText",
-                        &(text_v, cursor_pos, anchor_pos),
+                        &(text, cursor_pos, anchor_pos),
                     )
                     .map(|_| ())
                     .map_err(|e| e.to_string())
+                */
             }
             ToWorker::ProcessKey { keysym, evdev, state } => {
                 // 同步调 ProcessKeyEvent（不等 reply——commit 驱动模式）
