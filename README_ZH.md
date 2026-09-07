@@ -411,6 +411,16 @@ cd .. && ./gradlew clean build
 
 ---
 
+## 📚 扩展阅读
+
+- [docs/IME.md](docs/IME.md) — 输入法架构（v0.9.27+ ti3 重写）
+- [docs/CAPTURE.md](docs/CAPTURE.md) — 抓帧路径工程笔记（PipeWire / X11 / Minecraft framebuffer / 共享窗口中继）以及 `capture/fallback` 在 native bridge 缺失时使用的 dbus-send + grim fallback
+- [docs/EXTERNAL_PROJECTS.md](docs/EXTERNAL_PROJECTS.md) — 同类 fork 生态、外部 IME / GLFW / Wayland fix mod、音视频参考项目
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — 已知问题与诊断
+- [IME_RESEARCH_CONCLUSIONS.md](IME_RESEARCH_CONCLUSIONS.md) — 嵌套 wayland IME 为何是生态层面的问题
+
+---
+
 ## 🤝 贡献
 
 欢迎贡献！这是 [WaylandCraft](https://github.com/EVV1E/waylandcraft.git) 的 fork，多人功能由 AI 实现——粗糙之处在所难免。

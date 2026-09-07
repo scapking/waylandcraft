@@ -418,6 +418,16 @@ cd .. && ./gradlew clean build
 
 ---
 
+## 📚 Further Reading
+
+- [docs/IME.md](docs/IME.md) — IME architecture (v0.9.27+ ti3 rewrite)
+- [docs/CAPTURE.md](docs/CAPTURE.md) — capture path engineering notes (PipeWire / X11 / Minecraft framebuffer / shared-window relay) and the `capture/fallback` dbus-send + grim fallback used when the native bridge is unavailable
+- [docs/EXTERNAL_PROJECTS.md](docs/EXTERNAL_PROJECTS.md) — fork landscape, external IME / GLFW / Wayland fix mods, audio/video reference projects
+- [TROUBLESHOOTING.md](TROUBLESHOOTING.md) — known issues and diagnostics
+- [IME_RESEARCH_CONCLUSIONS.md](IME_RESEARCH_CONCLUSIONS.md) — why nested-wayland IME is an ecosystem-level limitation
+
+---
+
 ## 🤝 Contributing
 
 Contributions are welcome! This is a fork of [WaylandCraft](https://github.com/EVV1E/waylandcraft.git) with AI-implemented multi-player features — expect rough edges.
