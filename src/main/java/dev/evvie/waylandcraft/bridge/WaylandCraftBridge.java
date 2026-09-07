@@ -1010,7 +1010,24 @@ public class WaylandCraftBridge {
 	public String audioCaptureStatus() {
 		return audioCaptureStatusNative(instance);
 	}
-	
+
+	/** Aggregate status report (JSON) covering native lib / egl / wayland globals /
+	 * host_bridge (dbus-ibus) / ime_ti3 / xwayland-satellite / audio / portal / ...
+	 * Called from {@link WaylandCraft#refreshStatusLogIfNeeded()} every
+	 * {@code STATUS_REFRESH_INTERVAL_MS} (30s) and written to status.log as a
+	 * single overwriting snapshot. Returns empty string on failure rather than
+	 * throwing — status.log write failures must never propagate into the game
+	 * tick loop. */
+	public String getStatusReport(String javaThread) {
+		if (!nativeAvailable || instance == 0) return "";
+		try {
+			return getStatusReportNative(instance, javaThread == null ? "" : javaThread);
+		} catch (UnsatisfiedLinkError | RuntimeException e) {
+			WaylandCraftCommon.LOGGER.warn("getStatusReport unavailable: {}", e.toString());
+			return "";
+		}
+	}
+
 	public void resizeToplevelInteractive(WLCToplevel toplevel, int width, int height) {
 		toplevelResize(toplevel.getHandle(), width, height, true);
 	}
@@ -1262,7 +1279,16 @@ public class WaylandCraftBridge {
 	
 	// Query Rust-side audio capture pipeline status (JSON string)
 	private static native String audioCaptureStatusNative(long instance);
-	
+
+	// Aggregate status report for status.log (JSON). v0.13.4 native side added
+	// `get_status_report` (exported as `getStatusReportNative`); the Java call site
+	// in WaylandCraft.refreshStatusLogIfNeeded requires this declaration. jni-rs
+	// registers the whole native_methods array atomically — missing any one entry
+	// fails the entire RegisterNatives call and every Java->Rust call surfaces as
+	// `NoSuchMethod(... getStatusReportNative ...)` (see runImeDiagnosticNative
+	// comment for the same failure mode).
+	private static native String getStatusReportNative(long instance, String javaThread);
+
 	private static native int[] outputSize(long instance);
 	private static native int[] outputBounds(long instance);
 	
