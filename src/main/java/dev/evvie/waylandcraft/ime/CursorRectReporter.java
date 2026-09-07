@@ -1,7 +1,7 @@
 package dev.evvie.waylandcraft.ime;
 
 import dev.evvie.waylandcraft.WaylandCraft;
-import dev.evvie.waylandcraft.WaylandCraftCommon;
+
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.events.GuiEventListener;
@@ -60,7 +60,7 @@ public final class CursorRectReporter {
 				// P0 诊断：值丢失瞬间记录 getFocused() 返回什么（null / 非 EditBox 组件），
 				// 定位 (0,0,0,0) 锚点漂移的触发源。只在有值→无值转换时打一次，防刷屏。
 				String focusedDesc = focused == null ? "null" : focused.getClass().getSimpleName();
-				WaylandCraftCommon.LOGGER.info("[cursor] 焦点丢失 focused={} screen={} -> 补发 (0,0,0,0)",
+				LOGGER.info("[cursor] 焦点丢失 focused={} screen={} -> 补发 (0,0,0,0)",
 					focusedDesc, mc.screen.getClass().getSimpleName());
 				WaylandCraft.instance.bridge.updateCursorRect(0, 0, 0, 0);
 			}
@@ -81,7 +81,7 @@ public final class CursorRectReporter {
 			if (text.length() > 16) {
 				text = text.substring(0, 16) + "...";
 			}
-			WaylandCraftCommon.LOGGER.info("[cursor] EditBox class={} value=\"{}\" -> ({},{},{},{}) scale={}",
+			LOGGER.info("[cursor] EditBox class={} value=\"{}\" -> ({},{},{},{}) scale={}",
 				box.getClass().getSimpleName(), text, x, y, 2 * guiScale, 9 * guiScale, guiScale);
 			lastX = x;
 			lastY = y;
