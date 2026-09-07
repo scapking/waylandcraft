@@ -86,7 +86,13 @@ public final class CursorRectReporter {
 			lastX = x;
 			lastY = y;
 			// 光标近似矩形：宽 2 高 9（字体行高）→ 物理像素；桌面候选窗只取左上锚点。
-			WaylandCraft.instance.bridge.updateCursorRect(x, y, 2 * guiScale, 9 * guiScale);
+			int w = 2 * guiScale;
+			int h = 9 * guiScale;
+			// v0.14+：优先走 ImeDispatcher.setCursorRectangle（覆盖 fcitx5 / ibus / XIM
+			// / Cocoa / IMM / Android 全部 backend）。native bridge 仍保留作为
+			// nested wayland app 的 ti3 server 路径（firefox 等），两者并存不冲突。
+			dev.evvie.waylandcraft.ime.ImeDispatcher.get().setCursorRectangle(x, y, w, h);
+			WaylandCraft.instance.bridge.updateCursorRect(x, y, w, h);
 		}
 	}
 }

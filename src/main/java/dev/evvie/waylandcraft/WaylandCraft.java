@@ -193,7 +193,12 @@ public class WaylandCraft implements ClientModInitializer {
 		WindowItemModel.register();
 		hudRenderer.register();
 		SharedWindowClientHandler.register();
-		
+
+		// v0.14+：跨平台 IME dispatcher 启动（fcitx5 / ibus / XIM / Cocoa / IMM / Android / stub）
+		// ImeBackendRegistry 启动时 probe 所有 backend，按优先级选第一个
+		// probe 成功的；全部失败用 stub 兜底（mod 仍能跑，IME 不可用）。
+		dev.evvie.waylandcraft.ime.ImeDispatcher.get().start();
+
 		// 初始化窗口共享管理器
 		windowShareManager = new WindowShareManager(this);
 		audioCaptureManager = new AudioCaptureManager(this);
