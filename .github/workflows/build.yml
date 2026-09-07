@@ -309,82 +309,24 @@ jobs:
         path: native-libs/
         if-no-files-found: error
 
+  # Single-jar release model (v1.2.16+): one universal jar that bundles every
+  # native platform + every architecture + all native-deps + xwayland-satellite
+  # + full Java bytecode + assets. Install on Linux / Android / Windows / macOS
+  # / iOS / dedicated server — the mod auto-detects the running platform and
+  # skips local capture on viewer-only hosts (Windows / macOS / iOS).
+  # Matches the EVV1E upstream's "one jar, install anywhere" model.
   build-java:
     needs: [compile-native-libs, compile-native-android]
-    strategy:
-      matrix:
-        variant:
-          - name: linux-x86_64
-            build_args: -PwlPlatform=linux-gnu -PwlArch=x86_64
-            verify_args: linux-gnu x86_64
-            jar_name: waylandcraft-linux-x86_64
-            native_pattern: libwaylandcraft-linux-gnu-x86_64
-          - name: linux-arm64
-            build_args: -PwlPlatform=linux-gnu -PwlArch=arm64
-            verify_args: linux-gnu arm64
-            jar_name: waylandcraft-linux-arm64
-            native_pattern: libwaylandcraft-linux-gnu-arm64
-          - name: android-x86_64
-            build_args: -PwlPlatform=android -PwlArch=x86_64
-            verify_args: android x86_64
-            jar_name: waylandcraft-android-x86_64
-            native_pattern: libwaylandcraft-android-x86_64
-          - name: android-arm64
-            build_args: -PwlPlatform=android -PwlArch=arm64
-            verify_args: android arm64
-            jar_name: waylandcraft-android-arm64
-            native_pattern: libwaylandcraft-android-arm64
-          # Viewer-only platforms: no native capture backend, jar bundles
-          # no native lib / satellite / deps (build.gradle skips them).
-          - name: windows-x86_64
-            build_args: -PwlPlatform=windows -PwlArch=x86_64
-            verify_args: windows x86_64
-            jar_name: waylandcraft-windows-x86_64
-            viewer: true
-          - name: windows-arm64
-            build_args: -PwlPlatform=windows -PwlArch=arm64
-            verify_args: windows arm64
-            jar_name: waylandcraft-windows-arm64
-            viewer: true
-          - name: macos-x86_64
-            build_args: -PwlPlatform=macos -PwlArch=x86_64
-            verify_args: macos x86_64
-            jar_name: waylandcraft-macos-x86_64
-            viewer: true
-          - name: macos-arm64
-            build_args: -PwlPlatform=macos -PwlArch=arm64
-            verify_args: macos arm64
-            jar_name: waylandcraft-macos-arm64
-            viewer: true
-          - name: ios-arm64
-            build_args: -PwlPlatform=ios -PwlArch=arm64
-            verify_args: ios arm64
-            jar_name: waylandcraft-ios-arm64
-            viewer: true
-          # Server: pure Java server-side logic, no native payload, arch-independent.
-          - name: server
-            build_args: -PwlServer=true
-            verify_args: server
-            jar_name: waylandcraft-server
-            viewer: true
-          # Universal: catch-all fallback bundling all native platforms.
-          - name: universal
-            build_args: -PwlUniversal=true
-            verify_args: universal
-            jar_name: waylandcraft-universal
-            native_pattern: libwaylandcraft-*
     runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v6
-    - name: Download native lib
-      if: ${{ !matrix.variant.viewer }}
+    - name: Download all native libs
       uses: actions/download-artifact@v8
       with:
         path: native-libs
-        pattern: ${{ matrix.variant.native_pattern }}
+        pattern: libwaylandcraft-*
         merge-multiple: true
-    - name: Verify native lib
-      if: ${{ !matrix.variant.viewer }}
+    - name: Verify native libs
       run: |
         ls -la native-libs/
         ls -la native-libs/deps/ || true
@@ -396,15 +338,15 @@ jobs:
         distribution: 'temurin'
     - name: Setup gradle
       uses: gradle/actions/setup-gradle@v6
-    - name: Build java code (${{ matrix.variant.name }})
-      run: ./gradlew build ${{ matrix.variant.build_args }}
+    - name: Build java code (universal)
+      run: ./gradlew build
     - name: Verify jar contents
-      run: python3 scripts/verify_jar.py ${{ matrix.variant.verify_args }}
+      run: python3 scripts/verify_jar.py universal
     - name: Upload jar artifact
       uses: actions/upload-artifact@v7
       with:
-        name: waylandcraft-jar-${{ matrix.variant.name }}
-        path: build/libs/${{ matrix.variant.jar_name }}.jar
+        name: waylandcraft-jar-universal
+        path: build/libs/waylandcraft-universal.jar
         if-no-files-found: error
 
   release:
@@ -450,19 +392,14 @@ jobs:
           echo ""
           echo "## 平台与产物 (Platforms & Assets)"
           echo ""
-          echo "Native (full capture + share + view):"
-          echo "- waylandcraft-linux-x86_64.jar / waylandcraft-linux-arm64.jar (desktop Linux)"
-          echo "- waylandcraft-android-x86_64.jar / waylandcraft-android-arm64.jar (Android launchers like OnyxLauncher)"
+          echo "**Single universal jar** — install on every supported platform. The"
+          echo "mod auto-detects the host OS at startup:"
           echo ""
-          echo "Viewer-only (view shared windows, no local capture):"
-          echo "- waylandcraft-windows-x86_64.jar / waylandcraft-windows-arm64.jar"
-          echo "- waylandcraft-macos-x86_64.jar / waylandcraft-macos-arm64.jar"
-          echo "- waylandcraft-ios-arm64.jar (PojavLauncher/Amethyst)"
+          echo "- **Linux x86_64 / arm64** — full capture + share + view (Portal ScreenCast / PipeWire / xwayland-satellite)"
+          echo "- **Android x86_64 / arm64** — full capture + share + view (OnyxLauncher, etc.)"
+          echo "- **Windows / macOS / iOS** — viewer-only (receives shared windows, no local capture; native platform auto-detect skips libwaylandcraft.so)"
+          echo "- **Dedicated server** — pure Java server-side logic (give / permission / share)"
           echo ""
-          echo "Server (pure Java, install on the dedicated server):"
-          echo "- waylandcraft-server.jar"
-          echo ""
-          echo "Universal (catch-all, bundles every native platform):"
           echo "- waylandcraft-universal.jar"
           echo ""
           echo "源码包 (Source code): zip / tar.gz 由 GitHub 自动附加。"
