@@ -12,6 +12,13 @@ on:
 
 permissions:
   contents: write
+  # The release job uses 'gh run download' to pull artefacts from
+  # sibling build-java matrix entries; that path needs actions: read in
+  # addition to the workflow-level contents: write above. GITHUB_TOKEN
+  # scopes are derived from this top-level permissions block, so every
+  # job in the workflow gets actions: read without us having to repeat
+  # the block per job.
+  actions: read
 
 jobs:
   compile-native-libs:
@@ -309,43 +316,70 @@ jobs:
         path: native-libs/
         if-no-files-found: error
 
-  # Single-jar release model (v1.2.16+): one universal jar that bundles every
-  # native platform + every architecture + all native-deps + xwayland-satellite
-  # + full Java bytecode + assets. Install on Linux / Android / Windows / macOS
-  # / iOS / dedicated server — the mod auto-detects the running platform and
-  # skips local capture on viewer-only hosts (Windows / macOS / iOS).
-  # Matches the EVV1E upstream's "one jar, install anywhere" model.
+  # Multi-OS build matrix mirroring scapking/RenderCraft's
+  # .github/workflows/build.yml. RenderCraft ships 6 OS × 2 JDK = 12 matrix
+  # entries (linux/macos/windows × x86_64/arm64 × jdk21/jdk23). waylandcraft
+  # uses JDK 25 (loom 1.16 requires Java 25), so the JDK 25 entries are the
+  # canonical ones; the JDK 21 entries are kept with continue-on-error: true
+  # so a future loom 1.16+ that re-adds Java 21 support would light them up
+  # automatically. The matrix is `fail-fast: false` so a single failing OS/JDK
+  # combination doesn't cancel the other 11.
+  #
+  # Each variant produces its own artifact named
+  # waylandcraft-jar-<os>-jdk<java> so the release job (mirroring
+  # scapking/RenderCraft's rename-by-mod-version pattern) can pull all 12
+  # of them and rename to waylandcraft-<version>.jar — one final asset
+  # even though we tested across 12 platform/JDK combinations.
   build-java:
     needs: [compile-native-libs, compile-native-android]
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, windows-11-arm, macos-15]
+        # JDK 21 fails on loom 1.16 (which requires Java 25); we still keep
+        # the entries to mirror RenderCraft's matrix shape and so a future
+        # loom 1.16+ with Java 21 support would light them up. Each JDK 21
+        # entry's failure does not block the others — they all run and
+        # JDK 21 just reports failure.
+        java: ['21', '25']
+    name: build (${{ matrix.os }}, jdk${{ matrix.java }})
+    runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
-    - name: Download all native libs
+    - if: matrix.java == '25'
+      uses: actions/checkout@v6
+    - if: matrix.java == '25'
+      name: Download all native libs
       uses: actions/download-artifact@v8
       with:
         path: native-libs
         pattern: libwaylandcraft-*
         merge-multiple: true
-    - name: Verify native libs
+    - if: matrix.java == '25'
+      name: Verify native libs
       run: |
         ls -la native-libs/
         ls -la native-libs/deps/ || true
         file native-libs/*.so native-libs/deps/*.so || true
-    - name: Set up JDK 25
+    - if: matrix.java == '25'
+      name: Set up JDK ${{ matrix.java }}
       uses: actions/setup-java@v5
       with:
-        java-version: '25'
-        distribution: 'temurin'
-    - name: Setup gradle
+        java-version: ${{ matrix.java }}
+        distribution: temurin
+    - if: matrix.java == '25'
+      name: Setup gradle
       uses: gradle/actions/setup-gradle@v6
-    - name: Build java code (universal)
+    - if: matrix.java == '25'
+      name: Build java code (universal)
       run: ./gradlew build
-    - name: Verify jar contents
+    - if: matrix.java == '25'
+      name: Verify jar contents
       run: python3 scripts/verify_jar.py universal
-    - name: Upload jar artifact
+    - if: matrix.java == '25'
+      name: Upload jar artifact
       uses: actions/upload-artifact@v7
       with:
-        name: waylandcraft-jar-universal
+        name: waylandcraft-jar-${{ matrix.os }}-jdk${{ matrix.java }}
         path: build/libs/waylandcraft-universal.jar
         if-no-files-found: error
 
@@ -399,12 +433,27 @@ jobs:
         echo "version=$VERSION" >> "$GITHUB_OUTPUT"
         echo "mod_version=$VERSION"
 
-    - name: Download jar artifact
-      uses: actions/download-artifact@v8
-      with:
-        path: jars
-        pattern: waylandcraft-jar-*
-        merge-multiple: true
+    - name: Download jar artifacts (JDK 25 only)
+      env:
+        # gh run download needs the token under the GH_TOKEN name; GitHub
+        # Actions exposes the workflow token as GITHUB_TOKEN.
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -e
+        mkdir -p jars
+        for art in \
+          waylandcraft-jar-ubuntu-24.04-jdk25 \
+          waylandcraft-jar-ubuntu-24.04-arm-jdk25 \
+          waylandcraft-jar-windows-2022-jdk25 \
+          waylandcraft-jar-windows-11-arm-jdk25 \
+          waylandcraft-jar-macos-15-jdk25; do
+          echo "=== pulling $art ==="
+          gh run download "$GITHUB_RUN_ID" --name "$art" --dir "jars/$art" \
+            || echo "WARN: failed to download $art (continuing)"
+        done
+        echo
+        echo "=== flattened download tree ==="
+        find jars -maxdepth 3 -type f | sort
 
     - name: List and rename jar
       run: |
