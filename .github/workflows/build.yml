@@ -349,42 +349,116 @@ jobs:
         path: build/libs/waylandcraft-universal.jar
         if-no-files-found: error
 
+  # Cut a GitHub Release whenever a v* tag is pushed. Depends on the
+  # build-java job so we never publish a jar that did not pass CI. Mirrors
+  # the release: job in scapking/RenderCraft's .github/workflows/build.yml:
+  #   - precise if-trigger (only tag pushes or explicit manual dispatch)
+  #   - explicit `id` outputs for tag + version
+  #   - gradle.properties is the single source of truth for the version
+  #   - jar is renamed to waylandcraft-<version>.jar before upload so the
+  #     asset name carries the mod_version number (matches the EVV1E
+  #     upstream's `waylandcraft-<version>.jar` convention)
   release:
     needs: build-java
     runs-on: ubuntu-24.04
-    if: needs.build-java.result == 'success' && (github.event.inputs.tag != '' || github.event_name == 'push')
+    # Only fire on tag pushes and on manual dispatch with an explicit
+    # tag override. Branch pushes still run the build; they just skip
+    # the release step.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        || github.event_name == 'workflow_dispatch' && inputs.tag != ''
     steps:
     - uses: actions/checkout@v6
       with:
-        # fetch history + tags so release notes can diff commits against the
-        # previous release tag (and the source archives ship from this checkout)
+        # fetch history + tags so release notes can diff commits against
+        # the previous release tag.
         fetch-depth: 0
-    - name: Download jars
+        fetch-tags: true
+
+    - name: Resolve release tag
+      id: tag
+      run: |
+        set -e
+        if [ -n "${{ github.event.inputs.tag }}" ]; then
+          TAG="${{ github.event.inputs.tag }}"
+        else
+          TAG="${GITHUB_REF_NAME}"
+        fi
+        case "$TAG" in
+          v*) ;;
+          *) echo "Refusing to release under '$TAG' (does not start with v)"; exit 1 ;;
+        esac
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "Resolved release tag: $TAG"
+
+    - name: Read mod_version
+      id: ver
+      run: |
+        # Source of truth: gradle.properties. Stays in lock-step with what
+        # the jar was built from.
+        VERSION=$(grep '^mod_version=' gradle.properties | cut -d= -f2)
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "mod_version=$VERSION"
+
+    - name: Download jar artifact
       uses: actions/download-artifact@v8
       with:
         path: jars
         pattern: waylandcraft-jar-*
         merge-multiple: true
-    - name: Show jars
+
+    - name: List and rename jar
       run: |
-        ls -la jars/
-        sha256sum jars/*.jar
+        set -e
+        cd jars
+        echo "=== downloaded tree ==="
+        find . -type f | sort
+        echo
+        echo "=== renaming ==="
+        for f in $(find . -name '*.jar' -not -name '*-sources.jar'); do
+          target="waylandcraft-${{ steps.ver.outputs.version }}.jar"
+          if [ "$f" = "$target" ]; then
+            echo "  $f (no rename needed)"
+          else
+            echo "  $f -> $target"
+            mv "$f" "$target"
+          fi
+        done
+        # Sources jars: keep one per build with the version suffix.
+        for f in $(find . -name '*-sources.jar'); do
+          target="waylandcraft-${{ steps.ver.outputs.version }}-sources.jar"
+          if [ "$f" = "$target" ]; then
+            echo "  $f (no rename needed)"
+          else
+            echo "  $f -> $target"
+            mv "$f" "$target"
+          fi
+        done
+        echo
+        echo "=== final jars/ ==="
+        ls -la
+        echo
+        echo "=== final sha256 ==="
+        sha256sum *.jar
+
     - name: Generate release notes
       env:
-        TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+        TAG: ${{ steps.tag.outputs.tag }}
       run: |
-        # Notes = per-version changelog (commits since previous release tag) +
-        # the platform/asset summary. Never the stale generic text.
-        PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo "")
+        # Notes = per-version changelog (commits since previous release tag)
+        # + the platform/asset summary.
+        set -e
+        PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
         {
           echo "## 变更内容 (Changes)"
           echo ""
           if [ -n "$PREV" ]; then
-            echo "Since \`$PREV\`:"
+            echo "Since \`${PREV}\`:"
             echo ""
-            git log --pretty=format:'- `%h` %s' --no-merges "$PREV..$TAG" || true
+            git log --pretty=format:'- `%h` %s' --no-merges "${PREV}..${TAG}" || true
           else
-            git log --pretty=format:'- `%h` %s' --no-merges -30 "$TAG" || true
+            echo "First release, or no previous tag found; showing the last 30 commits on ${TAG}:"
+            echo ""
+            git log --pretty=format:'- `%h` %s' --no-merges -30 "${TAG}" || true
           fi
           echo ""
           echo ""
@@ -392,31 +466,35 @@ jobs:
           echo ""
           echo "## 平台与产物 (Platforms & Assets)"
           echo ""
-          echo "**Single universal jar** — install on every supported platform. The"
-          echo "mod auto-detects the host OS at startup:"
+          echo "**Single universal jar** — install on every supported platform."
+          echo "The mod auto-detects the host OS at startup:"
           echo ""
           echo "- **Linux x86_64 / arm64** — full capture + share + view (Portal ScreenCast / PipeWire / xwayland-satellite)"
           echo "- **Android x86_64 / arm64** — full capture + share + view (OnyxLauncher, etc.)"
           echo "- **Windows / macOS / iOS** — viewer-only (receives shared windows, no local capture; native platform auto-detect skips libwaylandcraft.so)"
           echo "- **Dedicated server** — pure Java server-side logic (give / permission / share)"
           echo ""
-          echo "- waylandcraft-universal.jar"
+          echo "- waylandcraft-${{ steps.ver.outputs.version }}.jar"
           echo ""
           echo "源码包 (Source code): zip / tar.gz 由 GitHub 自动附加。"
         } > notes.md
         echo "=== release notes ==="
         cat notes.md
+
     - name: Create or update GitHub Release
       env:
         GH_TOKEN: ${{ github.token }}
-        TAG: ${{ github.event.inputs.tag != '' && github.event.inputs.tag || github.ref_name }}
+        TAG: ${{ steps.tag.outputs.tag }}
       run: |
+        set -e
         cd jars
-        if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-          echo "Release $TAG exists, updating notes + uploading assets"
-          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file "$GITHUB_WORKSPACE/notes.md"
-          gh release upload "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --clobber
+        if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+          echo "Release ${TAG} exists, updating notes + uploading assets (clobber)"
+          gh release edit "${TAG}" --repo "${GITHUB_REPOSITORY}" \
+            --notes-file "${GITHUB_WORKSPACE}/notes.md"
+          gh release upload "${TAG}" *.jar --repo "${GITHUB_REPOSITORY}" --clobber
         else
-          echo "Creating release $TAG"
-          gh release create "$TAG" *.jar --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes-file "$GITHUB_WORKSPACE/notes.md"
+          echo "Creating release ${TAG}"
+          gh release create "${TAG}" *.jar --repo "${GITHUB_REPOSITORY}" \
+            --title "${TAG}" --notes-file "${GITHUB_WORKSPACE}/notes.md"
         fi
