@@ -403,7 +403,8 @@ jobs:
         && startsWith(github.ref, 'refs/tags/v')
         || github.event_name == 'workflow_dispatch'
            && inputs.tag != '')
-      && needs.build-java.result != 'cancelled'
+      && (needs.build-java.result == 'success'
+          || needs.build-java.result == 'failure')
     # The build-java matrix runs 10 entries (5 OS × 2 JDK). The JDK 21
     # entries skip every step (loom 1.16 requires Java 25) and report
     # success, while the 5 JDK 25 entries do the real build. If any JDK 25
