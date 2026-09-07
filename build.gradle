@@ -117,12 +117,14 @@ jar {
 		"linux-gnu-arm64",
 	]
 
-	// Host-arch native lib, if a local `cargo build --release` produced one.
-	// Identical content as the matching native-libs/ entry below; EXCLUDE above
-	// drops the duplicate.
-	def hostNative = file("native/target/release/libwaylandcraft.so")
+	// Host-arch native lib, if a local `cargo build` produced one. Identical
+	// content as the matching native-libs/ entry below; EXCLUDE above drops
+	// the duplicate. Prefer the debug build (matches the CI build mode set
+	// by .github/workflows/build.yml since v1.2.17; the release build's
+	// stripped symbols make stack traces unreadable in user crash reports).
+	def hostNative = file("native/target/debug/libwaylandcraft.so")
 	if (!hostNative.exists()) {
-		hostNative = file("native/target/debug/libwaylandcraft.so")
+		hostNative = file("native/target/release/libwaylandcraft.so")
 	}
 	if (hostNative.exists()) {
 		def hostArch = System.getProperty("os.arch").toLowerCase()
