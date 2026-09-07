@@ -46,15 +46,15 @@ jobs:
           libxcb-composite0-dev
     - name: Setup rust toolchain
       uses: dtolnay/rust-toolchain@stable
-    - name: Compile native library (debug)
+    - name: Compile native library (release)
       working-directory: native/
       env:
         WAYLANDCRAFT_GIT_HASH: ${{ github.sha }}
-      run: cargo build --target=${{ matrix.platform.target }}
+      run: cargo build --release --target=${{ matrix.platform.target }}
     - name: Move native library
       run: |
         mkdir native-libs
-        mv native/target/${{ matrix.platform.target }}/debug/libwaylandcraft.so \
+        mv native/target/${{ matrix.platform.target }}/release/libwaylandcraft.so \
           native-libs/libwaylandcraft-${{ matrix.platform.name }}.so
     - name: Collect runtime shared library dependencies
       # Copy the non-glibc .so dependencies (libxkbcommon/libpipewire/...) next to
@@ -259,7 +259,7 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
       with:
         targets: ${{ matrix.target.rust_target }}
-    - name: Compile native library (android debug)
+    - name: Compile native library (android release)
       working-directory: native/
       env:
         PKG_CONFIG_ALLOW_CROSS: "1"
@@ -275,11 +275,11 @@ jobs:
         CARGO_TARGET_${{ matrix.target.env_upper }}_CC: ${{ env.NDK }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target.linker }}
         CARGO_TARGET_${{ matrix.target.env_upper }}_LINKER: ${{ env.NDK }}/toolchains/llvm/prebuilt/linux-x86_64/bin/${{ matrix.target.linker }}
         CARGO_TARGET_${{ matrix.target.env_upper }}_AR: ${{ env.NDK }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar
-      run: cargo build --target=${{ matrix.target.rust_target }}
+      run: cargo build --release --target=${{ matrix.target.rust_target }}
     - name: Move native library + bundled deps
       run: |
         mkdir -p native-libs/deps
-        cp native/target/${{ matrix.target.rust_target }}/debug/libwaylandcraft.so \
+        cp native/target/${{ matrix.target.rust_target }}/release/libwaylandcraft.so \
           native-libs/libwaylandcraft-android-${{ matrix.target.name }}.so
         # Android cross-builds may not produce versioned symlinks (libxkbcommon.so
         # instead of libxkbcommon.so.0); copy whatever exists and create the .so.0
