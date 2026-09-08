@@ -444,9 +444,9 @@ pub fn get_audio_capture_status() -> String {
 
     format!(
         concat!(
-            r#"{"active":{},"stage":"{}","mode":"monitor","pid":{},"sink_node":{},"#,
-            r#""sink_name":"{}","stream_node":{},"linked":{},"capture_events":{},"#,
-            r#""total_bytes":{},"sample_rate":{},"channels":{},"last_error":{}}}"#
+            "{\"active\":{},\"stage\":\"{}\",\"mode\":\"monitor\",\"pid\":{},\"sink_node\":{},",
+            "\"sink_name\":\"{}\",\"stream_node\":{},\"linked\":{},\"capture_events\":{},",
+            "\"total_bytes\":{},\"sample_rate\":{},\"channels\":{},\"last_error\":{}}}"
         ),
         s.active,
         stage,
