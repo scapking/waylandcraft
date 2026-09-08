@@ -3,6 +3,9 @@ package dev.evvie.waylandcraft.shared;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,6 +26,9 @@ import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
  * 2. tick()：周期 poll native 累积的 PCM，分包成 SharedWindowAudioPayload 发送。
  * 3. stop()：停止 native 捕获。
  * 
+ * 缓冲策略：客户端预缓冲 4-8s + 服务端缓冲 4-8s，解决卡顿问题
+ * （参考 Discord Go Live 架构）。
+ * 
  * 匹配不到 PID（原生 Wayland 窗口）时不启动捕获 —— 无声但共享画面不受影响。
  */
 public class AudioCaptureManager {
@@ -32,10 +38,28 @@ public class AudioCaptureManager {
 	/** 单包 PCM 上限（30KB，远低于协议包上限，避免大包卡服务器） */
 	private static final int MAX_PACKET_BYTES = 30_000;
 	
+	/** 缓冲目标：6 秒（范围 4-8 秒） */
+	private static final int TARGET_BUFFER_MS = 6000;
+	private static final int MIN_BUFFER_MS = 4000;
+	private static final int MAX_BUFFER_MS = 8000;
+	
 	/** poll 间隔：每 100ms 拉一次 PCM 并发送 */
 	private static final long POLL_INTERVAL_MS = 100;
 	
 	private final WaylandCraft clientMod;
+	
+	/** 缓冲管理器 */
+	private final AudioBufferManager bufferManager = new AudioBufferManager();
+	
+	/** Opus 编码器 */
+	private OpusEncoderWrapper opusEncoder;
+	
+	/** 编码调度器 */
+	private final ScheduledExecutorService encodeExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+		Thread t = new Thread(r, "AudioEncode");
+		t.setDaemon(true);
+		return t;
+	});
 	
 	/** handle -> 发送序号 */
 	private long lastPollTime = 0;
@@ -44,7 +68,7 @@ public class AudioCaptureManager {
 	private boolean firstAudioLogged = false;
 	private long totalAudioBytes = 0;
 	private long nextAudioLogBytes = 1_000_000;
-
+	
 	// 全链路状态追踪（供 /wl audio status 查询）
 	private volatile int resolvedPid = -1;        // 来源：窗口 → PID
 	private volatile String sourceStage = "idle"; // 来源解析方式（wayland / x11 / none）
@@ -87,6 +111,10 @@ public class AudioCaptureManager {
 			return false;
 		}
 		
+		// 初始化 Opus 编码器
+		opusEncoder = new OpusEncoderWrapper();
+		opusEncoder.configure(48000, 2, 64000); // 48kHz 立体声 64kbps
+		
 		started = true;
 		startedAt = System.currentTimeMillis();
 		seqCounter = 0;
@@ -96,12 +124,33 @@ public class AudioCaptureManager {
 		sentPackets = 0;
 		nextAudioLogBytes = 1_000_000;
 		lastError = null;
+		
+		// 启动编码循环
+		startEncodeLoop();
+		
 		LOGGER.info("Audio capture started for window '{}' (pid={}, source={})", title, pid, sourceStage);
 		return true;
 	}
 	
+	private void startEncodeLoop() {
+		encodeExecutor.scheduleAtFixedRate(() -> {
+			if (!started) return;
+			
+			AudioBufferManager.AudioFrame frame = bufferManager.pollFrame();
+			if (frame == null) return;
+			
+			byte[] encoded = opusEncoder.encodeFrame(frame.data());
+			if (encoded.length > 0) {
+				AudioBufferManager.EncodedAudioPacket packet = new AudioBufferManager.EncodedAudioPacket(
+					encoded, frame.timestampMs(), seqCounter++
+				);
+				bufferManager.enqueuePacket(packet);
+			}
+		}, 0, 20, TimeUnit.MILLISECONDS); // 20ms = 50fps
+	}
+	
 	/**
-	 * 每帧调用（由 WindowShareManager.update 驱动）：周期 poll PCM 并发送。
+	 * 每帧调用（由 WindowShareManager.update 驱动）：周期 poll PCM 并发送编码包。
 	 */
 	public void tick() {
 		if(!started || clientMod == null || clientMod.bridge == null) return;
@@ -138,14 +187,15 @@ public class AudioCaptureManager {
 			nextAudioLogBytes += 1_000_000;
 		}
 		
-		// 分包发送
-		for(int offset = 0; offset < pcm.length; offset += MAX_PACKET_BYTES) {
-			int len = Math.min(MAX_PACKET_BYTES, pcm.length - offset);
-			byte[] chunk = new byte[len];
-			System.arraycopy(pcm, offset, chunk, 0, len);
-			
+		// 将 PCM 放入缓冲管理器（编码循环会异步处理）
+		bufferManager.enqueueFrame(pcm, System.currentTimeMillis(), sampleRate, channels);
+		
+		// 发送编码后的音频包
+		AudioBufferManager.EncodedAudioPacket packet;
+		while ((packet = bufferManager.pollPacket()) != null) {
 			SharedWindowAudioPayload payload = new SharedWindowAudioPayload(
-				windowHandle(), seqCounter++, sampleRate, channels, chunk);
+				windowHandle(), packet.sequence(), 48000, 2, packet.data()
+			);
 			ClientPlayNetworking.send(payload);
 			sentPackets++;
 		}
@@ -157,6 +207,24 @@ public class AudioCaptureManager {
 	public void stop() {
 		if(!started) return;
 		started = false;
+		
+		// 关闭编码器
+		if (opusEncoder != null) {
+			opusEncoder.shutdown();
+			opusEncoder = null;
+		}
+		
+		// 关闭编码调度器
+		encodeExecutor.shutdown();
+		try {
+			if (!encodeExecutor.awaitTermination(2, TimeUnit.SECONDS)) {
+				encodeExecutor.shutdownNow();
+			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			encodeExecutor.shutdownNow();
+		}
+		
 		if(clientMod != null && clientMod.bridge != null) {
 			try {
 				clientMod.bridge.audioCaptureStop();
@@ -164,6 +232,7 @@ public class AudioCaptureManager {
 				LOGGER.warn("Audio capture stop failed", t);
 			}
 		}
+		bufferManager.reset();
 		LOGGER.info("Audio capture stopped (total {} bytes, {} packets)", totalAudioBytes, sentPackets);
 	}
 	
@@ -173,7 +242,7 @@ public class AudioCaptureManager {
 	
 	/**
 	 * 发送端全链路状态（供 /wl audio status 展示）。
-	 * 覆盖：来源(PID) → 捕获(是否已启动 native) → 接口(已发字节/包数) + native 侧状态。
+	 * 覆盖：来源(PID) → 捕获(是否已启动 native) → 缓冲/编码状态 + native 侧状态。
 	 */
 	public String getStatusSummary() {
 		StringBuilder sb = new StringBuilder();
@@ -189,6 +258,16 @@ public class AudioCaptureManager {
 		}
 		if(lastError != null) {
 			sb.append("  last error: ").append(lastError).append("\n");
+		}
+		// 缓冲状态
+		AudioBufferManager.BufferState bufState = bufferManager.getState();
+		sb.append("  buffer: ").append(bufState.bufferedMs).append("ms queued, ")
+		  .append(bufState.queuedFrames).append(" frames, underrun=").append(bufState.underrun)
+		  .append(", overrun=").append(bufState.overrun).append("\n");
+		// 编码状态
+		if (opusEncoder != null) {
+			sb.append("  encoder: Opus ").append(opusEncoder.getSampleRate()).append("Hz ")
+			  .append(opusEncoder.getChannels()).append("ch ").append(opusEncoder.getBitrate()).append("bps\n");
 		}
 		// native 侧链路状态（JSON）
 		if(clientMod != null && clientMod.bridge != null) {

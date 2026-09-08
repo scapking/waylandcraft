@@ -15,7 +15,7 @@ import net.minecraft.client.Minecraft;
 /**
  * 共享窗口音频播放管理器（接收端）。
  * 
- * 收到 SharedWindowAudioPayload 后，把 PCM 交给 OpenAL（Minecraft 自带的 lwjgl
+ * 收到 SharedWindowAudioPayload 后，解码 Opus 并把 PCM 交给 OpenAL（Minecraft 自带的 lwjgl
  * OpenAL，复用其 device/context）流式播放：每窗口一个 source，持续 queue buffer。
  * 
  * 线程：OpenAL context 在 Minecraft 主线程创建，AL10 调用必须在主线程 ——
@@ -37,6 +37,9 @@ public class AudioPlaybackManager {
 	/** windowHandle -> 播放流 */
 	private final Map<Long, StreamHandle> streams = new ConcurrentHashMap<>();
 	
+	/** Opus 解码器（共享实例） */
+	private OpusDecoderWrapper opusDecoder;
+	
 	private boolean alAvailable = true;
 	private boolean firstAudioLogged = false;
 	private long totalAudioBytes = 0;
@@ -45,17 +48,18 @@ public class AudioPlaybackManager {
 	
 	/**
 	 * 网络线程调用：入队到主线程播放。
+	 * 支持 Opus 编码数据（sampleRate/channels 从 Opus 数据包头部读取，或使用默认 48000/2）。
 	 */
-	public void enqueue(long windowHandle, int sampleRate, int channels, byte[] pcm) {
+	public void enqueue(long windowHandle, int seq, int sampleRate, int channels, byte[] data) {
 		if(!alAvailable) return;
 		receivedPackets++;
 		
 		if(!firstAudioLogged) {
-			LOGGER.info("Audio playback: first packet received ({} bytes, {} Hz, {} ch, window {})",
-				pcm.length, sampleRate, channels, Long.toHexString(windowHandle));
+			LOGGER.info("Audio playback: first packet received (seq={}, {} bytes, {} Hz, {} ch, window {})",
+				seq, data.length, sampleRate, channels, Long.toHexString(windowHandle));
 			firstAudioLogged = true;
 		}
-		totalAudioBytes += pcm.length;
+		totalAudioBytes += data.length;
 		if(totalAudioBytes >= nextAudioLogBytes) {
 			LOGGER.info("Audio playback: {} bytes received so far", totalAudioBytes);
 			nextAudioLogBytes += 1_000_000;
@@ -64,23 +68,48 @@ public class AudioPlaybackManager {
 		Minecraft mc = Minecraft.getInstance();
 		if(mc == null) return;
 		
-		byte[] data = pcm; // 拷贝一份，避免 netty 缓冲复用
-		mc.execute(() -> playOnMain(windowHandle, sampleRate, channels, data));
+		byte[] pcmData = data; // Opus 解码在主线程
+		mc.execute(() -> playOnMain(windowHandle, sampleRate, channels, pcmData, seq));
 	}
 	
 	/**
-	 * 主线程调用：OpenAL 流式播放。
+	 * 初始化 Opus 解码器（在主线程调用）。
 	 */
-	private void playOnMain(long windowHandle, int sampleRate, int channels, byte[] pcm) {
+	public void initializeDecoder() {
+		if (opusDecoder == null) {
+			opusDecoder = new OpusDecoderWrapper();
+			opusDecoder.configure(48000, 2); // 默认 48kHz 立体声
+		}
+	}
+	
+	/**
+	 * 主线程调用：解码 Opus 并 OpenAL 流式播放。
+	 */
+	private void playOnMain(long windowHandle, int sampleRate, int channels, byte[] opusData, int seq) {
 		if(!alAvailable) return;
 		
 		try {
-			StreamHandle stream = streams.computeIfAbsent(windowHandle, h -> new StreamHandle(sampleRate, channels));
+			// 惰性初始化解码器
+			if (opusDecoder == null) {
+				initializeDecoder();
+			}
 			
-			// 采样率/声道变化（几乎不会）：重建
-			if(stream.sampleRate != sampleRate || stream.channels != channels) {
+			// 解码 Opus -> PCM
+			byte[] pcmData = opusDecoder.decodeFrame(opusData);
+			if (pcmData == null || pcmData.length == 0) {
+				return;
+			}
+			
+			// 实际采样率/声道可能从 Opus 包获取，这里用默认
+			int actualSampleRate = sampleRate > 0 ? sampleRate : 48000;
+			int actualChannels = channels > 0 ? channels : 2;
+			
+			StreamHandle stream = streams.computeIfAbsent(windowHandle, h -> new StreamHandle(actualSampleRate, actualChannels));
+			
+			// 采样率/声道变化：重建
+			if(stream.sampleRate != actualSampleRate || stream.channels != actualChannels) {
 				close(windowHandle);
-				stream = streams.computeIfAbsent(windowHandle, h -> new StreamHandle(sampleRate, channels));
+				stream = streams.computeIfAbsent(windowHandle, h -> new StreamHandle(actualSampleRate, actualChannels));
 			}
 			
 			// 清理已播完的 buffer
@@ -99,11 +128,11 @@ public class AudioPlaybackManager {
 				return;
 			}
 			
-			int format = channels >= 2 ? AL_FORMAT_STEREO16 : AL_FORMAT_MONO16;
+			int format = actualChannels >= 2 ? AL_FORMAT_STEREO16 : AL_FORMAT_MONO16;
 			int buffer = AL10.alGenBuffers();
-			ByteBuffer bb = ByteBuffer.allocateDirect(pcm.length).put(pcm);
+			ByteBuffer bb = ByteBuffer.allocateDirect(pcmData.length).put(pcmData);
 			bb.flip();
-			AL10.alBufferData(buffer, format, bb, sampleRate);
+			AL10.alBufferData(buffer, format, bb, actualSampleRate);
 			IntBuffer one = BufferUtils.createIntBuffer(1).put(buffer);
 			one.flip();
 			AL10.alSourceQueueBuffers(stream.source, one);

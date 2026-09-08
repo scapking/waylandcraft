@@ -344,19 +344,92 @@ public final class Fcitx5DbusBackend implements ImeBackend {
 
         // ---- ImeSession impl ----
 
+        /**
+         * commit(text) — 调 IC.ProcessKeyEvent 让 fcitx5 自己 commit。
+         *
+         * <p>fcitx5 dbus 接口签名（dbusfrontend.cpp:487）:
+         * <pre>{@code
+         *   ProcessKeyEvent(u:keysym, u:keycode, u:state, b:isRelease)
+         * }</pre>
+         *
+         * <p>我们逐字符把 Unicode 码点当 keysym 发 — fcitx5 内部 key
+         * handler 会触发对应 IME add-on（fcitx5-pinyin / rime 等），
+         * IME 处理后通过 CommitString signal 发回。我们监听 CommitString
+         * signal（见 {@link Fcitx5Session#dispatchSignal}）拿到结果。
+         *
+         * <p>state=0 表示按下，isRelease=false。
+         * X11 keysym = Unicode codepoint (XK_xxx 与 Unicode 0x0100+
+         * 一一对应) — 这是 fcitx5 默认接收 keysym 的方式。
+         */
         @Override
         public void commit(String text) {
-            // 调 IC.ProcessKeyEvent 让 fcitx5 处理 + commit
-            // 实际更简单：直接 forwardKeyEvent(keysym) — fcitx5 内部会 commit
-            // 但 fcitx5 一般不允许 client 端直接 commit — 这条路径标 TODO
-            LOGGER.debug("[ime] commit() requested (text={}); fcitx5 IC commit TODO", text);
+            if (text == null || text.isEmpty()) return;
+            try {
+                // 先 Reset 清 preedit
+                dbusCall(icPath, icIface + ".Reset", "").waitFor();
+                // 逐字符发送 ProcessKeyEvent
+                for (int i = 0; i < text.length(); ) {
+                    int cp = text.codePointAt(i);
+                    // keycode 0 — fcitx5 接受 keysym-only 触发
+                    dbusCall(icPath, icIface + ".ProcessKeyEvent",
+                            "uint32:" + cp, "uint32:0", "uint32:0", "boolean:false")
+                            .waitFor();
+                    i += Character.charCount(cp);
+                }
+            } catch (Exception e) {
+                LOGGER.debug("[ime] commit error: {}", e.toString());
+            }
         }
 
+        /**
+         * deleteSurrounding(before, after) — 调 IC.DeleteSurroundingText。
+         *
+         * <p>fcitx5 dbus 接口签名（dbusfrontend.cpp:509）:
+         * <pre>{@code
+         *   DeleteSurroundingText(i:offset, u:length)
+         * }</pre>
+         *
+         * <p>{@code offset} 是相对当前光标的字符数：负数删除光标前，
+         * 正数删除光标后。{@code length} 是删除的字符数。
+         * 我们把 ImeSession.Listener 的 (before, after) 合并成一个
+         * 删除范围 — before=1, after=0 等价于 delete-1。
+         */
         @Override
         public void deleteSurrounding(int before, int after) {
-            // fcitx5 dbus 接口没有直接的 deleteSurrounding — 通过 ForwardKey
-            // 模拟 Backspace / Delete 键
-            LOGGER.debug("[ime] deleteSurrounding({}/{}) — TODO via ForwardKey", before, after);
+            if (before == 0 && after == 0) return;
+            // fcitx5 DeleteSurroundingText 是单次删除 — 分两次调
+            try {
+                if (before > 0) {
+                    // 删光标前 before 个字符 → offset = -before, length = before
+                    dbusCall(icPath, icIface + ".DeleteSurroundingText",
+                            "int32:" + (-before), "uint32:" + before).waitFor();
+                }
+                if (after > 0) {
+                    // 删光标后 after 个字符 → offset = 0, length = after
+                    dbusCall(icPath, icIface + ".DeleteSurroundingText",
+                            "int32:0", "uint32:" + after).waitFor();
+                }
+            } catch (Exception e) {
+                LOGGER.debug("[ime] deleteSurrounding error: {}", e.toString());
+            }
+        }
+
+        /**
+         * dbus-send 调用 helper（fire-and-forget，不读 reply）。
+         * fcitx5 ProcessKeyEvent / DeleteSurroundingText 是 void 返回，
+         * 不需要 wait reply。
+         */
+        private Process dbusCall(String path, String method, String... args)
+                throws java.io.IOException {
+            java.util.List<String> cmd = new java.util.ArrayList<>();
+            cmd.add("dbus-send");
+            cmd.add("--session");
+            cmd.add("--print-reply");  // fcitx5 仍返回 reply，no-op
+            cmd.add("--dest=" + dest);
+            cmd.add(path);
+            cmd.add(method);
+            for (String a : args) cmd.add(a);
+            return new ProcessBuilder(cmd).start();
         }
 
         @Override

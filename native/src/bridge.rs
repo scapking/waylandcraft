@@ -404,6 +404,11 @@ bind_java_type! {
             name = "audioCaptureStatusNative",
             fn = audio_capture_status,
         },
+        static extern fn audio_buffer_status {
+            sig = (instance: jlong) -> JString,
+            name = "audioBufferStatusNative",
+            fn = audio_buffer_status,
+        },
         static extern fn output_size {
             sig = (instance: jlong) -> jint[],
             fn = output_size,
@@ -1923,6 +1928,18 @@ fn audio_capture_status<'local>(
     _instance: jlong,
 ) -> Result<JString<'local>, BridgeError> {
     let status = crate::audio_capture::get_audio_capture_status();
+    let status: String = status.into();
+    env.new_string(status)
+        .map_err(|e| BridgeError::JniError(e))
+}
+
+/// audioBufferStatus() —— 返回音频缓冲状态（JSON），供 Java /wl audio buffer 查询。
+fn audio_buffer_status<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let status = crate::audio_capture::get_audio_buffer_status();
     let status: String = status.into();
     env.new_string(status)
         .map_err(|e| BridgeError::JniError(e))

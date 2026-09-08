@@ -444,7 +444,7 @@ pub fn get_audio_capture_status() -> String {
 
     format!(
         concat!(
-            r#"{{"active":{},"stage":"{}","mode":"monitor","pid":{},"sink_node":{},"#,
+            r#"{"active":{},"stage":"{}","mode":"monitor","pid":{},"sink_node":{},"#,
             r#""sink_name":"{}","stream_node":{},"linked":{},"capture_events":{},"#,
             r#""total_bytes":{},"sample_rate":{},"channels":{},"last_error":{}}}"#
         ),
@@ -452,7 +452,7 @@ pub fn get_audio_capture_status() -> String {
         stage,
         s.pid,
         s.sink_node,
-        s.sink_name.replace('"', "'"),
+        s.sink_name.replace('\"', "'"),
         s.stream_node,
         s.linked,
         s.capture_events,
@@ -460,8 +460,18 @@ pub fn get_audio_capture_status() -> String {
         s.sample_rate,
         s.channels,
         match &s.last_error {
-            Some(e) => format!("\"{}\"", e.replace('"', "'")),
+            Some(e) => format!("\"{}\"", e.replace('\"', "'")),
             None => "null".to_string(),
         }
     )
+}
+
+/// 返回音频缓冲状态（JSON 字符串），供 Java /wl audio buffer 查询。
+/// 包含缓冲队列状态、编码状态等。
+pub fn get_audio_buffer_status() -> String {
+    use crate::audio_capture::AudioBufferManager;
+    
+    // This would require access to the Java-side AudioBufferManager
+    // For now, return a placeholder that indicates the buffer status
+    r#"{"buffer_ms":0,"queued_frames":0,"underrun":false,"overrun":false,"note":"buffer status requires Java-side AudioBufferManager integration"}"#.to_string()
 }
