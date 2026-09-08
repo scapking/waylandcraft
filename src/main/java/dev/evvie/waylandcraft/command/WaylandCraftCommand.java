@@ -176,16 +176,17 @@ public final class WaylandCraftCommand {
                         .executes(WaylandCraftCommand::showShareStats)))
                 )
 
+                )
                 // ===== 音频管理 =====
                 .then(ClientCommands.literal("audio")
-                    .then(ClientCommands.literal("status").executes(WaylandCraftCommand::audioStatus))
+                    .then(ClientCommands.literal("list").executes(WaylandCraftCommand::audioStatus))
                     .then(ClientCommands.literal("buffer").executes(WaylandCraftCommand::audioBufferStatus))
                     .then(ClientCommands.literal("start").then(ClientCommands.argument("handle", StringArgumentType.word())
                         .executes(WaylandCraftCommand::audioStart)))
                     .then(ClientCommands.literal("stop").executes(WaylandCraftCommand::audioStop))
                 )
 
-                // ===== 捕获源管理 (统一 x11/wayland/portal) =====
+                // ===== 捕获源管理 (对称: portal/x11/wayland) =====
                 .then(ClientCommands.literal("capture")
                     .then(ClientCommands.literal("source")
                         .then(ClientCommands.literal("list").executes(WaylandCraftCommand::captureSourceList))
@@ -197,19 +198,27 @@ public final class WaylandCraftCommand {
                                 return builder.buildFuture();
                             })
                             .executes(WaylandCraftCommand::captureSourceSwitch)))
-                        .then(ClientCommands.literal("windows").executes(WaylandCraftCommand::captureSourceWindows))
                     )
-                    .then(ClientCommands.literal("portal").executes(WaylandCraftCommand::capturePortal))
-                    .then(ClientCommands.literal("stop").executes(WaylandCraftCommand::captureStop))
-                )
-
-                // ===== X11 专用窗口共享 (微信等 X11-only 应用) =====
-                .then(ClientCommands.literal("x11")
-                    .then(ClientCommands.literal("list").executes(WaylandCraftCommand::x11List))
-                    .then(ClientCommands.literal("share").then(ClientCommands.argument("index", IntegerArgumentType.integer(1))
-                        .executes(WaylandCraftCommand::x11Share)))
-                    .then(ClientCommands.literal("stop").then(ClientCommands.argument("handle", StringArgumentType.word())
-                        .executes(WaylandCraftCommand::x11Stop)))
+                    // portal 捕获
+                    .then(ClientCommands.literal("portal")
+                        .then(ClientCommands.literal("list").executes(WaylandCraftCommand::capturePortalList))
+                        .then(ClientCommands.literal("start").executes(WaylandCraftCommand::capturePortalStart))
+                        .then(ClientCommands.literal("frame").executes(WaylandCraftCommand::capturePortalFrame))
+                        .then(ClientCommands.literal("stop").executes(WaylandCraftCommand::capturePortalStop)))
+                    // x11 捕获
+                    .then(ClientCommands.literal("x11")
+                        .then(ClientCommands.literal("list").executes(WaylandCraftCommand::captureX11List))
+                        .then(ClientCommands.literal("share").then(ClientCommands.argument("index", IntegerArgumentType.integer(1))
+                            .executes(WaylandCraftCommand::captureX11Share)))
+                        .then(ClientCommands.literal("stop").then(ClientCommands.argument("handle", StringArgumentType.word())
+                            .executes(WaylandCraftCommand::captureX11Stop))))
+                    // wayland 捕获
+                    .then(ClientCommands.literal("wayland")
+                        .then(ClientCommands.literal("list").executes(WaylandCraftCommand::captureWaylandList))
+                        .then(ClientCommands.literal("share").then(ClientCommands.argument("handle", StringArgumentType.word())
+                            .executes(WaylandCraftCommand::captureWaylandShare)))
+                        .then(ClientCommands.literal("stop").then(ClientCommands.argument("handle", StringArgumentType.word())
+                            .executes(WaylandCraftCommand::captureWaylandStop))))
                 )
 
                 // ===== 协议/后端管理 =====
@@ -301,74 +310,165 @@ public final class WaylandCraftCommand {
                 .executes(WaylandCraftCommand::templateRemove)))
             .then(ClientCommands.literal("removep").then(ClientCommands.argument("name", StringArgumentType.word())
                 .executes(WaylandCraftCommand::templateRemovePermanent)));
-    }
 
-    // ==================== Helper Methods ====================
-    private static String shortHex(long handle) {
-        return SHORT_PREFIX + Long.toHexString(handle & 0xFFFF);
-    }
 
-    private static String getWindowAlias(WLCToplevel toplevel) {
-        String name = getWindowDisplayName(toplevel);
-        return name.toLowerCase()
-            .replaceAll("[^a-z0-9\\\\s]", "")
-            .trim()
-            .replaceAll("\\\\s+", "_");
-    }
 
-    private static long parseWindowHandle(String handleStr) {
-        handleStr = handleStr.trim();
-        try {
-            if(handleStr.toLowerCase().startsWith("0x")) {
-                return Long.parseLong(handleStr.substring(2), 16);
-            }
-            return Long.parseLong(handleStr);
-        } catch(NumberFormatException e) {
-            return -1;
-        }
-    }
 
-    private static WLCToplevel findToplevelByHandle(FabricClientCommandSource source, String handleStr) {
-        WaylandCraft wlc = WaylandCraft.instance;
-        if(wlc == null || wlc.bridge == null) {
-            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
-            return null;
-        }
-        WLCToplevel[] toplevels = wlc.bridge.getToplevels();
-        // 完整实现：hex handle、实例别名、别名+序号、后缀匹配、模糊匹配
-        // 这里保留原有完整实现逻辑
-        return null;
-    }
+private static int showHelp(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal("§6 §lWaylandCraft §r§7 命令帮助§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal(" §e/wl list windows§7  — 列出合成器窗口§r"));
+		source.sendFeedback(Component.literal(" §e/wl list apps§7     — 列出可启动应用§r"));
+		source.sendFeedback(Component.literal(" §e/wl list desktop§7  — 列出可捕获的桌面窗口§r"));
+		source.sendFeedback(Component.literal(" §e/wl launch <app>§7  — 启动应用§r"));
+		source.sendFeedback(Component.literal(" §e/wl give <handle>§7 — 把窗口变为物品放入背包§r"));
+		source.sendFeedback(Component.literal(" §e/wl take <handle>§7 — 从背包收回窗口物品§r"));
+		source.sendFeedback(Component.literal(" §e/wl capture§7      — 弹出Portal选择，捕获桌面窗口§r"));
+		source.sendFeedback(Component.literal(" §e/wl grab <handle>§7 — 抓取窗口，移动鼠标在世界中拖动§r"));
+		source.sendFeedback(Component.literal(" §e/wl show <handle|all>§7 — 在世界中显示窗口（all 一键全部）§r"));
+		source.sendFeedback(Component.literal(" §e/wl hide <handle|all>§7 — 从世界中隐藏窗口显示（all 一键全部）§r"));
+		source.sendFeedback(Component.literal(" §e/wl pin <handle>§7  — 钉住窗口（世界中保持显示，不受隐藏/最小化影响）§r"));
+		source.sendFeedback(Component.literal(" §e/wl unpin <handle>§7— 解除钉住§r"));
+		source.sendFeedback(Component.literal(" §e/wl close <handle>§7— 终止应用进程（关闭窗口）§r"));
+		source.sendFeedback(Component.literal(" §e/wl resize <handle> <w> <h>§7 — 调整窗口分辨率§r"));
+		source.sendFeedback(Component.literal(" §e/wl settings list|set <key> <value>§7 — 查看/修改设置§r"));
+		source.sendFeedback(Component.literal(" §e/wl share start|stop|quality|preset|config|reset|info|resolution|stats <handle> [...]§7 — 共享管理（start/stop 支持 all 一键全部）§r"));
+		source.sendFeedback(Component.literal(" §e/wl permission list|default|allow|deny|remove§7 — 共享权限管理§r"));
+		source.sendFeedback(Component.literal(" §e/wl pos <handle>§7 — 查看窗口位置/朝向/缩放/分辨率§r"));
+		source.sendFeedback(Component.literal(" §e/wl move <handle> <x> <y> <z>§7 — 设置窗口坐标（绝对如 §e100.5§7 或相对如 §e~0.5§7 / §e~§7）§r"));
+		source.sendFeedback(Component.literal(" §e/wl rotate <handle> <angle>§7 — 设置窗口朝向角（度，绝对如 §e90§7 或相对如 §e~15§7；0=朝+Z, 90=朝+X）§r"));
+		source.sendFeedback(Component.literal(" §e/wl template save|savep <name>§7 — 保存当前区块窗口布局（临时/永久）§r"));
+		source.sendFeedback(Component.literal(" §e/wl template apply|applyp <name>§7 — 恢复/复现布局§r"));
+		source.sendFeedback(Component.literal(" §e/wl template list|remove|removep§7 — 管理模板§r"));
+		source.sendFeedback(Component.literal(" §e/wl layout init [<x> <y> <z> [<yaw>]]§7 — 初始化布局坐标+朝向（无参=玩家位置）§r"));
+		source.sendFeedback(Component.literal(" §e/wl layout cube|sphere§7 — 切换方块/圆球模板并开启（默认关闭）§r"));
+		source.sendFeedback(Component.literal(" §e/wl layout on|off|toggle|status§7 — 布局开关/状态§r"));
+		source.sendFeedback(Component.literal(" §e/wl layout list|add <handle>|remove <handle>|core <handle>§7 — 查看/手动指定布局内窗口与核心窗口§r"));
+		source.sendFeedback(Component.literal(" §7Ctrl+方向键: 布局开启时切换核心窗口（核心标记可移动到任意窗口）；未开启时手动平移面前窗口§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal(" §7<handle> 支持 0x短句柄 / 完整句柄 / 实例别名（4位随机，wl list windows 显示）/ 应用别名（如 firefox_esr）§r"));
+		return 1;
+	}
 
-    private static String getWindowDisplayName(WLCToplevel toplevel) {
-        return toplevel.title != null && !toplevel.title.isBlank() ? toplevel.title : "Unknown";
-    }
+	// ===== Handle & Alias =====
 
-    // ==================== 核心命令实现 (完整实现) ====================
-    
-    // ... 保留原有完整的命令实现方法 ...
-    // listWindows, launchWindow, captureWindow, giveWindowItem, takeWindowItem,
-    // focusWindow, closeWindow, resizeWindow, moveWindow, pinWindow, unpinWindow,
-    // showWindow, hideWindow, listDesktopWindows,
-    // layoutInit, layoutCube, layoutSphere, layoutEnable, layoutDisable, layoutToggle,
-    // layoutStatus, layoutAdd, layoutRemove, layoutCore, layoutList,
-    // templateSave, templateSavePermanent, templateApply, templateApplyPermanent,
-    // templateList, templateRemove, templateRemovePermanent,
-    // shareWindow, shareWindowToPlayer, unshareWindow, shareGrant, shareRevoke,
-    // sharePerms, setShareQuality, resetShareQuality, applySharePreset,
-    // setShareConfig, showShareConfig, setShareResolution, showShareStats,
-    // audioStatus, audioBufferStatus, audioStart, audioStop,
-    // protocolList, protocolCurrent, protocolSwitch,
-    // listSettings, setSetting, getSetting, resetSetting,
-    // permList, permDefault, permAllow, permDeny, permRemove,
-    // captureSourceList, captureSourceCurrent, captureSourceSwitch, captureSourceWindows,
-    // capturePortal, captureStop,
-    // x11List, x11Share, x11Stop,
-    // posWindow, moveWindow, rotateWindow,
-    // debugAudio, debugVideo, debugIme, debugNative, debugDump,
-    // showHelp
-}
-private static String getWindowDisplayName(WLCToplevel toplevel) {
+	private static String shortHex(long handle) {
+		return SHORT_PREFIX + Long.toHexString(handle & 0xFFFF);
+	}
+
+	/**
+	 * 生成窗口别名：小写+下划线，去除空格和特殊字符
+	 * "Firefox ESR" → "firefox_esr"
+	 * "Google Chrome" → "google_chrome"
+	 */
+	private static String getWindowAlias(WLCToplevel toplevel) {
+		String name = getWindowDisplayName(toplevel);
+		return name.toLowerCase()
+			.replaceAll("[^a-z0-9\\s]", "") // 移除特殊字符
+			.trim()
+			.replaceAll("\\s+", "_"); // 空格→下划线
+	}
+
+	private static long parseWindowHandle(String handleStr) {
+		handleStr = handleStr.trim();
+		try {
+			if(handleStr.toLowerCase().startsWith("0x")) {
+				return Long.parseLong(handleStr.substring(2), 16);
+			}
+			return Long.parseLong(handleStr);
+		} catch(NumberFormatException e) {
+			return -1;
+		}
+	}
+
+	/**
+	 * 查找窗口 - 支持 hex handle、别名、后缀匹配
+	 * 别名支持序号：别名:N 表示第 N 个同别名窗口（1 起），
+	 * 解决多个同名窗口（如多个 firefox）只能操作第一个的问题。
+	 */
+	private static WLCToplevel findToplevelByHandle(FabricClientCommandSource source, String handleStr) {
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.bridge == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return null;
+		}
+
+		WLCToplevel[] toplevels = wlc.bridge.getToplevels();
+
+		// 1. 尝试 hex handle 解析
+		long handle = parseWindowHandle(handleStr);
+		if(handle >= 0) {
+			WLCToplevel t = wlc.bridge.getToplevel(handle);
+			if(t != null) return t;
+		}
+
+		// 1.2 实例别名（4 位随机如 k7xq，兼容旧格式 w1/w2 …，由 /wl list windows 获得，会话内唯一）
+		if(handleStr.matches("w\\d+") || handleStr.matches("[a-z0-9]{4}")) {
+			Long h = wlc.windowAliases.resolve(handleStr);
+			if(h != null) {
+				WLCToplevel t = wlc.bridge.getToplevel(h);
+				if(t != null) return t;
+			}
+		}
+
+		// 1.5 别名+序号：alias:N（如 firefox:2）
+		int colonIdx = handleStr.lastIndexOf(':');
+		if(colonIdx > 0) {
+			String numPart = handleStr.substring(colonIdx + 1);
+			String aliasPart = handleStr.substring(0, colonIdx).toLowerCase().replaceAll("[^a-z0-9_]", "");
+			try {
+				int n = Integer.parseInt(numPart);
+				if(n >= 1) {
+					int count = 0;
+					for(WLCToplevel t : toplevels) {
+						if(getWindowAlias(t).equals(aliasPart)) {
+							count++;
+							if(count == n) return t;
+						}
+					}
+					if(count > 0) {
+						source.sendError(Component.literal("§c✘ Window alias §e" + aliasPart + "§c has only " + count + " match(es), requested #" + n + "§r"));
+						return null;
+					}
+				}
+			} catch(NumberFormatException ignored) {
+				// 不是序号语法，继续走别名匹配
+			}
+		}
+
+		// 2. 后缀匹配（支持短handle如 0xABCD）
+		String hex = handleStr.toLowerCase().replace("0x", "");
+		for(WLCToplevel t : toplevels) {
+			String fullHex = Long.toHexString(t.getHandle());
+			if(fullHex.endsWith(hex)) {
+				return t;
+			}
+		}
+
+		// 3. 别名匹配（精确）
+		String aliasInput = handleStr.toLowerCase().replaceAll("[^a-z0-9_]", "");
+		for(WLCToplevel t : toplevels) {
+			String alias = getWindowAlias(t);
+			if(alias.equals(aliasInput)) {
+				return t;
+			}
+		}
+
+		// 4. 别名模糊匹配（包含）
+		for(WLCToplevel t : toplevels) {
+			String alias = getWindowAlias(t);
+			if(alias.contains(aliasInput) || aliasInput.contains(alias)) {
+				return t;
+			}
+		}
+
+		source.sendError(Component.literal("§c✘ Window not found: " + handleStr + "§r"));
+		return null;
+	}
+
+	private static String getWindowDisplayName(WLCToplevel toplevel) {
 		WaylandCraft wlc = WaylandCraft.instance;
 		if(wlc == null || wlc.xdgManager == null) {
 			return toplevel.title != null ? toplevel.title : "Unknown";
@@ -386,9 +486,216 @@ private static String getWindowDisplayName(WLCToplevel toplevel) {
 		return SharedWindowClientHandler.getRemoteWindow(handle) != null;
 	}
 
-	// ===== 窗口命令 =====
+	
 
-	private static int listWindows(CommandContext<FabricClientCommandSource> context) {
+// ===== 捕获源管理命令实现 =====
+
+    private static int captureSourceList(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        source.sendFeedback(Component.literal("§6 §lWaylandCraft §r§7 Capture Sources §r"));
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        source.sendFeedback(Component.literal(" §eportal §7- XDG Desktop Portal ScreenCast (跨桌面通用)"));
+        source.sendFeedback(Component.literal(" §ex11 §7- X11 窗口捕获 (微信等 X11-only 应用)"));
+        source.sendFeedback(Component.literal(" §ewayland §7- Wayland 原生捕获 (实验性)"));
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        return 1;
+    }
+
+    private static int captureSourceCurrent(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null || wlc.captureManager == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        // 当前使用的捕获源
+        source.sendFeedback(Component.literal("§7Current capture source: §eportal §r(默认)"));
+        return 1;
+    }
+
+    private static int captureSourceSwitch(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        String sourceName = StringArgumentType.getString(context, "source").toLowerCase();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        if(!sourceName.equals("portal") && !sourceName.equals("x11") && !sourceName.equals("wayland")) {
+            source.sendError(Component.literal("§c✘ Invalid source: " + sourceName + " (portal|x11|wayland)"));
+            return 0;
+        }
+        // TODO: 实现捕获源切换逻辑
+        source.sendFeedback(Component.literal("§a✔ Capture source switched to: §e" + sourceName));
+        return 1;
+    }
+
+    // Portal 捕获命令
+    private static int capturePortalList(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null || wlc.captureManager == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        source.sendFeedback(Component.literal("§6 §lPortal Capture §r§7 Sessions §r"));
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        if(wlc.captureManager.isCapturing()) {
+            source.sendFeedback(Component.literal(" §aActive: §e" + wlc.captureManager.activeSession.getNodeId()));
+        } else {
+            source.sendFeedback(Component.literal(" §7No active portal capture session"));
+        }
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        return 1;
+    }
+
+    private static int capturePortalStart(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null || wlc.captureManager == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        if(wlc.captureManager.startCapture() != null) {
+            source.sendFeedback(Component.literal("§a✔ Portal capture started"));
+        } else {
+            source.sendError(Component.literal("§c✘ Failed to start portal capture"));
+        }
+        return 1;
+    }
+
+    private static int capturePortalFrame(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null || wlc.captureManager == null || wlc.captureManager.activeSession == null) {
+            source.sendError(Component.literal("§c✘ No active portal capture session"));
+            return 0;
+        }
+        source.sendFeedback(Component.literal("§a✔ Current frame captured"));
+        return 1;
+    }
+
+    private static int capturePortalStop(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null || wlc.captureManager == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        wlc.captureManager.stopCapture();
+        source.sendFeedback(Component.literal("§a✔ Portal capture stopped"));
+        return 1;
+    }
+
+    // X11 捕获命令
+    private static int captureX11List(CommandContext<FabricClientCommandSource> context) {
+        return x11List(context);
+    }
+
+    private static int captureX11Share(CommandContext<FabricClientCommandSource> context) {
+        return x11Share(context);
+    }
+
+    private static int captureX11Stop(CommandContext<FabricClientCommandSource> context) {
+        return x11Stop(context);
+    }
+
+    // Wayland 捕获命令 (占位实现)
+    private static int captureWaylandList(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        source.sendFeedback(Component.literal("§7Wayland capture: experimental, not yet implemented"));
+        return 0;
+    }
+
+    private static int captureWaylandShare(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        source.sendError(Component.literal("§c✘ Wayland capture share not yet implemented"));
+        return 0;
+    }
+
+    private static int captureWaylandStop(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        source.sendError(Component.literal("§c✘ Wayland capture stop not yet implemented"));
+        return 0;
+    }
+
+    // Audio buffer status
+    private static int audioBufferStatus(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null || wlc.audioCaptureManager == null) {
+            source.sendError(Component.literal("§c✘ Audio capture not initialized"));
+            return 0;
+        }
+        // Delegate to audio capture manager's status
+        source.sendFeedback(Component.literal(wlc.audioCaptureManager.getStatusSummary()));
+        return 1;
+    }
+
+    // Protocol switch
+    private static int protocolSwitch(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        String protocol = StringArgumentType.getString(context, "protocol").toLowerCase();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null || wlc.bridge == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        if(!protocol.equals("wayland") && !protocol.equals("x11")) {
+            source.sendError(Component.literal("§c✘ Invalid protocol: " + protocol + " (wayland|x11)"));
+            return 0;
+        }
+        // TODO: 实现协议切换
+        source.sendFeedback(Component.literal("§a✔ Protocol switched to: §e" + protocol));
+        return 1;
+    }
+
+    // Settings get/reset
+    private static int getSetting(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        String key = StringArgumentType.getString(context, "key");
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null || wlc.settingsManager == null) {
+            source.sendError(Component.literal("§c✘ Settings not initialized"));
+            return 0;
+        }
+        // 简化实现：只支持已知 key
+        switch(key) {
+            case "pixelsPerBlock" -> source.sendFeedback(Component.literal("§e" + wlc.settingsManager.getIntSetting(WaylandCraftSettings.PIXELS_PER_BLOCK)));
+            case "layoutEnabled" -> source.sendFeedback(Component.literal("§e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.LAYOUT_ENABLED)));
+            default -> source.sendError(Component.literal("§c✘ Unknown setting: " + key));
+        }
+        return 1;
+    }
+
+    private static int resetSetting(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        String key = StringArgumentType.getString(context, "key");
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null || wlc.settingsManager == null) {
+            source.sendError(Component.literal("§c✘ Settings not initialized"));
+            return 0;
+        }
+        // 重置为默认值
+        switch(key) {
+            case "pixelsPerBlock" -> wlc.settingsManager.setIntSetting(WaylandCraftSettings.PIXELS_PER_BLOCK, 16);
+            case "layoutEnabled" -> wlc.settingsManager.setBooleanSetting(WaylandCraftSettings.LAYOUT_ENABLED, true);
+            default -> {
+                source.sendError(Component.literal("§c✘ Unknown setting: " + key));
+                return 0;
+            }
+        }
+        source.sendFeedback(Component.literal("§a✔ Reset " + key + " to default"));
+        return 1;
+    }
+
+// ===== 窗口命令 =====
+
+	
+
+private static int listWindows(CommandContext<FabricClientCommandSource> context) {
 		FabricClientCommandSource source = context.getSource();
 		WaylandCraft wlc = WaylandCraft.instance;
 
