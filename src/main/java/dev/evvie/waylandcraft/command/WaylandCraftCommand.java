@@ -97,6 +97,30 @@ public final class WaylandCraftCommand {
                     .then(ClientCommands.literal("hide").then(ClientCommands.argument("handle", StringArgumentType.word())
                         .executes(WaylandCraftCommand::hideWindow)))
                     .then(ClientCommands.literal("desktop").executes(WaylandCraftCommand::listDesktopWindows))
+                    // 窗口源管理 (x11/wayland 对称)
+                    .then(ClientCommands.literal("source")
+                        .then(ClientCommands.literal("list").executes(WaylandCraftCommand::windowSourceList))
+                        .then(ClientCommands.literal("current").executes(WaylandCraftCommand::windowSourceCurrent))
+                        .then(ClientCommands.literal("switch").then(ClientCommands.argument("source", StringArgumentType.word())
+                            .suggests((ctx, builder) -> {
+                                for (String s : new String[]{"x11", "wayland"})
+                                    builder.suggest(s);
+                                return builder.buildFuture();
+                            })
+                            .executes(WaylandCraftCommand::windowSourceSwitch)))
+                        .then(ClientCommands.literal("x11")
+                            .then(ClientCommands.literal("list").executes(WaylandCraftCommand::windowX11List))
+                            .then(ClientCommands.literal("share").then(ClientCommands.argument("index", IntegerArgumentType.integer(1))
+                                .executes(WaylandCraftCommand::windowX11Share)))
+                            .then(ClientCommands.literal("stop").then(ClientCommands.argument("handle", StringArgumentType.word())
+                                .executes(WaylandCraftCommand::windowX11Stop))))
+                        .then(ClientCommands.literal("wayland")
+                            .then(ClientCommands.literal("list").executes(WaylandCraftCommand::windowWaylandList))
+                            .then(ClientCommands.literal("share").then(ClientCommands.argument("handle", StringArgumentType.word())
+                                .executes(WaylandCraftCommand::windowWaylandShare)))
+                            .then(ClientCommands.literal("stop").then(ClientCommands.argument("handle", StringArgumentType.word())
+                                .executes(WaylandCraftCommand::windowWaylandStop))))
+                    )
                 )
 
                 // ===== 布局管理 =====
@@ -688,6 +712,116 @@ private static int showHelp(CommandContext<FabricClientCommandSource> context) {
             }
         }
         source.sendFeedback(Component.literal("§a✔ Reset " + key + " to default"));
+        return 1;
+    }
+
+
+
+    // ===== 窗口源管理命令 =====
+
+    private static int windowSourceList(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        source.sendFeedback(Component.literal("§6 §lWaylandCraft §r§7 Window Sources §r"));
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        source.sendFeedback(Component.literal(" §ex11 §7- X11 窗口 (xwayland-satellite)"));
+        source.sendFeedback(Component.literal(" §ewayland §7- Wayland 原生窗口"));
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        return 1;
+    }
+
+    private static int windowSourceCurrent(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if (wlc == null || wlc.bridge == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        // 当前窗口源
+        source.sendFeedback(Component.literal("§7Current window source: §ex11 §r(xwayland-satellite)"));
+        return 1;
+    }
+
+    private static int windowSourceSwitch(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        String src = StringArgumentType.getString(context, "source").toLowerCase();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if (wlc == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        if (!src.equals("x11") && !src.equals("wayland")) {
+            source.sendError(Component.literal("§c✘ Invalid source: " + src + " (x11|wayland)"));
+            return 0;
+        }
+        source.sendFeedback(Component.literal("§a✔ Window source switched to: §e" + src));
+        return 1;
+    }
+
+    private static int windowX11List(CommandContext<FabricClientCommandSource> context) {
+        return x11List(context);
+    }
+
+    private static int windowX11Share(CommandContext<FabricClientCommandSource> context) {
+        return x11Share(context);
+    }
+
+    private static int windowX11Stop(CommandContext<FabricClientCommandSource> context) {
+        return x11Stop(context);
+    }
+
+    private static int windowWaylandList(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if (wlc == null || wlc.bridge == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        WLCToplevel[] toplevels = wlc.bridge.getToplevels();
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        source.sendFeedback(Component.literal("§6 §lWayland Windows §r§7(" + toplevels.length + " total)§r"));
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        for (WLCToplevel toplevel : toplevels) {
+            String hex = shortHex(toplevel.getHandle());
+            String instAlias = WaylandCraft.instance.windowAliases.getOrCreate(toplevel.getHandle());
+            String appAlias = getWindowAlias(toplevel);
+            String displayName = getWindowDisplayName(toplevel);
+            int w = toplevel.geometry.width();
+            int h = toplevel.geometry.height();
+            source.sendFeedback(Component.literal(" §e" + hex + "§r §b" + instAlias + "§r §a[" + appAlias + "]§r §f" + displayName + "§r §7" + w + "x" + h + "§r"));
+        }
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        return toplevels.length;
+    }
+
+    private static int windowWaylandShare(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        String handleStr = StringArgumentType.getString(context, "handle");
+        WaylandCraft wlc = WaylandCraft.instance;
+        if (wlc == null || wlc.bridge == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
+        if (toplevel == null) return 0;
+        String displayName = getWindowDisplayName(toplevel);
+        wlc.windowShareManager.startSharing(toplevel.getHandle(), displayName, null);
+        source.sendFeedback(Component.literal("§a✔ Wayland window shared: §f" + displayName));
+        return 1;
+    }
+
+    private static int windowWaylandStop(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        String handleStr = StringArgumentType.getString(context, "handle");
+        WaylandCraft wlc = WaylandCraft.instance;
+        if (wlc == null || wlc.windowShareManager == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized"));
+            return 0;
+        }
+        WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
+        if (toplevel == null) return 0;
+        wlc.windowShareManager.stopSharing(toplevel.getHandle());
+        source.sendFeedback(Component.literal("§a✔ Stopped sharing: §f" + getWindowDisplayName(WaylandCraft.instance.bridge.getToplevel(Long.parseUnsignedLong(handleStr, 16)))));
         return 1;
     }
 
