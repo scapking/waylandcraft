@@ -469,8 +469,6 @@ pub fn get_audio_capture_status() -> String {
 /// 返回音频缓冲状态（JSON 字符串），供 Java /wl audio buffer 查询。
 /// 包含缓冲队列状态、编码状态等。
 pub fn get_audio_buffer_status() -> String {
-    use crate::audio_capture::AudioBufferManager;
-    
     // This would require access to the Java-side AudioBufferManager
     // For now, return a placeholder that indicates the buffer status
     r#"{"buffer_ms":0,"queued_frames":0,"underrun":false,"overrun":false,"note":"buffer status requires Java-side AudioBufferManager integration"}"#.to_string()
