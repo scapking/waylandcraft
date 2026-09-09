@@ -85,6 +85,7 @@ if name.is_empty() || name.contains("No engine") || name.contains("error") {
 pub(crate) enum ToWorker {
     ProcessKey {
         keysym: u32,
+        keycode: u32,
         evdev: u32,
         state: u32,
     },
@@ -252,6 +253,7 @@ impl HostBridge for DbusIbusBridge {
                 }
                 Some(ToWorker::ProcessKey {
                     keysym,
+                    keycode,
                     evdev,
                     state,
                 })
@@ -487,11 +489,20 @@ fn command_loop(
                     .map_err(|e| e.to_string())
                 */
             }
-            ToWorker::ProcessKey { keysym, evdev, state } => {
-                // 同步调 ProcessKeyEvent（不等 reply——commit 驱动模式）
-                // v0.11.0 修：之前 `let _ = ...` 静默丢弃 zbus 错误——
-                // 49 次 submit / 0 ProcessKeyEvent 日志就是这 bug。
-                // 现在显式记录 zbus 调用结果（成功 + consumed、失败）。
+            ToWorker::ProcessKey {
+                keysym,
+                keycode,
+                evdev,
+                state,
+            } => {
+                // 同步调 ProcessKeyEvent（zbus blocking call 等 reply——reply 的
+                // consumed 是引擎真实返回值，见 bus/inputcontext.c：engine 处理完
+                // 才 return value；仅 engine==NULL/无 focus 时恒 false）。
+                // v1.2.33 修：**consumed=false 的键直接补发嵌套应用**——ibus 没有
+                // 自动 forward（ForwardKeyEvent 只由引擎主动调，libpinyin 等不调
+                // → v1.2.32 英文全断、0 ForwardKeyEvent）。consumed=false 意味着
+                // 引擎不处理该键（英文/标点/功能键/无引擎）——补发 wl_keyboard。
+                // consumed=true 的键引擎会发 preedit/commit 信号（现有信号路径）。
                 let call_result = ic_conns
                     .ic
                     .call::<_, _, bool>("ProcessKeyEvent", &(keysym, evdev, state));
@@ -500,11 +511,28 @@ fn command_loop(
                         ime_log!(
                             "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent keysym={keysym:#x} evdev={evdev} state={state:#x} -> consumed={consumed}"
                         );
+                        if !consumed {
+                            let is_release = state & 0x4000_0000 != 0;
+                            ime_log!(
+                                "[waylandcraft][host_bridge][dbus-ibus] 未消费（consumed=false）-> 补发嵌套应用 keycode={keycode} release={is_release}"
+                            );
+                            let _ = ev_tx.send(FromWorker::ForwardKey {
+                                keycode,
+                                is_release,
+                            });
+                        }
                     }
                     Err(e) => {
                         ime_log!(
                             "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent 失败 keysym={keysym:#x} evdev={evdev} state={state:#x}: {e}"
                         );
+                        // 调用失败：无法知道引擎是否消费——保守补发（宁可重复
+                        // 显示也不吞键）。
+                        let is_release = state & 0x4000_0000 != 0;
+                        let _ = ev_tx.send(FromWorker::ForwardKey {
+                            keycode,
+                            is_release,
+                        });
                     }
                 }
                 Ok(())
@@ -931,95 +959,53 @@ fn find_content_str(v: &OwnedValue) -> Option<String> {
 }
 
 /// 从 IBusLookupTable 序列化 variant 提取候选列表 + 光标位置。
-/// IBusLookupTable 序列化（ibuslookuptable.c）：
-/// Structure[ "IBusLookupTable", Dict{}, page_size(u), cursor_pos(u),
+/// IBusLookupTable 序列化（ibuslookuptable.c 权威）：
+/// Structure[ "IBusLookupTable", Dict{}(props), page_size(u), cursor_pos(u),
 ///            cursor_visible(b), round(b), orientation(i),
-///            candidates(a{IBusText variants}) ... ]
-/// 候选是 aav（IBusText 序列化的 variant 数组）。简化解析：递归抓所有
-/// "IBusText" 之后出现的 Str？——精确做法：遍历找首层 u32×2（page_size
-/// cursor_pos）再抓候选 variant 数组。为稳，递归收集所有 IBusText 内容。
+///            candidates(av: 每项 variant=IBusText serialize), labels(av), ... ]
+/// v1.2.33：**不赌字段位置**——候选全部是非 IBus 类型名的内容 Str，纯递归
+/// 收集（candidates 数组的每项 extract_ibustext）。cursor 简化取 0（上层只用
+/// candidates + visible；cursor_visible 由 UpdateLookupTable 的 visible 带）。
 fn extract_lookup_table(v: &OwnedValue) -> Option<(Vec<String>, u32)> {
-    use zbus::zvariant::Value;
-    let st = match &**v {
-        Value::Structure(s) => s,
-        _ => return None,
-    };
-    let fields = st.fields();
-    if fields.is_empty() {
-        return None;
-    }
-    // 字段 0 = 类型名 "IBusLookupTable"，字段 1 = properties dict
-    // 之后：page_size(u32) cursor_pos(u32) cursor_visible(b) round(b)
-    //       orientation(i32) candidates(Array<Variant<IBusText>>)
-    let mut cursor_pos: u32 = 0;
-    let mut candidates: Vec<String> = Vec::new();
-    let mut ints_seen = 0u32;
-    let mut seen_type = false;
-    for f in fields {
-        if let Ok(ov) = OwnedValue::try_from(f) {
-            match &*ov {
-                Value::Str(s) if s == "IBusLookupTable" || s == "IBusLookupTable" => {
-                    seen_type = true;
-                    continue;
-                }
-                Value::Dict(_) => continue, // properties dict
-                Value::U32(n) => {
-                    if seen_type {
-                        // 前两个 u32 = page_size, cursor_pos
-                        if ints_seen == 1 {
-                            cursor_pos = *n;
-                        }
-                        ints_seen += 1;
-                    }
-                }
-                Value::Array(a) => {
-                    // candidates: array of variant(IBusText)
-                    for item in a.iter() {
-                        if let Ok(ov2) = OwnedValue::try_from(item) {
-                            let t = extract_ibustext(&ov2);
-                            if !t.is_empty() {
-                                candidates.push(t);
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    if candidates.is_empty() {
-        // 兜底：递归全量抓（不同版本字段布局）
-        if let Some(first) = find_lookup_candidates_recursive(v) {
-            candidates = first;
-        }
-    }
-    Some((candidates, cursor_pos))
+    let candidates = find_lookup_candidates_recursive(v).unwrap_or_default();
+    Some((candidates, 0))
 }
 
+/// 递归收集结构里所有非 IBus 类型名的非空内容 Str（lookup 的候选文本）。
+/// 不依赖任何字段位置/数组签名——IBusLookupTable 无论怎么嵌套都能抓到。
 fn find_lookup_candidates_recursive(v: &OwnedValue) -> Option<Vec<String>> {
-    use zbus::zvariant::Value;
-    match &**v {
-        Value::Structure(st) => {
-            let mut out = Vec::new();
-            for f in st.fields() {
-                if let Ok(ov) = OwnedValue::try_from(f) {
-                    if let Value::Array(a) = &*ov {
-                        for item in a.iter() {
-                            if let Ok(ov2) = OwnedValue::try_from(item) {
-                                if let Some(s) = find_content_str(&ov2) {
-                                    out.push(s);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(mut more) = find_lookup_candidates_recursive(&ov) {
-                        out.append(&mut more);
+    fn walk(v: &OwnedValue, out: &mut Vec<String>) {
+        match &**v {
+            zbus::zvariant::Value::Str(s) => {
+                let s = s.to_string();
+                if !s.is_empty() && !s.starts_with("IBus") {
+                    out.push(s);
+                }
+            }
+            zbus::zvariant::Value::Structure(st) => {
+                for f in st.fields() {
+                    if let Ok(ov) = OwnedValue::try_from(f) {
+                        walk(&ov, out);
                     }
                 }
             }
-            if out.is_empty() { None } else { Some(out) }
+            zbus::zvariant::Value::Array(a) => {
+                for item in a.iter() {
+                    if let Ok(ov) = OwnedValue::try_from(item) {
+                        walk(&ov, out);
+                    }
+                }
+            }
+            // properties dict 不会有候选；Value::Dict 元素忽略。
+            _ => {}
         }
-        _ => None,
+    }
+    let mut out = Vec::new();
+    walk(v, &mut out);
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
