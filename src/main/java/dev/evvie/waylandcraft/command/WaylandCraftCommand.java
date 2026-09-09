@@ -168,7 +168,7 @@ public final class WaylandCraftCommand {
                         .executes(WaylandCraftCommand::sharePerms)))
                     .then(ClientCommands.literal("quality").then(ClientCommands.argument("handle", StringArgumentType.word())
                         .then(ClientCommands.argument("scale", FloatArgumentType.floatArg(0.1f, 2.0f))
-                            .then(ClientCommands.argument("bitrate", IntegerArgumentType.integer(100000))
+                            .then(ClientCommands.argument("quality", FloatArgumentType.floatArg(0.1f, 1.0f))
                                 .then(ClientCommands.argument("fps", IntegerArgumentType.integer(1, 60))
                                     .executes(WaylandCraftCommand::setShareQuality))))))
                     .then(ClientCommands.literal("preset").then(ClientCommands.argument("handle", StringArgumentType.word())
@@ -1000,7 +1000,7 @@ private static int listWindows(CommandContext<FabricClientCommandSource> context
 	 */
 	private static int launchWindow(CommandContext<FabricClientCommandSource> context) {
 		FabricClientCommandSource source = context.getSource();
-		String appName = StringArgumentType.getString(context, "app_name").trim();
+		String appName = StringArgumentType.getString(context, "app").trim();
 		WaylandCraft wlc = WaylandCraft.instance;
 
 		if(wlc == null || wlc.bridge == null) {
