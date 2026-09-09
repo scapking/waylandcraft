@@ -359,7 +359,10 @@ jobs:
         path: native-libs
         pattern: libwaylandcraft-*
         merge-multiple: true
-    - if: matrix.java == '25'
+    # Verify native libs is Linux/macOS-only: the commands are POSIX
+    # (ls -la / file) and PowerShell on Windows runners chokes on them;
+    # Windows is viewer-only and never loads the .so payloads anyway.
+    - if: matrix.java == '25' && matrix.os != 'windows-2022' && matrix.os != 'windows-11-arm'
       name: Verify native libs
       run: |
         ls -la native-libs/
