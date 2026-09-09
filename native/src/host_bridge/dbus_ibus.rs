@@ -180,11 +180,15 @@ impl DbusIbusBridge {
         // 4. 启动 worker 线程（独占 ic_conns，处理按键 + 接收信号）
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<ToWorker>();
         let (ev_tx, ev_rx) = std::sync::mpsc::channel::<FromWorker>();
+        // v1.2.34：共享信号计数——worker 判定"引擎是否消费了刚提交的键"。
+        // 引擎对选字数字键 reply consumed=false 但异步发 commit 信号——reply
+        // 不可靠，必须看信号。handle_signal 每收一个信号 +1。
+        let sig_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
         std::thread::Builder::new()
             .name("wc-host-bridge-ibus".into())
             .spawn(move || {
-                command_loop(ic_conns, cmd_rx, ev_tx);
+                command_loop(ic_conns, cmd_rx, ev_tx, sig_counter);
             })
             .expect("spawn worker thread");
 
@@ -369,6 +373,7 @@ fn command_loop(
     mut ic_conns: IcConnections,
     cmd_rx: Receiver<ToWorker>,
     ev_tx: Sender<FromWorker>,
+    sig_counter: std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) {
     use zbus::blocking::Proxy;
 
@@ -376,13 +381,14 @@ fn command_loop(
     for sig in WATCHED_SIGNALS {
         let ic = ic_conns.ic.clone();
         let ev_tx = ev_tx.clone();
+        let sig_counter = sig_counter.clone();
         let name = (*sig).to_string();
         std::thread::Builder::new()
             .name(format!("wc-host-bridge-ibus-sig-{}", sig))
             .spawn(move || {
                 if let Ok(iter) = ic.receive_signal(name.as_str()) {
                     for msg in iter {
-                        let _ = handle_signal(&name, &msg, &ev_tx);
+                        let _ = handle_signal(&name, &msg, &ev_tx, &sig_counter);
                     }
                 }
             })
@@ -495,26 +501,32 @@ fn command_loop(
                 evdev,
                 state,
             } => {
-                // 同步调 ProcessKeyEvent（zbus blocking call 等 reply——reply 的
-                // consumed 是引擎真实返回值，见 bus/inputcontext.c：engine 处理完
-                // 才 return value；仅 engine==NULL/无 focus 时恒 false）。
-                // v1.2.33 修：**consumed=false 的键直接补发嵌套应用**——ibus 没有
-                // 自动 forward（ForwardKeyEvent 只由引擎主动调，libpinyin 等不调
-                // → v1.2.32 英文全断、0 ForwardKeyEvent）。consumed=false 意味着
-                // 引擎不处理该键（英文/标点/功能键/无引擎）——补发 wl_keyboard。
-                // consumed=true 的键引擎会发 preedit/commit 信号（现有信号路径）。
+                // 同步调 ProcessKeyEvent。**consumed reply 不可靠**（v1.2.34）：
+                // libpinyin 对选字数字键 reply consumed=false 但异步发 commit
+                // 信号（信号先于 reply 到达）——若拿 reply false 就补发会把选字
+                // 数字也推进文本框（v1.2.33 实测："打字 + 1 候选数字"）。
+                // 正确判定：reply 后短暂等待引擎信号窗口，**有信号 = 引擎处理了
+                // （不补发）；无信号且 consumed=false = 真没处理（补发英文等）**。
+                let sig_before = sig_counter.load(std::sync::atomic::Ordering::Relaxed);
                 let call_result = ic_conns
                     .ic
                     .call::<_, _, bool>("ProcessKeyEvent", &(keysym, evdev, state));
+                let is_release = state & 0x4000_0000 != 0;
                 match call_result {
                     Ok(consumed) => {
+                        // 等信号线程处理引擎输出（本地 dbus 毫秒级；10ms 足够，
+                        // 人打字间隔 100ms+ 无感）。
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        let sig_after =
+                            sig_counter.load(std::sync::atomic::Ordering::Relaxed);
+                        let engine_produced_signal = sig_after != sig_before;
                         ime_log!(
-                            "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent keysym={keysym:#x} evdev={evdev} state={state:#x} -> consumed={consumed}"
+                            "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent keysym={keysym:#x} evdev={evdev} state={state:#x} -> consumed={consumed} sig_delta={}",
+                            sig_after.saturating_sub(sig_before)
                         );
-                        if !consumed {
-                            let is_release = state & 0x4000_0000 != 0;
+                        if !consumed && !engine_produced_signal {
                             ime_log!(
-                                "[waylandcraft][host_bridge][dbus-ibus] 未消费（consumed=false）-> 补发嵌套应用 keycode={keycode} release={is_release}"
+                                "[waylandcraft][host_bridge][dbus-ibus] 引擎未消费且无信号 -> 补发嵌套应用 keycode={keycode} release={is_release}"
                             );
                             let _ = ev_tx.send(FromWorker::ForwardKey {
                                 keycode,
@@ -528,7 +540,6 @@ fn command_loop(
                         );
                         // 调用失败：无法知道引擎是否消费——保守补发（宁可重复
                         // 显示也不吞键）。
-                        let is_release = state & 0x4000_0000 != 0;
                         let _ = ev_tx.send(FromWorker::ForwardKey {
                             keycode,
                             is_release,
@@ -710,8 +721,13 @@ fn handle_signal(
     name: &str,
     msg: &zbus::message::Message,
     ev_tx: &Sender<FromWorker>,
+    sig_counter: &std::sync::atomic::AtomicU32,
 ) -> Result<(), String> {
     use zbus::zvariant::OwnedValue;
+    // v1.2.34：任何信号到达都 +1——worker 用它在 ProcessKeyEvent reply 后
+    // 判断引擎是否真的处理了该键（reply consumed 对选字数字键不可靠：
+    // 引擎 reply false 但异步发 commit）。
+    sig_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let body = msg.body();
 
     match name {
@@ -954,6 +970,11 @@ fn find_content_str(v: &OwnedValue) -> Option<String> {
             }
             None
         }
+        // v1.2.34: av 数组元素是 variant——zbus 表示为 Value::Value(Box<Value>)，
+        // 必须解开递归，否则 IBusLookupTable 的候选（av 数组）全部丢失。
+        Value::Value(inner) => {
+            find_content_str(&OwnedValue::try_from(inner.as_ref()).ok()?)
+        }
         _ => None,
     }
 }
@@ -994,6 +1015,12 @@ fn find_lookup_candidates_recursive(v: &OwnedValue) -> Option<Vec<String>> {
                     if let Ok(ov) = OwnedValue::try_from(item) {
                         walk(&ov, out);
                     }
+                }
+            }
+            // v1.2.34: variant 包装（av 数组元素）必须解开。
+            zbus::zvariant::Value::Value(inner) => {
+                if let Ok(ov) = OwnedValue::try_from(inner.as_ref()) {
+                    walk(&ov, out);
                 }
             }
             // properties dict 不会有候选；Value::Dict 元素忽略。
@@ -1206,5 +1233,35 @@ mod tests {
         // 只有类型名 → 空
         let v = ov_text(vec![ov_str("IBusText")]);
         assert_eq!(extract_ibustext(&v), "");
+    }
+
+    #[test]
+    fn extract_lookup_handles_variant_wrapped_candidates() {
+        use zbus::zvariant::Value;
+        // 模拟 UpdateLookupTable (vb) 的 v：IBusLookupTable serialize——
+        // 候选是 av 数组，元素在 zbus 里是 Value::Value(Box(IBusText Structure))。
+        let cand_text = |s: &str| {
+            let inner = ov_text(vec![ov_str("IBusText"), ov_str(s)]);
+            let val: Value<'static> = match &**&inner {
+                Value::Structure(st) => Value::Structure(st.try_clone().unwrap()),
+                _ => unreachable!(),
+            };
+            Value::Value(Box::new(val))
+        };
+        let items = vec![cand_text("你"), cand_text("好")];
+        // 手动构造 Array 的 signature：用 zvariant::ArrayBuilder 太重——直接
+        // 走结构：把候选数组当作一个带 variant 元素的容器验证 walk 能穿透。
+        // 简化：构建 Structure[IBusLookupTable, variant(结构[IBusText,文本]), ...]
+        let mut b = zbus::zvariant::StructureBuilder::new();
+        b = b.append_field(ov_str("IBusLookupTable"));
+        for it in items {
+            b = b.append_field(it);
+        }
+        let st = b.build().expect("build");
+        let owned =
+            OwnedValue::try_from(Value::Structure(st)).expect("own");
+        let (cands, _cursor) = extract_lookup_table(&owned).unwrap();
+        assert!(cands.contains(&"你".to_string()), "cands={cands:?}");
+        assert!(cands.contains(&"好".to_string()), "cands={cands:?}");
     }
 }

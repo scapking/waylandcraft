@@ -1562,7 +1562,7 @@ fn keyboard_input<'local>(
         .ime
         .handle_key(scancode as u32, action, mods);
 
-    // 2) v1.2.33 单路模型（对齐 GTK im-ibus 真实语义）：
+    // 2) v1.2.34 单路模型（对齐 GTK im-ibus 真实语义）：
     //    - key **只喂宿主 IME**（不直接发 wl_keyboard——v1.2.30 双路导致
     //      "raw 字母先进文本框 + preedit 后到"竞态错乱：中文打拼音时文本框
     //      先出现字母，候选/commit 后到叠加 → 文本与候选错位）；
@@ -1712,7 +1712,7 @@ fn native_version<'local>(
 /// 全部子系统状态（native lib / egl / wayland globals / host_bridge / ime /
 /// xwayland-satellite / audio / portal / ...），不必再切 4 个独立日志。
 ///
-/// v0.13.4 新增。mod_version 硬编码 "1.2.33"（与 gradle.properties 同步）；
+/// v0.13.4 新增。mod_version 硬编码 "1.2.34"（与 gradle.properties 同步）；
 /// v0.13.9 修：之前 v0.13.5/7/8 bump version 时忘记同步这里——导致 status.log
 /// 一直显示 "1.2.9"。后续 bump version 时记得改这里（+ gradle.properties）。
 fn get_status_report<'local>(
@@ -1728,7 +1728,7 @@ fn get_status_report<'local>(
     let report = crate::status::StatusReport::gather(
         &instance,
         thread_name,
-        "1.2.33", // mod_version — 与 waylandcraft/gradle.properties 同步
+        "1.2.34", // mod_version — 与 waylandcraft/gradle.properties 同步
     );
     Ok(env.new_string(report.to_json())?)
 }
