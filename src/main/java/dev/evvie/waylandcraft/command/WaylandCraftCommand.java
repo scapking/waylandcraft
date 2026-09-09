@@ -123,6 +123,44 @@ public final class WaylandCraftCommand {
                     )
                 )
 
+                // ===== 顶层窗口命令（README 原始 CLI：/wl list|launch|give|...）=====
+                // 重构曾把它们埋进 /wl window 子树；这里恢复顶层入口（子树保留兼容）。
+                .then(ClientCommands.literal("list")
+                    .executes(WaylandCraftCommand::listApps)
+                    .then(ClientCommands.literal("windows").executes(WaylandCraftCommand::listWindows))
+                    .then(ClientCommands.literal("apps").executes(WaylandCraftCommand::listApps))
+                    .then(ClientCommands.literal("desktop").executes(WaylandCraftCommand::listDesktopWindows)))
+                .then(ClientCommands.literal("launch").then(ClientCommands.argument("app", StringArgumentType.greedyString())
+                    .executes(WaylandCraftCommand::launchWindow)))
+                .then(ClientCommands.literal("give").then(ClientCommands.argument("handle", StringArgumentType.word())
+                    .executes(WaylandCraftCommand::giveWindowItem)))
+                .then(ClientCommands.literal("take").then(ClientCommands.argument("handle", StringArgumentType.word())
+                    .executes(WaylandCraftCommand::takeWindowItem)))
+                .then(ClientCommands.literal("grab").then(ClientCommands.argument("handle", StringArgumentType.word())
+                    .executes(WaylandCraftCommand::grabWindow)))
+                .then(ClientCommands.literal("show").then(ClientCommands.argument("handle", StringArgumentType.word())
+                    .executes(WaylandCraftCommand::showWindow)))
+                .then(ClientCommands.literal("hide").then(ClientCommands.argument("handle", StringArgumentType.word())
+                    .executes(WaylandCraftCommand::hideWindow)))
+                .then(ClientCommands.literal("pin").then(ClientCommands.argument("handle", StringArgumentType.word())
+                    .executes(WaylandCraftCommand::pinWindow)))
+                .then(ClientCommands.literal("unpin").then(ClientCommands.argument("handle", StringArgumentType.word())
+                    .executes(WaylandCraftCommand::unpinWindow)))
+                .then(ClientCommands.literal("close").then(ClientCommands.argument("handle", StringArgumentType.word())
+                    .executes(WaylandCraftCommand::closeWindow)))
+                .then(ClientCommands.literal("focus").then(ClientCommands.argument("handle", StringArgumentType.word())
+                    .executes(WaylandCraftCommand::focusWindow)))
+                .then(ClientCommands.literal("resize").then(ClientCommands.argument("handle", StringArgumentType.word())
+                    .then(ClientCommands.argument("width", IntegerArgumentType.integer(1))
+                        .then(ClientCommands.argument("height", IntegerArgumentType.integer(1))
+                            .executes(WaylandCraftCommand::resizeWindow)))))
+                .then(ClientCommands.literal("x11")
+                    .then(ClientCommands.literal("list").executes(WaylandCraftCommand::x11List))
+                    .then(ClientCommands.literal("share").then(ClientCommands.argument("index", IntegerArgumentType.integer(1))
+                        .executes(WaylandCraftCommand::x11Share)))
+                    .then(ClientCommands.literal("stop").then(ClientCommands.argument("handle", StringArgumentType.word())
+                        .executes(WaylandCraftCommand::x11Stop))))
+
                 // ===== 布局管理 =====
                 .then(ClientCommands.literal("layout")
                     .then(ClientCommands.literal("init")
@@ -212,6 +250,7 @@ public final class WaylandCraftCommand {
 
                 // ===== 捕获源管理 (对称: portal/x11/wayland) =====
                 .then(ClientCommands.literal("capture")
+                    .executes(WaylandCraftCommand::captureWindow)
                     .then(ClientCommands.literal("source")
                         .then(ClientCommands.literal("list").executes(WaylandCraftCommand::captureSourceList))
                         .then(ClientCommands.literal("current").executes(WaylandCraftCommand::captureSourceCurrent))
@@ -258,8 +297,8 @@ public final class WaylandCraftCommand {
                         .executes(WaylandCraftCommand::protocolSwitch)))
                 )
 
-                // ===== 配置管理 =====
-                .then(ClientCommands.literal("config")
+                // ===== 配置管理 (README: /wl settings) =====
+                .then(ClientCommands.literal("settings")
                     .then(ClientCommands.literal("list").executes(WaylandCraftCommand::listSettings))
                     .then(ClientCommands.literal("set").then(ClientCommands.argument("key", StringArgumentType.word())
                         .then(ClientCommands.argument("value", StringArgumentType.greedyString())
