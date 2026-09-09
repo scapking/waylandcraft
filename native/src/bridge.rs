@@ -1562,7 +1562,7 @@ fn keyboard_input<'local>(
         .ime
         .handle_key(scancode as u32, action, mods);
 
-    // 2) v1.2.30 双路模型（对齐 GNOME/mutter 标准）：
+    // 2) v1.2.31 双路模型（对齐 GNOME/mutter 标准）：
     //    - **raw key 永远转发给嵌套应用**（seat.keyboard_key → wl_keyboard.key，
     //      chromium/GTK 端在无 preedit 时直接显示英文/标点——修"纯英文无法输入"）；
     //    - **host_bridge 同步喂宿主 IME**（ibus 收同一按键，中文模式回 preedit/
@@ -1709,7 +1709,7 @@ fn native_version<'local>(
 /// 全部子系统状态（native lib / egl / wayland globals / host_bridge / ime /
 /// xwayland-satellite / audio / portal / ...），不必再切 4 个独立日志。
 ///
-/// v0.13.4 新增。mod_version 硬编码 "1.2.30"（与 gradle.properties 同步）；
+/// v0.13.4 新增。mod_version 硬编码 "1.2.31"（与 gradle.properties 同步）；
 /// v0.13.9 修：之前 v0.13.5/7/8 bump version 时忘记同步这里——导致 status.log
 /// 一直显示 "1.2.9"。后续 bump version 时记得改这里（+ gradle.properties）。
 fn get_status_report<'local>(
@@ -1725,7 +1725,7 @@ fn get_status_report<'local>(
     let report = crate::status::StatusReport::gather(
         &instance,
         thread_name,
-        "1.2.30", // mod_version — 与 waylandcraft/gradle.properties 同步
+        "1.2.31", // mod_version — 与 waylandcraft/gradle.properties 同步
     );
     Ok(env.new_string(report.to_json())?)
 }

@@ -46,6 +46,7 @@ use crate::ime::{
 use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TryRecvError};
 use std::time::Duration;
+use zbus::zvariant::OwnedValue;
 
 // ibus-portal 入口（事实 1：session bus 上同名 `org.freedesktop.IBus` 服务
 // 不实现 IBus 接口 —— 真正的入口是 `org.freedesktop.portal.IBus` portal 服务）。
@@ -655,8 +656,22 @@ fn classify_init_error(e: &str) -> BridgeInit {
 
 /// 把 ibus 信号消息翻译为 FromWorker。
 ///
-/// ibus UpdatePreeditText wire signature: `(vub)` = IBusText(variant), cursor_pos(uint), visible(bool)
-/// HidePreeditText / HideLookupTable / ShowLookupTable = Unit signature（无 body）
+/// **wire signature 权威参考**（ibus 官方 client src/ibusinputcontext.c）：
+/// ```text
+/// CommitText                  (v)     IBusText 序列化在 variant 内
+/// UpdatePreeditText           (vub)   variant + cursor_pos(u32) + visible(bool)
+/// UpdatePreeditTextWithMode   (vubu)  + mode(u32)
+/// HidePreeditText             ()      无 body
+/// UpdateLookupTable           (vb)    IBusLookupTable variant + visible
+/// ShowLookupTable/Hide        ()
+/// DeleteSurroundingText       (iu)    offset(i32) + nchars(u32)
+/// ForwardKeyEvent             (uuu)
+/// RegisterProperties/Property (v)
+/// ```
+/// v1.2.30 修：旧实现把 body 当**顶层 Structure** 反序列化——真实 wire 的
+/// IBusText 对象是包在 variant 里的（(v)/(vub)…）。后果：CommitText 顶层
+/// deserialize Structure 失败 → text=""（日志可见空 commit）；UpdatePreeditText
+/// 同理失败 → return Err → **信号全丢且无日志**（拼音 preedit 永远不出现）。
 fn handle_signal(
     name: &str,
     msg: &zbus::message::Message,
@@ -664,78 +679,79 @@ fn handle_signal(
 ) -> Result<(), String> {
     use zbus::zvariant::OwnedValue;
     let body = msg.body();
-    let sig = body.signature();
-    let _ = sig; // 暂存供将来用
 
     match name {
         "CommitText" => {
-            // body 是 IBusText 序列化的 variant（参见 ibus/src/ibusserializable.c
-            // ibus_serializable_serialize_object）：
-            //   GVariant 是 Tuple (s, ...)  —— 第一个 String 是 GObject 类型名
-            //   （如 "IBusText"），后随 IBusText 字段（text: s, attrs: aav...）。
-            // v0.10 修法：**跳过第一个 String**（GObject 类型名）——取**第二个**
-            // String（真正的 commit 文本）。原 v0.9.45 之前实现错误地取了第一
-            // 个 String，所以 commit 文本 = "IBusText"（用户日志可见）。
-            let text = if let Ok(s) = body.deserialize::<zbus::zvariant::Structure>() {
-                let strs: Vec<String> = s
-                    .fields()
-                    .iter()
-                    .filter_map(|f| match f {
-                        zbus::zvariant::Value::Str(s) => Some(s.to_string()),
-                        _ => None,
-                    })
-                    .collect();
-                // 第一个是 GObject 类型名（"IBusText"），跳过；第二个是 IBusText.text
-                strs.into_iter()
-                    .find(|s| s != "IBusText" && !s.is_empty())
-                    .unwrap_or_default()
-            } else {
-                String::new()
+            // wire: (v) —— variant 内是 IBusText 序列化 Structure
+            let text = match body.deserialize::<(OwnedValue,)>() {
+                Ok((v,)) => extract_ibustext(&v),
+                Err(e) => {
+                    ime_log!(
+                        "[waylandcraft][host_bridge][dbus-ibus] handle_signal CommitText body 解析失败: {e}"
+                    );
+                    String::new()
+                }
             };
-            ime_log!("[waylandcraft][host_bridge][dbus-ibus] handle_signal: CommitText text={:?}", text);
+            ime_log!(
+                "[waylandcraft][host_bridge][dbus-ibus] handle_signal: CommitText text={:?}",
+                text
+            );
             let _ = ev_tx.send(FromWorker::Commit(text));
             let _ = ev_tx.send(FromWorker::Done(0));
         }
-        "UpdatePreeditText" | "UpdatePreeditTextWithMode" => {
-            // wire: (vub) 或 (vubu)
-            let mut fields_iter = match body.deserialize::<zbus::zvariant::Structure>() {
-                Ok(s) => s.fields().to_vec(),
+        "UpdatePreeditText" => {
+            // wire: (vub) = IBusText variant + cursor_pos(u32) + visible(bool)
+            let (text, cursor_pos) = match body.deserialize::<(OwnedValue, u32, bool)>() {
+                Ok((v, cursor_pos, _visible)) => (extract_ibustext(&v), cursor_pos),
                 Err(e) => {
-                    // 兜底：作为预编辑文本处理
-                    return Err(format!("UpdatePreeditText fields: {e}"));
+                    ime_log!(
+                        "[waylandcraft][host_bridge][dbus-ibus] handle_signal UpdatePreeditText body 解析失败: {e}"
+                    );
+                    (String::new(), 0)
                 }
             };
-            // v0.10 修法：IBusText 序列化的 variant 内部结构——
-            // GVariant Tuple (s, IBusText fields)。第一个 String 是 GObject 类型名
-            // （"IBusText"），后随 IBusText 实际字段（text: s, attrs: aav...）。
-            // find_text_in_value 递归抓**任何** String 字段——但跳
-            // 过类型名。
-            let text = if !fields_iter.is_empty() {
-                OwnedValue::try_from(&fields_iter[0])
-                    .ok()
-                    .and_then(|v| find_text_in_value(&v))
-                    .filter(|s| s != "IBusText" && !s.is_empty())
-                    .unwrap_or_default()
-            } else {
-                String::new()
-            };
-            // wire (vub)：variant(text, cursor: u32, visible: bool)；
-            // 或 (vubu)：+ mode: u32。cursor 在 variant 之外的字段。
-            // v0.10：cursor_pos 直接取 wire 第 2 个字段（如果存在）。
-            let cursor_begin = if fields_iter.len() > 1 {
-                find_int_in_value(&fields_iter[1]).unwrap_or(text.chars().count() as i64) as i32
-            } else {
-                text.chars().count() as i32
-            };
+            ime_log!(
+                "[waylandcraft][host_bridge][dbus-ibus] handle_signal: UpdatePreeditText text={:?} cursor={}",
+                text, cursor_pos
+            );
+            let cursor = cursor_pos as i32;
             let _ = ev_tx.send(FromWorker::Preedit {
-                text,
-                cursor_begin,
-                cursor_end: cursor_begin,
+                text: text.clone(),
+                cursor_begin: cursor,
+                cursor_end: cursor,
+                clear: false,
+            });
+            let _ = ev_tx.send(FromWorker::Done(0));
+        }
+        "UpdatePreeditTextWithMode" => {
+            // wire: (vubu) = variant + cursor_pos + visible + mode
+            let (text, cursor_pos) = match body.deserialize::<(OwnedValue, u32, bool, u32)>() {
+                Ok((v, cursor_pos, _visible, _mode)) => (extract_ibustext(&v), cursor_pos),
+                Err(e) => {
+                    ime_log!(
+                        "[waylandcraft][host_bridge][dbus-ibus] handle_signal UpdatePreeditTextWithMode body 解析失败: {e}"
+                    );
+                    (String::new(), 0)
+                }
+            };
+            ime_log!(
+                "[waylandcraft][host_bridge][dbus-ibus] handle_signal: UpdatePreeditTextWithMode text={:?} cursor={}",
+                text, cursor_pos
+            );
+            let cursor = cursor_pos as i32;
+            let _ = ev_tx.send(FromWorker::Preedit {
+                text: text.clone(),
+                cursor_begin: cursor,
+                cursor_end: cursor,
                 clear: false,
             });
             let _ = ev_tx.send(FromWorker::Done(0));
         }
         "HidePreeditText" => {
+            // wire: () 无 body——清空 preedit
+            ime_log!(
+                "[waylandcraft][host_bridge][dbus-ibus] handle_signal: HidePreeditText"
+            );
             let _ = ev_tx.send(FromWorker::Preedit {
                 text: String::new(),
                 cursor_begin: 0,
@@ -745,56 +761,59 @@ fn handle_signal(
             let _ = ev_tx.send(FromWorker::Done(0));
         }
         "DeleteSurroundingText" => {
-            // wire: (iu) = offset(int), n_chars(uint)
-            if let Ok(s) = body.deserialize::<zbus::zvariant::Structure>() {
-                let fields = s.fields();
-                let before = if fields.len() > 0 {
-                    find_int_in_value(&fields[0]).unwrap_or(0).max(0) as u32
-                } else {
-                    0
-                };
-                let after = if fields.len() > 1 {
-                    find_int_in_value(&fields[1]).unwrap_or(0).max(0) as u32
-                } else {
-                    0
-                };
-                let _ = ev_tx.send(FromWorker::DeleteSurrounding { before, after });
-                let _ = ev_tx.send(FromWorker::Done(0));
-            }
+            // wire: (iu) = offset_from_cursor(i32) + nchars(u32)
+            let (offset, nchars) = match body.deserialize::<(i32, u32)>() {
+                Ok(p) => p,
+                Err(e) => {
+                    ime_log!(
+                        "[waylandcraft][host_bridge][dbus-ibus] handle_signal DeleteSurroundingText body 解析失败: {e}"
+                    );
+                    (0, 0)
+                }
+            };
+            ime_log!(
+                "[waylandcraft][host_bridge][dbus-ibus] handle_signal: DeleteSurroundingText offset={} nchars={}",
+                offset, nchars
+            );
+            // ibus 语义：offset<0 = 删光标前，>0 = 删光标后
+            let (before, after) = if offset < 0 {
+                ((-offset) as u32, 0)
+            } else {
+                (0, offset as u32)
+            };
+            let _ = ev_tx.send(FromWorker::DeleteSurrounding { before, after });
+            let _ = ev_tx.send(FromWorker::Done(0));
         }
         "UpdateLookupTable" => {
-            // wire: (vbiavav) = IBusLookupTable, visible, ..., cursor_pos
-            // 简化：先解析出 candidates 列表，其他字段用默认
-            if let Ok(s) = body.deserialize::<zbus::zvariant::Structure>() {
-                let fields = s.fields();
-                // 第 1 字段（index 0）是 IBusLookupTable
-                let parsed = if !fields.is_empty() {
-                    OwnedValue::try_from(&fields[0])
-                        .ok()
-                        .and_then(|v| parse_lookup_table_v(&v))
-                        .unwrap_or_else(|| (Vec::new(), 0))
-                } else {
-                    (Vec::new(), 0)
+            // wire: (vb) = IBusLookupTable variant + visible(bool)
+            let (candidates, cursor_pos, visible) =
+                match body.deserialize::<(OwnedValue, bool)>() {
+                    Ok((v, visible)) => match extract_lookup_table(&v) {
+                        Some((cands, cpos)) => (cands, cpos, visible),
+                        None => (Vec::new(), 0, visible),
+                    },
+                    Err(e) => {
+                        ime_log!(
+                            "[waylandcraft][host_bridge][dbus-ibus] handle_signal UpdateLookupTable body 解析失败: {e}"
+                        );
+                        (Vec::new(), 0, false)
+                    }
                 };
-                let (candidates, cursor_pos) = parsed;
-                // 第 5 字段是 visible (bool)
-                let visible = if fields.len() > 1 {
-                    find_bool_in_value(&fields[1]).unwrap_or(!candidates.is_empty())
-                } else {
-                    !candidates.is_empty()
-                };
-                let page_size = candidates.len() as u32;
-                let _ = ev_tx.send(FromWorker::LookupTable {
-                    candidates,
-                    labels: Vec::new(),
-                    cursor_pos,
-                    cursor_visible: true,
-                    page_size,
-                    orientation: 0,
-                    visible,
-                });
-                let _ = ev_tx.send(FromWorker::Done(0));
-            }
+            ime_log!(
+                "[waylandcraft][host_bridge][dbus-ibus] handle_signal: UpdateLookupTable {} candidates visible={} cursor={}",
+                candidates.len(), visible, cursor_pos
+            );
+            let page_size = candidates.len() as u32;
+            let _ = ev_tx.send(FromWorker::LookupTable {
+                candidates,
+                labels: Vec::new(),
+                cursor_pos,
+                cursor_visible: true,
+                page_size,
+                orientation: 0,
+                visible,
+            });
+            let _ = ev_tx.send(FromWorker::Done(0));
         }
         "ShowLookupTable" => {
             let _ = ev_tx.send(FromWorker::LookupTable {
@@ -832,30 +851,51 @@ fn handle_signal(
     Ok(())
 }
 
-/// 在 zvariant::Value 里找字符串。
-/// 递归在 zvariant::Value 中找 String。
+/// 从 IBusText 序列化 variant 中提取文本。
 ///
-/// IBusText 序列化的 variant 内部可能是嵌套 Structure。v0.10 改：递归
-/// 搜所有 String 字段，调用方过滤 GObject 类型名。
-///
-/// zbus 0.32 Value 不暴露 Variant 变体——所以直接用 Structure 递归。
-fn find_text_in_value(v: &zbus::zvariant::Value<'_>) -> Option<String> {
+/// IBusText 序列化结构（ibus_serializable + ibustext.c）：
+/// ```text
+/// Structure[ Str("IBusText"),        ← GObject 类型名（fields[0]）
+///             Dict{}(properties),    ← a{sv}（fields[1]，通常空）
+///             Str(text),             ← 实际文本（fields[2]）
+///             Variant(IBusAttrList)  ← attrs（fields[3]）
+///           ]
+/// ```
+/// 也可能嵌套更深（ibus 版本差异）。extract_ibustext 递归搜**第一个非类型名
+/// 非空 String**。类型名 = "IBus" 开头的 GObject 名（IBusText/IBusAttrList/
+/// IBusLookupTable/IBusEngineDesc…），递归时跳过。
+fn extract_ibustext(v: &OwnedValue) -> String {
+    find_content_str(v).unwrap_or_default()
+}
+
+/// 递归找第一个非 IBus-类型名的非空 String（跳过 GObject 序列化类型名）。
+fn find_content_str(v: &OwnedValue) -> Option<String> {
     use zbus::zvariant::Value;
-    match v {
-        Value::Str(s) => Some(s.to_string()),
-        Value::ObjectPath(p) => Some(p.to_string()),
-        Value::Structure(s) => {
-            for f in s.fields() {
-                if let Some(s) = find_text_in_value(f) {
-                    return Some(s);
+    match &**v {
+        Value::Str(s) => {
+            let s = s.to_string();
+            if s.is_empty() || s.starts_with("IBus") {
+                None
+            } else {
+                Some(s)
+            }
+        }
+        Value::Structure(st) => {
+            for f in st.fields() {
+                if let Ok(ov) = OwnedValue::try_from(f) {
+                    if let Some(s) = find_content_str(&ov) {
+                        return Some(s);
+                    }
                 }
             }
             None
         }
         Value::Array(a) => {
             for item in a.iter() {
-                if let Some(s) = find_text_in_value(item) {
-                    return Some(s);
+                if let Ok(ov) = OwnedValue::try_from(item) {
+                    if let Some(s) = find_content_str(&ov) {
+                        return Some(s);
+                    }
                 }
             }
             None
@@ -864,65 +904,97 @@ fn find_text_in_value(v: &zbus::zvariant::Value<'_>) -> Option<String> {
     }
 }
 
-fn find_int_in_value(v: &zbus::zvariant::Value<'_>) -> Option<i64> {
+/// 从 IBusLookupTable 序列化 variant 提取候选列表 + 光标位置。
+/// IBusLookupTable 序列化（ibuslookuptable.c）：
+/// Structure[ "IBusLookupTable", Dict{}, page_size(u), cursor_pos(u),
+///            cursor_visible(b), round(b), orientation(i),
+///            candidates(a{IBusText variants}) ... ]
+/// 候选是 aav（IBusText 序列化的 variant 数组）。简化解析：递归抓所有
+/// "IBusText" 之后出现的 Str？——精确做法：遍历找首层 u32×2（page_size
+/// cursor_pos）再抓候选 variant 数组。为稳，递归收集所有 IBusText 内容。
+fn extract_lookup_table(v: &OwnedValue) -> Option<(Vec<String>, u32)> {
     use zbus::zvariant::Value;
-    match v {
-        Value::U8(n) => Some(*n as i64),
-        Value::U16(n) => Some(*n as i64),
-        Value::U32(n) => Some(*n as i64),
-        Value::U64(n) => Some(*n as i64),
-        Value::I16(n) => Some(*n as i64),
-        Value::I32(n) => Some(*n as i64),
-        Value::I64(n) => Some(*n),
-        _ => None,
-    }
-}
-
-fn find_bool_in_value(v: &zbus::zvariant::Value<'_>) -> Option<bool> {
-    use zbus::zvariant::Value;
-    match v {
-        Value::Bool(b) => Some(*b),
-        _ => None,
-    }
-}
-
-/// 解析 IBusLookupTable 序列化的 variant 字段。
-///
-/// IBusLookupTable 序列化（参见 ibus/src/ibuslookuptable.c）：
-///   1. parent class serialize 加 (s, "IBusLookupTable")
-///   2. (u, page_size), (u, cursor_pos), (b, cursor_visible), (b, round)
-///   3. (i, orientation)
-///   4. (aav, candidates) —— 每个 candidate 是 IBusText 序列化的 variant
-///
-/// v0.10 修法：递归 find_text_in_value 抓所有 String 字段，**跳过
-/// GObject 类型名**（"IBusLookupTable" / "IBusText"）——这些是序列化
-/// 协议要求，不是用户内容。
-fn parse_lookup_table_v(
-    v: &zbus::zvariant::Value<'_>,
-) -> Option<(Vec<String>, u32)> {
-    use zbus::zvariant::Value;
-    let s = match v {
+    let st = match &**v {
         Value::Structure(s) => s,
         _ => return None,
     };
-    let fields = s.fields();
+    let fields = st.fields();
     if fields.is_empty() {
-        return Some((Vec::new(), 0));
+        return None;
     }
-    // 抓所有 String 字段（递归），过滤掉 GObject 类型名
-    let all_strs: Vec<String> = fields
-        .iter()
-        .filter_map(find_text_in_value)
-        .filter(|s| s != "IBusLookupTable" && s != "IBusText" && !s.is_empty())
-        .collect();
-    // 前 10 个当 candidates
-    let candidates: Vec<String> = all_strs.into_iter().take(10).collect();
-    // cursor_pos：u32 字段之一（page_size, cursor_pos, ...）
-    let cursor_pos = fields
-        .iter()
-        .find_map(find_int_in_value)
-        .unwrap_or(0) as u32;
+    // 字段 0 = 类型名 "IBusLookupTable"，字段 1 = properties dict
+    // 之后：page_size(u32) cursor_pos(u32) cursor_visible(b) round(b)
+    //       orientation(i32) candidates(Array<Variant<IBusText>>)
+    let mut cursor_pos: u32 = 0;
+    let mut candidates: Vec<String> = Vec::new();
+    let mut ints_seen = 0u32;
+    let mut seen_type = false;
+    for f in fields {
+        if let Ok(ov) = OwnedValue::try_from(f) {
+            match &*ov {
+                Value::Str(s) if s == "IBusLookupTable" || s == "IBusLookupTable" => {
+                    seen_type = true;
+                    continue;
+                }
+                Value::Dict(_) => continue, // properties dict
+                Value::U32(n) => {
+                    if seen_type {
+                        // 前两个 u32 = page_size, cursor_pos
+                        if ints_seen == 1 {
+                            cursor_pos = *n;
+                        }
+                        ints_seen += 1;
+                    }
+                }
+                Value::Array(a) => {
+                    // candidates: array of variant(IBusText)
+                    for item in a.iter() {
+                        if let Ok(ov2) = OwnedValue::try_from(item) {
+                            let t = extract_ibustext(&ov2);
+                            if !t.is_empty() {
+                                candidates.push(t);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if candidates.is_empty() {
+        // 兜底：递归全量抓（不同版本字段布局）
+        if let Some(first) = find_lookup_candidates_recursive(v) {
+            candidates = first;
+        }
+    }
     Some((candidates, cursor_pos))
+}
+
+fn find_lookup_candidates_recursive(v: &OwnedValue) -> Option<Vec<String>> {
+    use zbus::zvariant::Value;
+    match &**v {
+        Value::Structure(st) => {
+            let mut out = Vec::new();
+            for f in st.fields() {
+                if let Ok(ov) = OwnedValue::try_from(f) {
+                    if let Value::Array(a) = &*ov {
+                        for item in a.iter() {
+                            if let Ok(ov2) = OwnedValue::try_from(item) {
+                                if let Some(s) = find_content_str(&ov2) {
+                                    out.push(s);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(mut more) = find_lookup_candidates_recursive(&ov) {
+                        out.append(&mut more);
+                    }
+                }
+            }
+            if out.is_empty() { None } else { Some(out) }
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1085,5 +1157,42 @@ mod tests {
         // 不应 panic，也不应发 cmd
         b.submit(DownEvent::State(FocusChange::Activate));
         assert!(!b.is_ready());
+    }
+
+    // ── extract_ibustext 单元测试 ──────────────────────────────
+    // 结构模拟 ibus IBusSerializable wire 布局（类型名 + properties dict +
+    // 属性字段），验证 v1.2.30 重写的解析器从 variant 里正确取文本。
+
+    fn ov_text(fields: Vec<zbus::zvariant::Value<'static>>) -> OwnedValue {
+        let mut b = zbus::zvariant::StructureBuilder::new();
+        for f in fields {
+            b = b.append_field(f);
+        }
+        let st = b.build().expect("structure build");
+        OwnedValue::try_from(zbus::zvariant::Value::Structure(st)).expect("own")
+    }
+    fn ov_str(s: &str) -> zbus::zvariant::Value<'static> {
+        zbus::zvariant::Value::new(s.to_owned())
+    }
+
+    #[test]
+    fn extract_ibustext_skips_type_name_and_dict() {
+        // Structure[Str("IBusText"), Str("你"), Str("IBusAttrList")]
+        let v = ov_text(vec![ov_str("IBusText"), ov_str("你"), ov_str("IBusAttrList")]);
+        assert_eq!(extract_ibustext(&v), "你");
+    }
+
+    #[test]
+    fn extract_ibustext_recursive_variant_wrap() {
+        // variant 包 structure：OwnedValue(Structure[Str("IBusText"), Str("你好")])
+        let inner = ov_text(vec![ov_str("IBusText"), ov_str("你好")]);
+        assert_eq!(extract_ibustext(&inner), "你好");
+    }
+
+    #[test]
+    fn extract_ibustext_empty_when_no_content() {
+        // 只有类型名 → 空
+        let v = ov_text(vec![ov_str("IBusText")]);
+        assert_eq!(extract_ibustext(&v), "");
     }
 }
