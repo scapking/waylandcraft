@@ -314,7 +314,7 @@ public final class WaylandCraftCommand {
                                 .executes(WaylandCraftCommand::moveWindow)))))
                 .then(ClientCommands.literal("rotate").then(ClientCommands.argument("handle", StringArgumentType.word())
                     .then(ClientCommands.argument("angle", DoubleArgumentType.doubleArg())
-                        .executes(WaylandCraftCommand::rotateWindow)))
+                        .executes(WaylandCraftCommand::rotateWindow)))))
         );
     }
 
@@ -334,8 +334,29 @@ public final class WaylandCraftCommand {
                 .executes(WaylandCraftCommand::templateRemove)))
             .then(ClientCommands.literal("removep").then(ClientCommands.argument("name", StringArgumentType.word())
                 .executes(WaylandCraftCommand::templateRemovePermanent)));
+    }
 
 
+
+
+
+    /**
+     * /wl window focus <handle> —— 把桌面焦点切到指定窗口（需要窗口可见/存在）。
+     */
+    private static int focusWindow(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        String handleStr = StringArgumentType.getString(context, "handle");
+        WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
+        if(toplevel == null) return 0;
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null || wlc.bridge == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+            return 0;
+        }
+        wlc.bridge.focusSurface(toplevel);
+        source.sendFeedback(Component.literal("§a✔ Focused: §f" + getWindowDisplayName(toplevel) + "§r"));
+        return 1;
+    }
 
 
 private static int showHelp(CommandContext<FabricClientCommandSource> context) {
@@ -567,7 +588,7 @@ private static int showHelp(CommandContext<FabricClientCommandSource> context) {
         source.sendFeedback(Component.literal("§6 §lPortal Capture §r§7 Sessions §r"));
         source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
         if(wlc.captureManager.isCapturing()) {
-            source.sendFeedback(Component.literal(" §aActive: §e" + wlc.captureManager.activeSession.getNodeId()));
+            source.sendFeedback(Component.literal(" §aActive: §e" + wlc.captureManager.getActiveSession().getNodeId()));
         } else {
             source.sendFeedback(Component.literal(" §7No active portal capture session"));
         }
@@ -593,7 +614,7 @@ private static int showHelp(CommandContext<FabricClientCommandSource> context) {
     private static int capturePortalFrame(CommandContext<FabricClientCommandSource> context) {
         FabricClientCommandSource source = context.getSource();
         WaylandCraft wlc = WaylandCraft.instance;
-        if(wlc == null || wlc.captureManager == null || wlc.captureManager.activeSession == null) {
+        if(wlc == null || wlc.captureManager == null || wlc.captureManager.getActiveSession() == null) {
             source.sendError(Component.literal("§c✘ No active portal capture session"));
             return 0;
         }
@@ -675,6 +696,44 @@ private static int showHelp(CommandContext<FabricClientCommandSource> context) {
         source.sendFeedback(Component.literal("§a✔ Protocol switched to: §e" + protocol));
         return 1;
     }
+
+    /**
+     * /wl protocol list —— 列出可用捕获协议。
+     */
+    private static int protocolList(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        source.sendFeedback(Component.literal("§6 §lCapture Protocols§r"));
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        source.sendFeedback(Component.literal(" §ewayland§7 — Wayland 原生捕获（推荐）§r"));
+        source.sendFeedback(Component.literal(" §ex11§7 — X11 窗口捕获（xwayland-satellite）§r"));
+        source.sendFeedback(Component.literal(" §7切换: §e/wl protocol switch <wayland|x11>§r"));
+        return 1;
+    }
+
+    /**
+     * /wl protocol current —— 显示当前生效的捕获协议。
+     */
+    private static int protocolCurrent(CommandContext<FabricClientCommandSource> context) {
+        FabricClientCommandSource source = context.getSource();
+        WaylandCraft wlc = WaylandCraft.instance;
+        if(wlc == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+            return 0;
+        }
+        if (wlc.bridge == null) {
+            source.sendError(Component.literal("§c✘ WaylandCraft native bridge not available§r"));
+            return 0;
+        }
+        // 桌面捕获统一走 PipeWire(wayland)/xwayland 自动协商；当前主要通道为 wayland。
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        source.sendFeedback(Component.literal("§6 §lProtocol Availability§r"));
+        source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+        source.sendFeedback(Component.literal(" §ewayland§r: §a✔ 可用（native bridge 在线）§r"));
+        source.sendFeedback(Component.literal(" §ex11§r: §7xwayland-satellite（按需启动）§r"));
+        return 1;
+    }
+
 
     // Settings get/reset
     private static int getSetting(CommandContext<FabricClientCommandSource> context) {
@@ -2028,6 +2087,14 @@ private static int listWindows(CommandContext<FabricClientCommandSource> context
 		return 1;
 	}
 
+	private static int layoutEnable(CommandContext<FabricClientCommandSource> context) {
+		return setLayoutEnabled(context, true);
+	}
+
+	private static int layoutDisable(CommandContext<FabricClientCommandSource> context) {
+		return setLayoutEnabled(context, false);
+	}
+
 	private static int layoutOn(CommandContext<FabricClientCommandSource> context) {
 		return setLayoutEnabled(context, true);
 	}
@@ -2742,6 +2809,46 @@ private static int listWindows(CommandContext<FabricClientCommandSource> context
 		}
 	}
 
+	// ===== 音频捕获启停 =====
+
+	/**
+	 * /wl audio start <handle> —— 启动该窗口的音频捕获并转发。
+	 */
+	private static int audioStart(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		String handleStr = StringArgumentType.getString(context, "handle");
+		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
+		if(toplevel == null) return 0;
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.audioCaptureManager == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft audio capture not initialized§r"));
+			return 0;
+		}
+		long h = toplevel.getHandle();
+		boolean ok = wlc.audioCaptureManager.start(h, getWindowDisplayName(toplevel), toplevel.appID);
+		if(ok) {
+			source.sendFeedback(Component.literal("§a✔ 音频捕获已启动: §f" + getWindowDisplayName(toplevel) + "§r"));
+		} else {
+			source.sendError(Component.literal("§c✘ 音频捕获启动失败（可能已在运行或无音频流）§r"));
+		}
+		return ok ? 1 : 0;
+	}
+
+	/**
+	 * /wl audio stop —— 停止全部音频捕获转发。
+	 */
+	private static int audioStop(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.audioCaptureManager == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft audio capture not initialized§r"));
+			return 0;
+		}
+		wlc.audioCaptureManager.stop();
+		source.sendFeedback(Component.literal("§a✔ 音频捕获已停止§r"));
+		return 1;
+	}
+
 	// ===== 音频全链路状态 =====
 
 	private static int audioStatus(CommandContext<FabricClientCommandSource> context) {
@@ -2812,4 +2919,60 @@ private static int listWindows(CommandContext<FabricClientCommandSource> context
 		source.sendFeedback(Component.literal(" §7Rust 侧全链路日志文件: §ewaylandcraft-ime.log§r"));
 		return 1;
 	}
+
+	// ===== 调试命令（/wl debug <audio|video|ime|native|dump>）=====
+
+	private static int debugAudio(CommandContext<FabricClientCommandSource> context) {
+		return audioStatus(context);
+	}
+
+	private static int debugVideo(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.captureManager == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal("§6 §lVideo / Capture Debug§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		PipeWireCaptureManager.CaptureSession sess = wlc.captureManager.getActiveSession();
+		if(sess != null) {
+			source.sendFeedback(Component.literal(" §7Capture session: §eactive§r  nodeId=" + sess.getNodeId()));
+			source.sendFeedback(Component.literal(" §7isCapturing: §e" + wlc.captureManager.isCapturing() + "§r"));
+		} else {
+			source.sendFeedback(Component.literal(" §7Capture session: §7none§r"));
+		}
+		return 1;
+	}
+
+	private static int debugIme(CommandContext<FabricClientCommandSource> context) {
+		return imeDiagnostic(context);
+	}
+
+	private static int debugNative(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.bridge == null) {
+			source.sendError(Component.literal("§c✘ native bridge not available (Android/unsupported platform)§r"));
+			return 0;
+		}
+		String report = wlc.bridge.getStatusReport("client-command");
+		if(report == null || report.isEmpty()) {
+			source.sendError(Component.literal("§c✘ getStatusReport returned empty (native unavailable)§r"));
+			return 0;
+		}
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		source.sendFeedback(Component.literal("§6 §lNative Status§r"));
+		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
+		for(String line : report.split("\n")) {
+			source.sendFeedback(Component.literal(" §7" + line + "§r"));
+		}
+		return 1;
+	}
+
+	private static int debugDump(CommandContext<FabricClientCommandSource> context) {
+		return debugNative(context);
+	}
+
 }

@@ -6,6 +6,9 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.components.events.GuiEventListener;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * 焦点文本框光标矩形上报 —— 桌面候选窗锚点（防漂移核心）。
  *
@@ -22,6 +25,8 @@ import net.minecraft.client.gui.components.events.GuiEventListener;
  * 旧调用，但实际不产生效果。
  */
 public final class CursorRectReporter {
+
+	private static final Logger LOGGER = LoggerFactory.getLogger("waylandcraft-cursor");
 	private static int lastX = Integer.MIN_VALUE;
 	private static int lastY = Integer.MIN_VALUE;
 

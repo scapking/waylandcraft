@@ -63,7 +63,7 @@ public class SharedWindowClientHandler {
 				// 只播放已知窗口的声音（窗口列表里有才播放，避免脏包）
 				if(remoteWindows.containsKey(payload.windowHandle())) {
 					wlc.audioPlaybackManager.enqueue(
-						payload.windowHandle(), payload.sampleRate(), payload.channels(), payload.pcmData());
+						payload.windowHandle(), payload.seq(), payload.sampleRate(), payload.channels(), payload.pcmData());
 				}
 			}
 		});

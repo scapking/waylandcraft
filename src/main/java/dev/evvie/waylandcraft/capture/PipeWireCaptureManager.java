@@ -95,6 +95,12 @@ public class PipeWireCaptureManager {
 	}
 	
 	/**
+	 * 当前激活的捕获会话（可能为 null）。
+	 */
+	public CaptureSession getActiveSession() {
+		return activeSession;
+	}
+	/**
 	 * 当前是否有激活的捕获会话
 	 */
 	public boolean isCapturing() {

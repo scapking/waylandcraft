@@ -94,13 +94,15 @@ public final class McImeIntegration {
             // 强制整体注入 — 跳过 char-by-char（避免触发 IME 重新进入）
             eb.insertText(text);
         } else if (focused instanceof MultiLineEditBox mleb) {
-            mleb.insertText(text);
+            // MultiLineEditBox 无 insertText；整体替换为 现值+新文本（多行编辑器光标位置难拿，追加语义足够）
+            String cur = mleb.getValue();
+            mleb.setValue(cur == null ? text : cur + text);
         } else {
             // 通用 fallback — 用 charTyped 逐字符
             for (int i = 0; i < text.length(); ) {
                 int cp = text.codePointAt(i);
                 try {
-                    focused.charTyped(new CharacterEvent(mc, cp, 0));
+                    focused.charTyped(new CharacterEvent(cp));
                 } catch (Throwable ignored) {}
                 i += Character.charCount(cp);
             }
