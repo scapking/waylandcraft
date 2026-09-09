@@ -177,6 +177,16 @@ pub enum UpEvent {
     Commit(Commit),
     DeleteSurrounding(DeleteSurrounding),
     LookupTable(LookupTable),
+    /// 宿主 IME 明确不消费的按键（ibus ForwardKeyEvent）——应用应把该键
+    /// 作为普通输入转发给嵌套应用（GTK im module 同款机制）。
+    /// v1.2.32：key 只喂 IME（单路），不消费的键由本事件回传补发——
+    /// 避免双路模型"raw 字母先进文本框 + preedit 后到"的竞态错乱。
+    ForwardKey {
+        /// 提交给 IME 时的 keycode（x11 域 = Java scancode，seat.keyboard_key 直接可用）。
+        keycode: u32,
+        /// true = Release（state 带 IBUS_RELEASE_MASK）。
+        is_release: bool,
+    },
     Done(Done),
 }
 

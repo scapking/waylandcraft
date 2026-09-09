@@ -364,6 +364,9 @@ impl ImeState {
                 UpEvent::DeleteSurrounding(d) => {
                     last_delete = Some((d.before_length, d.after_length));
                 }
+                // v1.2.32：ForwardKey 由 lib.rs::update 直接转发 seat.keyboard_key，
+                // 不进入 ti3 preedit/commit 批（这里忽略）。
+                UpEvent::ForwardKey { .. } => {}
                 UpEvent::Done(_d) => {
                     APPLIED.with(|c| c.set(c.get() + 1));
                 }

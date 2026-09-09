@@ -483,10 +483,27 @@ impl<'a> WaylandCraft<'a> {
 
         // host_bridge 每帧 drain 上行事件（commit/preedit/delete/lookup），
         // 灌入 relay → 原子推到 firefox 等嵌套应用的 ti3 text_input。
-        if let Some(hb) = &mut self.state.host_bridge {
-            for batch in hb.take_up_events_batched() {
-                self.state.ime.apply_up_events(batch);
+        let host_batches: Vec<Vec<crate::ime::UpEvent>> = if let Some(hb) =
+            &mut self.state.host_bridge
+        {
+            hb.take_up_events_batched()
+        } else {
+            Vec::new()
+        };
+        for batch in host_batches {
+            // v1.2.32：ForwardKey（ibus 不消费的键）→ 直接补发 wl_keyboard
+            // 给嵌套应用（不经过 ti3 preedit/commit 批）。
+            for ev in &batch {
+                if let crate::ime::UpEvent::ForwardKey { keycode, is_release } = ev {
+                    let action = if *is_release {
+                        crate::seat::KeyboardAction::Release
+                    } else {
+                        crate::seat::KeyboardAction::Press
+                    };
+                    self.state.seat.keyboard_key(*keycode, action);
+                }
             }
+            self.state.ime.apply_up_events(batch);
         }
 
         // v0.13.6：每帧检查 satellite 是否还活着——死了自动 restart。

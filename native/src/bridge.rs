@@ -1562,18 +1562,16 @@ fn keyboard_input<'local>(
         .ime
         .handle_key(scancode as u32, action, mods);
 
-    // 2) v1.2.31 双路模型（对齐 GNOME/mutter 标准）：
-    //    - **raw key 永远转发给嵌套应用**（seat.keyboard_key → wl_keyboard.key，
-    //      chromium/GTK 端在无 preedit 时直接显示英文/标点——修"纯英文无法输入"）；
-    //    - **host_bridge 同步喂宿主 IME**（ibus 收同一按键，中文模式回 preedit/
-    //      commit → ti3 推回嵌套应用文本框）。
-    //    v0.11.0 的"完全吞键单路"是错误决定：consumed=false 的键既没进嵌套应用
-    //    也没产生 commit → 英文直接消失。v0.11.3 把 host_bridge 缺席时的
-    //    fallthrough 也删了 → 无 IME 时按键全丢。双路恢复两者。
-    //    注：嵌套应用若自身直连宿主 IME（X11 + GTK_IM_MODULE=ibus 的 firefox）
-    //    会双份收到按键——但那类应用走 XIM/satellite 路径，不是 ti3 client；
-    //    本函数只服务 wayland ti3 client（chromium/firefox-wayland），它们不
-    //    直连宿主 ibus，双路安全。
+    // 2) v1.2.32 单路模型（对齐 GTK im-ibus 真实语义）：
+    //    - key **只喂宿主 IME**（不直接发 wl_keyboard——v1.2.30 双路导致
+    //      "raw 字母先进文本框 + preedit 后到"竞态错乱：中文打拼音时文本框
+    //      先出现字母，候选/commit 后到叠加 → 文本与候选错位）；
+    //    - IME **不消费**的键由 ibus ForwardKeyEvent 信号回传 → UpEvent::
+    //      ForwardKey → lib.rs update() 补发 wl_keyboard（英文/标点/功能键
+    //      ——GTK im module 同款机制，无竞态，引擎判定后同步回传）；
+    //    - IME 消费的键 → preedit/commit 信号 → ti3 推文本框（中文干净）。
+    //    兜底：host_bridge 缺失/未就绪 / keysym=0（无 keysym 的键 IME 不会
+    //    消费）→ 直接 wl_keyboard 转发，按键不丢。
     if !handled {
         let keycode = scancode as u32;
         let keysym = instance
@@ -1582,12 +1580,14 @@ fn keyboard_input<'local>(
             .xkb_state
             .key_get_one_sym(xkbcommon::xkb::Keycode::new(keycode))
             .raw() as u32;
-        // raw key 转发嵌套应用（wl_keyboard）。kb_active=false（未绑定）时
-        // keyboard_key 内部丢弃——Java 只在绑定模式调 keyboardInput，语义不变。
-        instance.state.seat.keyboard_key(keycode, action);
-        // host_bridge 喂宿主 IME（存在且就绪时）。
-        if let Some(hb) = &mut instance.host_bridge {
-            if hb.is_ready() {
+        let hb_ready = instance
+            .host_bridge
+            .as_ref()
+            .map(|hb| hb.is_ready())
+            .unwrap_or(false);
+        if hb_ready && keysym != 0 {
+            // 单路：只给宿主 IME；消费与否由 ForwardKeyEvent/preedit/commit 决定。
+            if let Some(hb) = &mut instance.host_bridge {
                 use crate::ime::KeyEvent;
                 crate::bridge::ime_log_write(&format!(
                     "[waylandcraft][ime] bridge submit_key scancode={keycode} keysym={keysym:#x} action={action:?}"
@@ -1599,6 +1599,9 @@ fn keyboard_input<'local>(
                     mods,
                 }));
             }
+        } else {
+            // 无 host_bridge / 未就绪 / keysym=0：直接转发嵌套应用。
+            instance.state.seat.keyboard_key(keycode, action);
         }
         handled = true;
     }
@@ -1709,7 +1712,7 @@ fn native_version<'local>(
 /// 全部子系统状态（native lib / egl / wayland globals / host_bridge / ime /
 /// xwayland-satellite / audio / portal / ...），不必再切 4 个独立日志。
 ///
-/// v0.13.4 新增。mod_version 硬编码 "1.2.31"（与 gradle.properties 同步）；
+/// v0.13.4 新增。mod_version 硬编码 "1.2.32"（与 gradle.properties 同步）；
 /// v0.13.9 修：之前 v0.13.5/7/8 bump version 时忘记同步这里——导致 status.log
 /// 一直显示 "1.2.9"。后续 bump version 时记得改这里（+ gradle.properties）。
 fn get_status_report<'local>(
@@ -1725,7 +1728,7 @@ fn get_status_report<'local>(
     let report = crate::status::StatusReport::gather(
         &instance,
         thread_name,
-        "1.2.31", // mod_version — 与 waylandcraft/gradle.properties 同步
+        "1.2.32", // mod_version — 与 waylandcraft/gradle.properties 同步
     );
     Ok(env.new_string(report.to_json())?)
 }

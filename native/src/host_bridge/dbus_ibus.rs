@@ -130,6 +130,9 @@ pub(crate) enum FromWorker {
     /// 任意信号边界：mod 层用这个把同一批 commit/preedit/delete 一起发给 relay。
     /// batch_id 是诊断 ID（递增）。
     Done(u32),
+    /// ibus ForwardKeyEvent：引擎不消费的键（含 keycode，state 带 RELEASE_MASK
+    /// 表示释放）。v1.2.32：单路模型下靠它把"未消费键"补发给嵌套应用。
+    ForwardKey { keycode: u32, is_release: bool },
     Fatal(String),
 }
 
@@ -321,6 +324,9 @@ impl HostBridge for DbusIbusBridge {
                         orientation,
                         visible,
                     }));
+                }
+                Ok(FromWorker::ForwardKey { keycode, is_release }) => {
+                    out.push(UpEvent::ForwardKey { keycode, is_release });
                 }
                 Ok(FromWorker::Done(_)) => {
                     self.next_batch = self.next_batch.wrapping_add(1);
@@ -839,7 +845,27 @@ fn handle_signal(
             });
             let _ = ev_tx.send(FromWorker::Done(0));
         }
-        "ForwardKeyEvent" | "RequireSurroundingText" | "UpdateProperty" | "RegisterProperties"
+        "ForwardKeyEvent" => {
+            // wire: (uuu) = keyval(u32) + keycode(u32) + state(u32)
+            // 引擎不消费的键回传——应用把它作为普通输入转发给嵌套应用。
+            // state 带 IBUS_RELEASE_MASK (0x40000000) = release。
+            let (keyval, keycode, state) = match body.deserialize::<(u32, u32, u32)>() {
+                Ok(p) => p,
+                Err(e) => {
+                    ime_log!(
+                        "[waylandcraft][host_bridge][dbus-ibus] handle_signal ForwardKeyEvent body 解析失败: {e}"
+                    );
+                    return Ok(());
+                }
+            };
+            let is_release = state & 0x4000_0000 != 0;
+            ime_log!(
+                "[waylandcraft][host_bridge][dbus-ibus] handle_signal: ForwardKeyEvent keyval={keyval:#x} keycode={keycode} release={is_release} -> 补发嵌套应用"
+            );
+            let _ = ev_tx.send(FromWorker::ForwardKey { keycode, is_release });
+            // 不配 Done——ForwardKey 是独立事件，不参与 preedit/commit 批。
+        }
+        "RequireSurroundingText" | "UpdateProperty" | "RegisterProperties"
         | "Enabled" | "Disabled" => {
             // 不需要处理（mod 不拦截按键；RegisterProperties/UpdateProperty
             // 由 kimpanel 拉取，mod 不消费）
