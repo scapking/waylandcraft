@@ -507,43 +507,62 @@ fn command_loop(
                 // 数字也推进文本框（v1.2.33 实测："打字 + 1 候选数字"）。
                 // 正确判定：reply 后短暂等待引擎信号窗口，**有信号 = 引擎处理了
                 // （不补发）；无信号且 consumed=false = 真没处理（补发英文等）**。
-                let sig_before = sig_counter.load(std::sync::atomic::Ordering::Relaxed);
-                let call_result = ic_conns
-                    .ic
-                    .call::<_, _, bool>("ProcessKeyEvent", &(keysym, evdev, state));
+                // v1.2.35 修：**Release 键无条件补发**（不等引擎判定）——实测
+                // kb.prev 194 press vs 21 release：release 被引擎判定吞掉 →
+                // chromium 认为键一直按住 → 自动 repeat 疯狂删字（"输入法
+                // 不稳定"的一大来源）。release 对 chromium 是状态复位（防卡键），
+                // 必须 1:1 送达。引擎仍收到 release（状态复位），chromium 也
+                // 收到——双发无害（孤儿 release 会被 wl_keyboard 忽略）。
                 let is_release = state & 0x4000_0000 != 0;
-                match call_result {
-                    Ok(consumed) => {
-                        // 等信号线程处理引擎输出（本地 dbus 毫秒级；10ms 足够，
-                        // 人打字间隔 100ms+ 无感）。
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        let sig_after =
-                            sig_counter.load(std::sync::atomic::Ordering::Relaxed);
-                        let engine_produced_signal = sig_after != sig_before;
-                        ime_log!(
-                            "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent keysym={keysym:#x} evdev={evdev} state={state:#x} -> consumed={consumed} sig_delta={}",
-                            sig_after.saturating_sub(sig_before)
-                        );
-                        if !consumed && !engine_produced_signal {
+                if is_release {
+                    // 引擎仍收到 release（状态复位，如修饰键/组合状态），
+                    // 不等 reply 不 sleep；chromium 侧 1:1 补发防卡键。
+                    let _ = ic_conns
+                        .ic
+                        .call::<_, _, bool>("ProcessKeyEvent", &(keysym, evdev, state));
+                    let _ = ev_tx.send(FromWorker::ForwardKey {
+                        keycode,
+                        is_release: true,
+                    });
+                } else {
+                    let sig_before =
+                        sig_counter.load(std::sync::atomic::Ordering::Relaxed);
+                    let call_result = ic_conns
+                        .ic
+                        .call::<_, _, bool>("ProcessKeyEvent", &(keysym, evdev, state));
+                    match call_result {
+                        Ok(consumed) => {
+                            // 等信号线程处理引擎输出（本地 dbus 毫秒级；10ms
+                            // 足够，人打字间隔 100ms+ 无感）。
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            let sig_after =
+                                sig_counter.load(std::sync::atomic::Ordering::Relaxed);
+                            let engine_produced_signal = sig_after != sig_before;
                             ime_log!(
-                                "[waylandcraft][host_bridge][dbus-ibus] 引擎未消费且无信号 -> 补发嵌套应用 keycode={keycode} release={is_release}"
+                                "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent keysym={keysym:#x} evdev={evdev} state={state:#x} -> consumed={consumed} sig_delta={}",
+                                sig_after.saturating_sub(sig_before)
                             );
+                            if !consumed && !engine_produced_signal {
+                                ime_log!(
+                                    "[waylandcraft][host_bridge][dbus-ibus] 引擎未消费且无信号 -> 补发嵌套应用 keycode={keycode} release={is_release}"
+                                );
+                                let _ = ev_tx.send(FromWorker::ForwardKey {
+                                    keycode,
+                                    is_release,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            ime_log!(
+                                "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent 失败 keysym={keysym:#x} evdev={evdev} state={state:#x}: {e}"
+                            );
+                            // 调用失败：无法知道引擎是否消费——保守补发（宁可
+                            // 重复显示也不吞键）。
                             let _ = ev_tx.send(FromWorker::ForwardKey {
                                 keycode,
                                 is_release,
                             });
                         }
-                    }
-                    Err(e) => {
-                        ime_log!(
-                            "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent 失败 keysym={keysym:#x} evdev={evdev} state={state:#x}: {e}"
-                        );
-                        // 调用失败：无法知道引擎是否消费——保守补发（宁可重复
-                        // 显示也不吞键）。
-                        let _ = ev_tx.send(FromWorker::ForwardKey {
-                            keycode,
-                            is_release,
-                        });
                     }
                 }
                 Ok(())
