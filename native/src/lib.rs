@@ -76,9 +76,13 @@ pub(crate) struct WaylandCraft<'a> {
     pub egl: EGLHelper,
     pub xdg: XDGSpecHelper,
     /// 宿主 IME 桥接（dbus-ibus / dbus-fcitx5）。
-    /// 启动时探测一次；连接断开后由 update() 重建。
+    /// 启动时探测一次；失败后由 update() 定时重试（见 host_probe_retry_at）。
     /// 当前用途：C 方案 Layer 3 等待 XIM server 上线后启用。
     pub host_bridge: Option<crate::host_bridge::HostBridgeHandle>,
+    /// 最近一次 host_bridge probe 失败原因（诊断 /status 透出；成功时为 None）。
+    pub host_probe_error: Option<String>,
+    /// 下次自动重试 probe 的时刻（仅 Transient 失败才安排；Unsupported 不重试）。
+    pub host_probe_retry_at: Option<std::time::Instant>,
     /// 启动时间（v0.13.4 status.rs 用）。`Instant` 而非 `SystemTime`——
     /// 状态报告关心"uptime 秒数"，不关心 wall clock。
     pub start_time: std::time::Instant,
@@ -339,34 +343,37 @@ pub(crate) fn wlc_init(
     state.socket = socket.socket_name().to_os_string();
 
     // 系统桌面输入法穿透：按探测顺序选择宿主后端
-    // （wayland-ti3 → dbus-ibus → …）。全部不可用为结构性不支持（不再重试）；
-    // 暂时性失败（连接/总线问题）会在 update() 里自动重试。
-    let mut ime_ready = false;
-    // C 方案：探测宿主 IME daemon（dbus-ibus / dbus-fcitx5）。
-    // 启动成功仅记录日志——当前 firefox 通过 GdkIMContext 直通宿主，
-    // 不需要 mod 介入。XIM server 上线后 host_bridge 才真正被使用。
-    let host_bridge = match crate::host_bridge::probe() {
+    // （wayland-ti3 → dbus-ibus → …）。v0.13.8 修：Transient 失败（bus 未就绪 /
+    // portal 未激活等）不再永久放弃——记 host_probe_error 并安排 update() 定时
+    // 重试（host_probe_retry_at）；Unsupported（无 daemon / 协议不匹配）记录后
+    // 不重试（结构性缺失，重试无意义）。
+    let mut host_bridge = None;
+    let mut host_probe_error = None;
+    let mut host_probe_retry_at = None;
+    let host_probe_result = crate::host_bridge::probe();
+    match host_probe_result {
         crate::host_bridge::BridgeInit::Ready(b) => {
             eprintln!(
                 "[waylandcraft][host_bridge] OK -> {} (C 方案 Layer 3)",
                 b.name()
             );
-            ime_ready = true;
-            Some(crate::host_bridge::HostBridgeHandle::new(b))
+            host_bridge = Some(crate::host_bridge::HostBridgeHandle::new(b));
         }
         crate::host_bridge::BridgeInit::Transient(msg) => {
             eprintln!(
-                "[waylandcraft][host_bridge] TRANSIENT: {msg}（无宿主 IME daemon；XIM server 上线后将不可用）"
+                "[waylandcraft][host_bridge] TRANSIENT: {msg}（安排 2s 后自动重试）"
             );
-            None
+            host_probe_error = Some(format!("transient: {msg}"));
+            host_probe_retry_at =
+                Some(std::time::Instant::now() + Duration::from_secs(2));
         }
         crate::host_bridge::BridgeInit::Unsupported(msg) => {
             eprintln!(
-                "[waylandcraft][host_bridge] UNSUPPORTED: {msg}（无 ibus/fcitx5 守护进程）"
+                "[waylandcraft][host_bridge] UNSUPPORTED: {msg}（无 ibus/fcitx5 守护进程；不再重试）"
             );
-            None
+            host_probe_error = Some(format!("unsupported: {msg}"));
         }
-    };
+    }
 
     // Start xwayland-satellite to provide an X11 display for X11-only apps
     match satellite::start_satellite(&state.socket) {
@@ -405,8 +412,6 @@ pub(crate) fn wlc_init(
 
     let xdg = XDGSpecHelper::init();
 
-    let _ = ime_ready; // 抑制 unused warning；未来 XIM server/im1 global 加回时用
-
     let instance = WaylandCraft {
         state,
         event_loop,
@@ -414,6 +419,8 @@ pub(crate) fn wlc_init(
         egl,
         xdg,
         host_bridge,
+        host_probe_error,
+        host_probe_retry_at,
         start_time: std::time::Instant::now(),
     };
     Ok(instance)
@@ -432,6 +439,41 @@ impl<'a> WaylandCraft<'a> {
         let hb = self.host_bridge.take();
         if hb.is_some() {
             self.state.host_bridge = hb;
+        } else {
+            // v0.13.8：Transient probe 失败自动重试（注释承诺了但从未实现——
+            // 之前 wlc_init 一次性探测失败就永久 None，ibus 晚于 MC 就绪时
+            // 整条 IME 链路永远断）。成功或 Unsupported 后不再重试。
+            if let Some(at) = self.host_probe_retry_at {
+                if std::time::Instant::now() >= at {
+                    self.host_probe_retry_at = None;
+                    match crate::host_bridge::probe() {
+                        crate::host_bridge::BridgeInit::Ready(b) => {
+                            eprintln!(
+                                "[waylandcraft][host_bridge] retry OK -> {}",
+                                b.name()
+                            );
+                            self.host_probe_error = None;
+                            self.state.host_bridge =
+                                Some(crate::host_bridge::HostBridgeHandle::new(b));
+                        }
+                        crate::host_bridge::BridgeInit::Transient(msg) => {
+                            eprintln!(
+                                "[waylandcraft][host_bridge] retry TRANSIENT: {msg}（2s 后再试）"
+                            );
+                            self.host_probe_error = Some(format!("transient: {msg}"));
+                            self.host_probe_retry_at = Some(
+                                std::time::Instant::now() + Duration::from_secs(2),
+                            );
+                        }
+                        crate::host_bridge::BridgeInit::Unsupported(msg) => {
+                            eprintln!(
+                                "[waylandcraft][host_bridge] retry UNSUPPORTED: {msg}（放弃）"
+                            );
+                            self.host_probe_error = Some(format!("unsupported: {msg}"));
+                        }
+                    }
+                }
+            }
         }
 
         // 嵌套合成器更新：嵌套应用通过原生 IME 协议（XIM / im2 / im1）
@@ -465,6 +507,20 @@ impl<'a> WaylandCraft<'a> {
 
         // dispatch 后把 host_bridge 取回 self.host_bridge（避免下一帧重复 take）
         self.host_bridge = state.host_bridge.take();
+    }
+
+    /// 完整输入法故障链诊断（v0.11.0+；Java 端 `/wl ime diagnostic` 调用）。
+    ///
+    /// v0.13.8 修：host_bridge handle 从这里传（dispatch 外它在 self 上，
+    /// 不在 state 上——之前读 state.host_bridge 恒 None，后端 Ready 也被误报
+    /// FAIL）；probe 失败原因（host_probe_error）一并透出。
+    pub fn run_diagnostic(&self) -> String {
+        crate::diagnostic::DiagnosticReport::run(
+            &self.state,
+            self.host_bridge.as_ref(),
+            self.host_probe_error.as_deref(),
+        )
+        .render()
     }
 }
 

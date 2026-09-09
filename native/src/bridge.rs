@@ -1809,7 +1809,9 @@ fn run_ime_diagnostic<'local>(
     instance: jlong,
 ) -> Result<JString<'local>, BridgeError> {
     let instance = jptr_to_instance!(instance, "runImeDiagnostic")?;
-    let report = instance.state.run_diagnostic();
+    // v0.13.8：走 instance.run_diagnostic()——诊断需要 instance 上的
+    // host_bridge handle（dispatch 外不在 state 上）+ probe 失败原因。
+    let report = instance.run_diagnostic();
     env.new_string(report).map_err(BridgeError::JniError)
 }
 

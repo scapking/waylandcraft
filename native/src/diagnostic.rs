@@ -110,14 +110,21 @@ impl DiagnosticReport {
     /// 9. preedit
     /// 10. commit
     /// 11. application received
-    pub fn run(state: &WLCState) -> Self {
+    /// `host_bridge`: 真实句柄（dispatch 外它在 `WaylandCraft.host_bridge`，
+    /// 不在 `WLCState` 上——调用方必须从 instance 取，否则恒 None 假警报）。
+    /// `probe_error`: host_bridge::probe() 失败时的具体原因（ime.log 摘要）。
+    pub fn run(
+        state: &WLCState,
+        host_bridge: Option<&HostBridgeHandle>,
+        probe_error: Option<&str>,
+    ) -> Self {
         let mut checks = Vec::new();
         Self::check_environment(&mut checks);
         Self::check_wayland(&mut checks);
         Self::check_dbus(&mut checks);
         Self::check_ibus_daemon(&mut checks);
         Self::check_ibus_engine(&mut checks);
-        Self::check_input_context(state, &mut checks);
+        Self::check_input_context(host_bridge, probe_error, &mut checks);
         Self::check_focus(state, &mut checks);
         Self::check_surrounding(&mut checks);
         Self::check_preedit(&mut checks);
@@ -270,8 +277,16 @@ impl DiagnosticReport {
     }
 
     /// 6. input context（host_bridge 状态）
-    fn check_input_context(state: &WLCState, out: &mut Vec<DiagnosticCheck>) {
-        match &state.host_bridge {
+    ///
+    /// v0.13.8 修：handle 由调用方从 `WaylandCraft.host_bridge` 传入——
+    /// 之前从 `state.host_bridge` 读，但 dispatch 外该字段恒 None（句柄在
+    /// instance 上），导致已 Ready 的后端被误报 FAIL。
+    fn check_input_context(
+        host_bridge: Option<&HostBridgeHandle>,
+        probe_error: Option<&str>,
+        out: &mut Vec<DiagnosticCheck>,
+    ) {
+        match host_bridge {
             Some(hb) if hb.is_ready() => {
                 out.push(DiagnosticCheck::pass(
                     "input_context",
@@ -287,11 +302,22 @@ impl DiagnosticReport {
                 ));
             }
             None => {
+                // 透出 probe() 的真实失败原因（原文案是硬编码推测，误导排查）。
+                let (rc, sug) = match probe_error {
+                    Some(e) if !e.is_empty() => (
+                        format!("host_bridge::probe() 失败: {e}"),
+                        "按错误信息处理；若为 'no owner' 且 ibus 已启动，等自动重试或手动重进游戏".to_string(),
+                    ),
+                    _ => (
+                        "host_bridge::probe() 失败——没找到 ibus/fcitx5 daemon".to_string(),
+                        "启动 ibus-daemon / fcitx5 / 检查 DBUS_SESSION_BUS_ADDRESS".to_string(),
+                    ),
+                };
                 out.push(DiagnosticCheck::fail(
                     "input_context",
                     "host_bridge 是 None".to_string(),
-                    "host_bridge::probe() 失败——没找到 ibus/fcitx5 daemon",
-                    "启动 ibus-daemon / fcitx5 / 检查 DBUS_SESSION_BUS_ADDRESS",
+                    rc,
+                    sug,
                 ));
             }
         }
@@ -384,12 +410,5 @@ impl DiagnosticReport {
             let _ = writeln!(out, "  7. application       → 检查 Java 端 'firefox.commit_received' 事件");
         }
         out
-    }
-}
-
-impl WLCState {
-    /// 跑诊断（自动检查整个 IME 故障链）。
-    pub fn run_diagnostic(&self) -> String {
-        DiagnosticReport::run(self).render()
     }
 }

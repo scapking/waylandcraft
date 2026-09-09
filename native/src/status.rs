@@ -109,7 +109,13 @@ impl StatusReport {
         ));
 
         // ── host_bridge ──────────────────────────────────────────
-        match &wc.state.host_bridge {
+        // v0.13.8：dispatch 外句柄在 wc.host_bridge（不在 state 上）——
+        // 只读 state.host_bridge 会误报 None。两处都查。
+        let hb_opt = wc
+            .host_bridge
+            .as_ref()
+            .or_else(|| wc.state.host_bridge.as_ref());
+        match hb_opt {
             Some(hb) => {
                 if hb.is_ready() {
                     subsystems.push((
@@ -129,9 +135,13 @@ impl StatusReport {
                 }
             }
             None => {
+                let detail = wc
+                    .host_probe_error
+                    .as_deref()
+                    .unwrap_or("ibus/fcitx5 not bridged");
                 subsystems.push((
                     "host_bridge",
-                    SubEntry::error("host_bridge = None; ibus/fcitx5 not bridged"),
+                    SubEntry::error(format!("host_bridge = None; {detail}")),
                 ));
             }
         }

@@ -520,7 +520,45 @@ fn probe_service_owner(
     match reply {
         Ok((true,)) => Ok(()),
         Ok((false,)) => {
-            Err(BridgeInit::Unsupported(format!("{name}: no owner")))
+            // v0.13.8 修：no owner 不再直接 Unsupported（=永久放弃）。
+            // `org.freedesktop.portal.IBus` 是 D-Bus activation 服务——MC 启动
+            // 早于 portal 被拉起时 NameHasOwner 是 false，但稍后 ibus-daemon /
+            // xdg-desktop-portal 会激活它。对目标 name 发一次 Ping（method call
+            // 到 well-known name 会触发 activation），再复查。
+            ime_log!(
+                "[waylandcraft][host_bridge][dbus-ibus] {name} 暂无 owner —— Ping 触发 D-Bus activation 后复查"
+            );
+            let ping_proxy = Proxy::new(
+                conn,
+                name,
+                "/org/freedesktop/IBus",
+                "org.freedesktop.DBus.Peer",
+            )
+            .map_err(|e| {
+                BridgeInit::Transient(format!("{name} activation ping proxy: {e}"))
+            })?;
+            if let Err(e) = ping_proxy.call::<_, _, ()>("Ping", &()) {
+                let msg = e.to_string();
+                // ServiceUnknown = 系统里根本没有该 .service 文件 → 结构性缺失
+                if msg.contains("ServiceUnknown") || msg.contains("NameHasNoOwner") {
+                    return Err(BridgeInit::Unsupported(format!(
+                        "{name}: no owner 且无 activation service（{msg}）"
+                    )));
+                }
+                // 激活排队 / 超时 / 权限等 → 暂时性，交给上层定时重试
+                return Err(BridgeInit::Transient(format!(
+                    "{name}: activation pending（{msg}）"
+                )));
+            }
+            // Ping 成功（服务已被激活）→ 复查 owner
+            let reply2: Result<(bool,), _> = proxy.call("NameHasOwner", &(name,));
+            match reply2 {
+                Ok((true,)) => Ok(()),
+                Ok((false,)) => Err(BridgeInit::Transient(format!(
+                    "{name}: Ping 成功但尚无 owner（刚激活，稍后重试）"
+                ))),
+                Err(e) => Err(BridgeInit::Transient(format!("{name}: recheck {e}"))),
+            }
         }
         Err(e) => Err(BridgeInit::Transient(format!("{name}: {e}"))),
     }
