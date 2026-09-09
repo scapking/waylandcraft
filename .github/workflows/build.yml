@@ -347,6 +347,12 @@ jobs:
         # entry's failure does not block the others — they all run and
         # JDK 21 just reports failure.
         java: ['21', '25']
+        # Temurin publishes no Windows arm64 JDK 25 (latest is 23), so
+        # windows-11-arm can only build with JDK 21. Keep the pairing out
+        # of the matrix instead of failing every run.
+        exclude:
+          - os: windows-11-arm
+            java: '25'
     name: build (${{ matrix.os }}, jdk${{ matrix.java }})
     runs-on: ${{ matrix.os }}
     steps:
@@ -368,6 +374,7 @@ jobs:
         ls -la native-libs/
         ls -la native-libs/deps/ || true
         file native-libs/*.so native-libs/deps/*.so || true
+      shell: bash
     - if: matrix.java == '25'
       name: Set up JDK ${{ matrix.java }}
       uses: actions/setup-java@v5
@@ -379,7 +386,12 @@ jobs:
       uses: gradle/actions/setup-gradle@v6
     - if: matrix.java == '25'
       name: Build java code (universal)
-      run: ./gradlew build
+      # Mirror scapking/RenderCraft's build.yml: run gradle under bash
+      # explicitly (Windows runners default to pwsh, where a bare
+      # ./gradlew silently no-ops), and pass --no-daemon --console=plain
+      # so the build exits cleanly on every hosted runner.
+      run: ./gradlew build --no-daemon --console=plain
+      shell: bash
     # Jar content verification on ubuntu only: the universal jar payload is
     # identical across the matrix (native libs are merged into it on every OS),
     # and ubuntu-24.04 is guaranteed to have python3. Windows-arm hosted
@@ -387,6 +399,7 @@ jobs:
     - if: matrix.java == '25' && matrix.os == 'ubuntu-24.04'
       name: Verify jar contents
       run: python3 scripts/verify_jar.py universal
+      shell: bash
     - if: matrix.java == '25'
       name: Upload jar artifact
       uses: actions/upload-artifact@v7
