@@ -459,8 +459,7 @@ pub fn get_audio_capture_status() -> String {
             Some(e) => format!("\"{}\"", e.replace('"', "'")),
             None => "null".to_string(),
         }
-    ),
-
+    )
 }
 
 /// 返回音频缓冲状态（JSON 字符串），供 Java /wl audio buffer 查询。
