@@ -1562,63 +1562,47 @@ fn keyboard_input<'local>(
         .ime
         .handle_key(scancode as u32, action, mods);
 
-    // 2) C 方案：host_bridge 接嵌套应用键盘事件，转发到宿主 dbus-ibus/dbus-fcitx5。
-    //    关键：嵌套应用（firefox/gnome-terminal）**不**用 GdkIMContext 直通——
-    //    mod 接管键盘，host_bridge 触发宿主引擎，commit/preedit 由 mod 通过 ti3
-    //    推到 firefox 文本框。这样**双客户端冲突消失**。
-    //
-    //    firefox 自己的 GdkIMContext 路径仍然可用（firefox 仍连宿主 ibus），
-    //    但**只在 host_bridge 没接管时**生效——目前 host_bridge 永远接管，
-    //    所以 firefox GdkIMContext 实际上**收不到键盘**。
+    // 2) v1.2.30 双路模型（对齐 GNOME/mutter 标准）：
+    //    - **raw key 永远转发给嵌套应用**（seat.keyboard_key → wl_keyboard.key，
+    //      chromium/GTK 端在无 preedit 时直接显示英文/标点——修"纯英文无法输入"）；
+    //    - **host_bridge 同步喂宿主 IME**（ibus 收同一按键，中文模式回 preedit/
+    //      commit → ti3 推回嵌套应用文本框）。
+    //    v0.11.0 的"完全吞键单路"是错误决定：consumed=false 的键既没进嵌套应用
+    //    也没产生 commit → 英文直接消失。v0.11.3 把 host_bridge 缺席时的
+    //    fallthrough 也删了 → 无 IME 时按键全丢。双路恢复两者。
+    //    注：嵌套应用若自身直连宿主 IME（X11 + GTK_IM_MODULE=ibus 的 firefox）
+    //    会双份收到按键——但那类应用走 XIM/satellite 路径，不是 ti3 client；
+    //    本函数只服务 wayland ti3 client（chromium/firefox-wayland），它们不
+    //    直连宿主 ibus，双路安全。
     if !handled {
+        let keycode = scancode as u32;
+        let keysym = instance
+            .state
+            .seat
+            .xkb_state
+            .key_get_one_sym(xkbcommon::xkb::Keycode::new(keycode))
+            .raw() as u32;
+        // raw key 转发嵌套应用（wl_keyboard）。kb_active=false（未绑定）时
+        // keyboard_key 内部丢弃——Java 只在绑定模式调 keyboardInput，语义不变。
+        instance.state.seat.keyboard_key(keycode, action);
+        // host_bridge 喂宿主 IME（存在且就绪时）。
         if let Some(hb) = &mut instance.host_bridge {
             if hb.is_ready() {
-                use crate::ime::{KeyEvent};
-                use crate::seat::KeyboardAction as KA;
-                // v0.11.0：mod 接管键盘（仅 mod 转发给宿主 ibus）。
-                // 删 v0.9.43-v0.10.2 的双路（seat.keyboard_key）——**双路**
-                // 导致 firefox GdkIMContext 与 mod 独立工作：
-                //   - 字母键到窗口（Path B：firefox GdkIMContext）
-                //   - 拼音+数字到窗口（Path B 主导）
-                //   - 偶尔 commit 进（Path A：mod ti3 推）
-                // v0.11 删 Path B：mod 完全吞键——firefox 不再收到 raw key——
-                // firefox 自己的 GdkIMContext 不工作——**只有** mod 通过 ti3 推
-                // commit 文本到 firefox 文本框。
-                // 候选窗由宿主 ibus kimpanel 显示（独立窗口，不嵌入 firefox）。
-                match action {
-                    KA::Press | KA::Repeat | KA::Release => {
-                        let keycode = scancode as u32;
-                        // v0.10.2：xkb 解码 keysym（不是 evdev，是 ibus keyval）
-                        let keysym = instance
-                            .state
-                            .seat
-                            .xkb_state
-                            .key_get_one_sym(xkbcommon::xkb::Keycode::new(keycode))
-                            .raw() as u32;
-                        let ke = KeyEvent {
-                            keysym,
-                            keycode,
-                            action: action,
-                            mods,
-                        };
-                        crate::bridge::ime_log_write(&format!(
-                            "[waylandcraft][ime] bridge submit_key scancode={keycode} keysym={keysym:#x} action={:?}",
-                            action
-                        ));
-                        hb.submit(crate::ime::DownEvent::Key(ke));
-                        handled = true; // **v0.11 完全吞**——不调 seat.keyboard_key
-                    }
-                }
+                use crate::ime::KeyEvent;
+                crate::bridge::ime_log_write(&format!(
+                    "[waylandcraft][ime] bridge submit_key scancode={keycode} keysym={keysym:#x} action={action:?}"
+                ));
+                hb.submit(crate::ime::DownEvent::Key(KeyEvent {
+                    keysym,
+                    keycode,
+                    action,
+                    mods,
+                }));
             }
         }
+        handled = true;
     }
 
-    // v0.11.3 修：v0.11.0 commit message 说"删 Path B"——但代码 fall through
-    // `if !handled { seat.keyboard_key() }` 仍存在。**真删**——host_bridge
-    // 是唯一键盘通道。如果 host_bridge 没接管，按键**丢失**（GNOME 原生
-    // IME daemon 死亡时一样行为）。也修了一个隐藏 bug——fall through
-    // 可能调 seat.keyboard_key 时 xkb_state 未就绪（user 报告"创建窗口
-    // 或放置时崩溃"的可能根因之一）。
     Ok(())
 }
 
@@ -1725,7 +1709,7 @@ fn native_version<'local>(
 /// 全部子系统状态（native lib / egl / wayland globals / host_bridge / ime /
 /// xwayland-satellite / audio / portal / ...），不必再切 4 个独立日志。
 ///
-/// v0.13.4 新增。mod_version 硬编码 "1.2.29"（与 gradle.properties 同步）；
+/// v0.13.4 新增。mod_version 硬编码 "1.2.30"（与 gradle.properties 同步）；
 /// v0.13.9 修：之前 v0.13.5/7/8 bump version 时忘记同步这里——导致 status.log
 /// 一直显示 "1.2.9"。后续 bump version 时记得改这里（+ gradle.properties）。
 fn get_status_report<'local>(
@@ -1741,7 +1725,7 @@ fn get_status_report<'local>(
     let report = crate::status::StatusReport::gather(
         &instance,
         thread_name,
-        "1.2.29", // mod_version — 与 waylandcraft/gradle.properties 同步
+        "1.2.30", // mod_version — 与 waylandcraft/gradle.properties 同步
     );
     Ok(env.new_string(report.to_json())?)
 }

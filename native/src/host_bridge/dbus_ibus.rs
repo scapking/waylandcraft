@@ -61,6 +61,24 @@ const IBUS_IC_IFACE: &str = "org.freedesktop.IBus.InputContext";
 /// 客户端能力（声明完整支持）。
 const IC_CAPABILITIES: u32 = 0x3F;
 
+/// 探测宿主 global engine（`ibus engine` 输出，如 libpinyin）。
+/// 失败/空返回 None——调用方依赖 daemon 的 global-engine attach。
+/// v1.2.30：显式 SetEngine 绕开"FocusIn 后 daemon 未把 global engine
+/// attach 到 portal IC"的不确定性（consumed=false + 无 preedit 的根因候选）。
+fn detect_global_engine() -> Option<String> {
+let out = std::process::Command::new("ibus").arg("engine").output().ok()?;
+if !out.status.success() {
+    return None;
+}
+let s = String::from_utf8_lossy(&out.stdout);
+let name = s.trim();
+if name.is_empty() || name.contains("No engine") || name.contains("error") {
+    None
+} else {
+    Some(name.to_string())
+}
+}
+
 /// dbus 端进程内部通道。
 #[derive(Debug)]
 pub(crate) enum ToWorker {
@@ -339,7 +357,7 @@ impl HostBridge for DbusIbusBridge {
 
 /// Worker 线程：独占 dbus 连接 + ic_conns。
 fn command_loop(
-    ic_conns: IcConnections,
+    mut ic_conns: IcConnections,
     cmd_rx: Receiver<ToWorker>,
     ev_tx: Sender<FromWorker>,
 ) {
@@ -367,6 +385,43 @@ fn command_loop(
         let res: Result<(), String> = match cmd {
             ToWorker::FocusIn => {
                 ime_log!("[waylandcraft][host_bridge][dbus-ibus] FocusIn -> ibus-daemon");
+                // v1.2.30：首次 FocusIn 前显式 SetEngine（若探测到 global engine）。
+                // daemon 的 global-engine attach 对 portal IC 不可靠（consumed=false
+                // + 无 preedit 的根因候选）——显式设置确保 libpinyin 真正挂到 IC。
+                if !ic_conns.engine_set {
+                    ic_conns.engine_set = true;
+                    if let Some(en) = ic_conns.engine_name.clone() {
+                        match ic_conns.ic.call::<_, _, ()>("SetEngine", &(en.clone(),)) {
+                            Ok(()) => {
+                                ime_log!(
+                                    "[waylandcraft][host_bridge][dbus-ibus] SetEngine({en}) OK"
+                                );
+                            }
+                            Err(e) => {
+                                ime_log!(
+                                    "[waylandcraft][host_bridge][dbus-ibus] SetEngine({en}) 失败: {e}"
+                                );
+                            }
+                        }
+                        // GetEngine 验证：打印 engine path/值——空 = 引擎没挂上。
+                        // reply 类型各 ibus 版本不一（(o) 或 (s)），用 OwnedValue 通吃。
+                        match ic_conns
+                            .ic
+                            .call::<_, _, zbus::zvariant::OwnedValue>("GetEngine", &())
+                        {
+                            Ok(v) => ime_log!(
+                                "[waylandcraft][host_bridge][dbus-ibus] GetEngine -> {v:?}"
+                            ),
+                            Err(e) => ime_log!(
+                                "[waylandcraft][host_bridge][dbus-ibus] GetEngine 失败: {e}"
+                            ),
+                        }
+                    } else {
+                        ime_log!(
+                            "[waylandcraft][host_bridge][dbus-ibus] 无 engine 名——依赖 daemon global attach（若持续 consumed=false 需排查）"
+                        );
+                    }
+                }
                 ic_conns
                     .ic
                     .call::<_, _, ()>("FocusIn", &())
@@ -483,6 +538,11 @@ const WATCHED_SIGNALS: &[&str] = &[
 struct IcConnections {
     _conn: zbus::blocking::Connection,
     ic: zbus::blocking::Proxy<'static>,
+    /// 显式设置的 engine 名（None = 依赖 daemon global engine）。
+    /// v1.2.30：首次 FocusIn 前 SetEngine，绕开 global-attach 不确定性。
+    engine_name: Option<String>,
+    /// engine 已设置（只设一次；引擎切换由宿主 panel 负责，我们不覆盖）。
+    engine_set: bool,
 }
 
 fn connect_input_context(conn: &zbus::blocking::Connection) -> Result<IcConnections, String> {
@@ -497,7 +557,23 @@ fn connect_input_context(conn: &zbus::blocking::Connection) -> Result<IcConnecti
             .map_err(|e| format!("input context proxy: {e}"))?;
     ic.call::<_, _, ()>("SetCapabilities", &(IC_CAPABILITIES,))
         .map_err(|e| format!("SetCapabilities: {e}"))?;
-    Ok(IcConnections { _conn: conn.clone(), ic })
+    // v1.2.30：读宿主 global engine 名（ibus engine），供首次 FocusIn SetEngine。
+    let engine_name = detect_global_engine();
+    if let Some(en) = &engine_name {
+        ime_log!(
+            "[waylandcraft][host_bridge][dbus-ibus] detected global engine: {en}（FocusIn 时显式 SetEngine）"
+        );
+    } else {
+        ime_log!(
+            "[waylandcraft][host_bridge][dbus-ibus] 未能探测 global engine（ibus engine 无输出）——依赖 daemon global attach"
+        );
+    }
+    Ok(IcConnections {
+        _conn: conn.clone(),
+        ic,
+        engine_name,
+        engine_set: false,
+    })
 }
 
 fn probe_service_owner(
