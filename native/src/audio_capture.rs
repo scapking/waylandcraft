@@ -443,12 +443,12 @@ pub fn get_audio_capture_status() -> String {
     };
 
         format!(
-        "{{\\"active\\":{},\\"stage\\":\\"{}\",\\"mode\\":\\"monitor\\",\\"pid\\":{},\\"sink_node\\":{},\\"sink_name\\":\\"{}\",\\"stream_node\\":{},\\"linked\\":{},\\"capture_events\\":{},\\"total_bytes\\":{},\\"sample_rate\\":{},\\"channels\\":{},\\"last_error\\":\\"{}\"}}",
+        "{{\"active\":{},\"stage\":\"{}\",\"mode\":\"monitor\",\"pid\":{},\"sink_node\":{},\"sink_name\":\"{}\",\"stream_node\":{},\"linked\":{},\"capture_events\":{},\"total_bytes\":{},\"sample_rate\":{},\"channels\":{},\"last_error\":{}}}",
         s.active,
         stage,
         s.pid,
         s.sink_node,
-        s.sink_name.replace('\\"', "'"),
+        s.sink_name.replace('"', "'"),
         s.stream_node,
         s.linked,
         s.capture_events,
@@ -456,10 +456,11 @@ pub fn get_audio_capture_status() -> String {
         s.sample_rate,
         s.channels,
         match &s.last_error {
-            Some(e) => e.replace('\\"', "'"),
+            Some(e) => format!("\"{}\"", e.replace('"', "'")),
             None => "null".to_string(),
         }
     ),
+
 }
 
 /// 返回音频缓冲状态（JSON 字符串），供 Java /wl audio buffer 查询。
