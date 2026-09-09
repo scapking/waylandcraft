@@ -36,8 +36,30 @@ public final class CursorRectReporter {
 	/** 每 tick 调用（MinecraftMixin.runTick HEAD）。 */
 	public static void tick() {
 		Minecraft mc = Minecraft.getInstance();
-		if (mc == null || mc.screen == null || WaylandCraft.instance == null
-				|| WaylandCraft.instance.bridge == null) {
+		if (mc == null || WaylandCraft.instance == null) {
+			return;
+		}
+		// IME 焦点通知独立于 native bridge：fcitx5/ibus dbus backend 不需要
+		// bridge 就能 FocusIn/FocusOut（bridge 只为 nested wayland app 的 ti3
+		// 服务）。这里先算出"有无文本框持焦点"，通知 dispatcher（内部只在
+		// 状态翻转时调 backend），再继续光标矩形上报。
+		boolean hasInput = false;
+		if (mc.screen != null) {
+			GuiEventListener f = mc.screen.getFocused();
+			if (f instanceof EditBox) {
+				hasInput = true;
+			} else {
+				for (GuiEventListener child : mc.screen.children()) {
+					if (child instanceof EditBox eb && eb.isFocused()) {
+						hasInput = true;
+						break;
+					}
+				}
+			}
+		}
+		dev.evvie.waylandcraft.ime.ImeDispatcher.get().onScreenInputFocusChanged(hasInput);
+
+		if (mc.screen == null || WaylandCraft.instance.bridge == null) {
 			return;
 		}
 		EditBox box = null;

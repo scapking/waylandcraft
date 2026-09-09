@@ -56,6 +56,8 @@ public final class ImeDispatcher {
             new CopyOnWriteArrayList<>();
 
     private volatile PreeditState preedit = PreeditState.EMPTY;
+    /** 当前 MC 是否有文本框持焦点（驱动 backend focusIn/focusOut）。 */
+    private volatile boolean inputFocused = false;
     private volatile List<String> candidates = List.of();
     private volatile int candidateCursor = 0;
     private volatile int candidatePageSize = 0;
@@ -139,6 +141,31 @@ public final class ImeDispatcher {
 
         // enter: notify MC + backend
         McImeIntegration.beginComposition(componentId);
+    }
+
+    /**
+     * MC 文本框输入焦点状态（每 tick 由 MinecraftMixin 检测 EditBox
+     * focused 后调用）。变化时通知 backend focusIn/focusOut —— fcitx5/ibus
+     * 只有 FocusIn 后才把按键交给 IME 引擎（v1.2.26 验证：缺这一步导致
+     * IC 永不激活，preedit/commit 收不到）。
+     */
+    public void onScreenInputFocusChanged(boolean active) {
+        if (active == inputFocused) return;
+        inputFocused = active;
+        ImeBackend.ImeSession s = currentSession.get();
+        if (s == null) return;
+        try {
+            if (active) {
+                s.focusIn();
+            } else {
+                s.focusOut();
+                preedit = PreeditState.EMPTY;
+                candidates = List.of();
+                McImeIntegration.clearPreedit();
+            }
+        } catch (Throwable t) {
+            LOGGER.warn("[ime] focus change threw: {}", t.toString());
+        }
     }
 
     /**

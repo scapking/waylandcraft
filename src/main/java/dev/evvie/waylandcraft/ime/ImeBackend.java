@@ -114,6 +114,20 @@ public interface ImeBackend {
         /**
          * 注册事件 listener — 必须在 close() 之前调一次。
          */
+        /**
+         * 文本框获得输入焦点（MC 聊天/搜索框打开或聚焦）— backend 通知
+         * 宿主 IME 激活本 IC（fcitx5/ibus FocusIn）。此后宿主才会把
+         * 按键交给 IME 引擎并回传 preedit/commit。
+         * <p>默认 no-op：不区分 focus 的 backend（XIM/Cocoa/IMM）无需实现。
+         */
+        default void focusIn() {}
+
+        /**
+         * 文本框失去焦点 — backend 通知宿主 IME 停用本 IC（FocusOut），
+         * 清空 preedit / 收走候选窗。
+         */
+        default void focusOut() {}
+
         void setEventListener(Listener listener);
 
         /**

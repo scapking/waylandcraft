@@ -238,34 +238,51 @@ public final class Fcitx5DbusBackend implements ImeBackend {
                 this.readerThread = new Thread(() -> {
                     try (BufferedReader r = new BufferedReader(
                             new InputStreamReader(monitor.getInputStream(), StandardCharsets.UTF_8))) {
+                        // dbus-monitor (non-profile) 每 signal 输出两段:
+                        //   1) header 单行: signal time=... sender=:1.x -> destination=... serial=N
+                        //      path=/org/freedesktop/IBus/InputContext_N/N; interface=...; member=...
+                        //   2) 参数行（缩进 + 类型前缀）:   string "你好" / uint32 1 / ...
+                        //   空行分隔相邻 signal。
+                        // 旧实现在等 interface=/member= 出现在行首 —— dbus-monitor
+                        // 从不那样输出，导致 commit/preedit 永远解析不到（v1.2.26 实测
+                        // 根因）。这里改为解析真实 header 格式。
                         String line;
                         String pendingIface = null, pendingMember = null;
+                        boolean inSignal = false;
                         List<String> argLines = new ArrayList<>();
+                        Pattern header = Pattern.compile(
+                                "signal .*?path=([^;]*); interface=([^;]*); member=(\\S+)");
                         while ((line = r.readLine()) != null) {
                             if (closed) break;
                             String trimmed = line.trim();
-                            if (trimmed.startsWith("interface=")) {
-                                // 新 signal 开始
-                                if (pendingIface != null && pendingMember != null) {
+                            if (trimmed.startsWith("signal ") || trimmed.startsWith("error ")) {
+                                // 上一 signal 收尾（若有）
+                                if (inSignal && pendingIface != null && pendingMember != null) {
                                     dispatchSignal(pendingIface, pendingMember, argLines);
                                 }
-                                pendingIface = trimmed;
-                                argLines.clear();
-                            } else if (trimmed.startsWith("member=")) {
-                                pendingMember = trimmed;
+                                Matcher m = header.matcher(trimmed);
+                                if (m.matches()) {
+                                    pendingIface = m.group(2);
+                                    pendingMember = m.group(3);
+                                    argLines.clear();
+                                    inSignal = true;
+                                } else {
+                                    inSignal = false;
+                                    pendingIface = pendingMember = null;
+                                }
                             } else if (trimmed.isEmpty()) {
-                                // 空行 = signal 结束
-                                if (pendingIface != null && pendingMember != null) {
+                                if (inSignal && pendingIface != null && pendingMember != null) {
                                     dispatchSignal(pendingIface, pendingMember, argLines);
                                     pendingIface = pendingMember = null;
                                     argLines.clear();
                                 }
-                            } else {
+                                inSignal = false;
+                            } else if (inSignal) {
                                 argLines.add(trimmed);
                             }
                         }
-                        // EOF
-                        if (pendingIface != null && pendingMember != null) {
+                        // EOF 收尾
+                        if (inSignal && pendingIface != null && pendingMember != null) {
                             dispatchSignal(pendingIface, pendingMember, argLines);
                         }
                     } catch (Exception e) {
@@ -287,9 +304,7 @@ public final class Fcitx5DbusBackend implements ImeBackend {
          * <p>只关心 fcitx5 / ibus 实际 emit 的几个 signal —
          * 其余直接忽略。
          */
-        private void dispatchSignal(String ifaceLine, String memberLine, List<String> args) {
-            String iface = ifaceLine.substring("interface=".length());
-            String member = memberLine.substring("member=".length());
+        private void dispatchSignal(String iface, String member, List<String> args) {
             Listener l = listener.get();
             if (l == null) return;
 
@@ -299,12 +314,18 @@ public final class Fcitx5DbusBackend implements ImeBackend {
                         String s = parseStringArg(args);
                         if (s != null) l.onCommit(s);
                     }
-                    case "PreeditText", "PreeditString" -> {
-                        // 老 ibus PreeditText(s, i, ui) — text + cursor + visibility
-                        // fcitx5 PreeditString(s, i) — text + cursor
+                    case "PreeditText", "PreeditString", "UpdatePreeditText" -> {
+                        // ibus UpdatePreeditText(s, i, ui) — text + cursor + visibility
+                        // 老 ibus PreeditText 同型；fcitx5 PreeditString(s, i) — text + cursor
                         String s = parseStringArg(args);
+                        // UpdatePreeditText 附带光标位置：第二个 uint32 参数是光标偏移
+                        int cursor = 0;
+                        if (member.equals("UpdatePreeditText")) {
+                            cursor = parseIntArg(args, 1);
+                        }
                         if (s != null) {
-                            l.onPreeditChanged(s, 0, s.length());
+                            int end = cursor > 0 ? cursor : s.length();
+                            l.onPreeditChanged(s, 0, Math.max(0, end));
                         }
                     }
                     case "UpdatePreeditCaret" -> {
@@ -334,12 +355,33 @@ public final class Fcitx5DbusBackend implements ImeBackend {
          */
         private static final Pattern STRING_ARG = Pattern.compile("string\\s+\"([^\"]*)\"");
 
+        private static final Pattern INT_ARG = Pattern.compile("uint32\\s+(\\d+)");
+
         private static String parseStringArg(List<String> argLines) {
             for (String line : argLines) {
                 Matcher m = STRING_ARG.matcher(line);
                 if (m.find()) return m.group(1);
             }
             return null;
+        }
+
+        /** 取第 idx 个 uint32 参数值（0 起）；不存在/非数字返回 0。 */
+        private static int parseIntArg(List<String> argLines, int idx) {
+            int seen = 0;
+            for (String line : argLines) {
+                Matcher m = INT_ARG.matcher(line);
+                if (m.find()) {
+                    if (seen == idx) {
+                        try {
+                            return Integer.parseInt(m.group(1));
+                        } catch (NumberFormatException e) {
+                            return 0;
+                        }
+                    }
+                    seen++;
+                }
+            }
+            return 0;
         }
 
         // ---- ImeSession impl ----
@@ -361,23 +403,39 @@ public final class Fcitx5DbusBackend implements ImeBackend {
          * X11 keysym = Unicode codepoint (XK_xxx 与 Unicode 0x0100+
          * 一一对应) — 这是 fcitx5 默认接收 keysym 的方式。
          */
+        /** fcitx5 IC 激活：FocusIn 后宿主把按键交给 IME 引擎。 */
+        @Override
+        public void focusIn() {
+            try {
+                dbusCall(icPath, icIface + ".FocusIn", "").waitFor();
+            } catch (Exception e) {
+                LOGGER.debug("[ime] FocusIn failed: {}", e.toString());
+            }
+        }
+
+        /** fcitx5 IC 停用：FocusOut，宿主收走候选窗。 */
+        @Override
+        public void focusOut() {
+            try {
+                dbusCall(icPath, icIface + ".FocusOut", "").waitFor();
+            } catch (Exception e) {
+                LOGGER.debug("[ime] FocusOut failed: {}", e.toString());
+            }
+        }
+
         @Override
         public void commit(String text) {
+            // ImeBackend.commit 语义：把"已确认的预编辑"作为最终文本落进文本框。
+            // 对 dbus 后端，宿主 IME 在用户选词/确认时自己会发 CommitText 信号
+            // （我们监听后经 onCommit 上屏），这里不需要也不应该把字符当 keysym
+            // 回灌 ProcessKeyEvent —— 那会让 fcitx5 把已确认文本当新按键重新
+            // 交给 IME 引擎（错误方向，v1.2.26 验证）。
+            // 需要时仅 Reset 清掉残留 preedit，随后由信号驱动的真实 commit 上屏。
             if (text == null || text.isEmpty()) return;
             try {
-                // 先 Reset 清 preedit
                 dbusCall(icPath, icIface + ".Reset", "").waitFor();
-                // 逐字符发送 ProcessKeyEvent
-                for (int i = 0; i < text.length(); ) {
-                    int cp = text.codePointAt(i);
-                    // keycode 0 — fcitx5 接受 keysym-only 触发
-                    dbusCall(icPath, icIface + ".ProcessKeyEvent",
-                            "uint32:" + cp, "uint32:0", "uint32:0", "boolean:false")
-                            .waitFor();
-                    i += Character.charCount(cp);
-                }
             } catch (Exception e) {
-                LOGGER.debug("[ime] commit error: {}", e.toString());
+                LOGGER.debug("[ime] commit reset error: {}", e.toString());
             }
         }
 
