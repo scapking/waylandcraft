@@ -517,6 +517,7 @@ public class WaylandCraftBridge {
 				surfaces_new.add(surface);
 			}
 			else {
+				surface.destroy();
 				freeSurface(this.instance, surface.takeHandle());
 			}
 		}

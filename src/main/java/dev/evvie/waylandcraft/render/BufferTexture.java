@@ -52,13 +52,15 @@ public abstract class BufferTexture {
 	public static abstract class BasicBufferTexture extends BufferTexture {
 		
 		public final int id;
+		private GlTexture texture;
 		private GpuTextureView textureView = null;
 		
 		public BasicBufferTexture(int width, int height, int format) {
 			super(width, height, format);
 			this.id = GlStateManager._genTexture();
-			GlTexture glTexture = IGlTextureMixin.createTexture(GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, "buffertexture-" + this.hashCode(), TextureFormat.RGBA8, width, height, 1, 1, id);
-			this.textureView = RenderSystem.getDevice().createTextureView(glTexture);
+			
+			texture = IGlTextureMixin.createTexture(GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING, "buffertexture-" + this.hashCode(), TextureFormat.RGBA8, width, height, 1, 1, id);
+			this.textureView = RenderSystem.getDevice().createTextureView(texture);
 		}
 		
 		@Override
@@ -68,8 +70,9 @@ public abstract class BufferTexture {
 		
 		@Override
 		public void release() {
+			textureView.close();
+			texture.close();
 			textureView = null;
-			GlStateManager._deleteTexture(id);
 		}
 		
 	}
