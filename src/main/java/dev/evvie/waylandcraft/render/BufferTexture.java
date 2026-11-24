@@ -1,6 +1,5 @@
 package dev.evvie.waylandcraft.render;
 
-import java.nio.ByteBuffer;
 import java.util.OptionalInt;
 
 import org.lwjgl.glfw.GLFW;
@@ -110,44 +109,39 @@ public abstract class BufferTexture {
 		
 	}
 	
-	public static class SinglePixelBufferTexture extends BasicBufferTexture {
+	// 单像素缓冲区纹理：改用基础 Blaze3D 命令创建并清色 [upstream 524a02f]，
+	// 替代此前绕过 blaze3d 生命周期的裸 OpenGL glTexImage2D 实现。
+	// fork 适配：保持 public 构造器（WLCSurface.attachSinglePixelBuffer 直接 new）。
+	public static class SinglePixelBufferTexture extends BufferTexture {
 		
-		public final byte r;
-		public final byte g;
-		public final byte b;
-		public final byte a;
+		private GpuTexture texture;
+		private GpuTextureView textureView = null;
 		
 		public SinglePixelBufferTexture(byte r, byte g, byte b, byte a) {
 			super(1, 1, BufferTexture.FORMAT_ARGB8888);
-			this.r = r;
-			this.g = g;
-			this.b = b;
-			this.a = a;
 			
-			init();
+			texture = RenderSystem.getDevice().createTexture("buffertexture-" + this.hashCode(), GpuTexture.USAGE_COPY_DST | GpuTexture.USAGE_TEXTURE_BINDING | GpuTexture.USAGE_RENDER_ATTACHMENT, TextureFormat.RGBA8, 1, 1, 1, 1);
+			textureView = RenderSystem.getDevice().createTextureView(texture);
+			
+			int c1 = Byte.toUnsignedInt(r);
+			int c2 = Byte.toUnsignedInt(g);
+			int c3 = Byte.toUnsignedInt(b);
+			int c4 = Byte.toUnsignedInt(a);
+			int color = c4 << 24 | c1 << 16 | c2 << 8 | c3;
+			
+			RenderSystem.getDevice().createCommandEncoder().clearColorTexture(texture, color);
 		}
 		
-		private void init() {
-			GlStateManager._bindTexture(this.id);
-			GlStateManager._texParameter(GL33.GL_TEXTURE_2D, GL33.GL_TEXTURE_MAX_LEVEL, 0);
-			GlStateManager._texParameter(GL33.GL_TEXTURE_2D, GL33.GL_TEXTURE_MIN_LOD, 0);
-			GlStateManager._texParameter(GL33.GL_TEXTURE_2D, GL33.GL_TEXTURE_MAX_LOD, 0);
-			
-			GlStateManager._texParameter(GL33.GL_TEXTURE_2D, GL33.GL_TEXTURE_MIN_FILTER, GL33.GL_NEAREST);
-			GlStateManager._texParameter(GL33.GL_TEXTURE_2D, GL33.GL_TEXTURE_MAG_FILTER, GL33.GL_NEAREST);
-			
-			GlStateManager._pixelStore(GL33.GL_UNPACK_ROW_LENGTH, 0);
-			GlStateManager._pixelStore(GL33.GL_UNPACK_SKIP_PIXELS, 0);
-			GlStateManager._pixelStore(GL33.GL_UNPACK_SKIP_ROWS, 0);
-			GlStateManager._pixelStore(GL33.GL_UNPACK_ALIGNMENT, 4);
-			
-			ByteBuffer buf = ByteBuffer.allocateDirect(4);
-			buf.put(b);
-			buf.put(g);
-			buf.put(r);
-			buf.put(a);
-			buf.rewind();
-			GL33.glTexImage2D(GL33.GL_TEXTURE_2D, 0, GL33.GL_RGBA8, width, height, 0, GL33.GL_BGRA, GL33.GL_UNSIGNED_INT_8_8_8_8_REV, buf);
+		@Override
+		public GpuTextureView getTextureView() {
+			return textureView;
+		}
+		
+		@Override
+		public void release() {
+			textureView.close();
+			texture.close();
+			textureView = null;
 		}
 		
 	}
