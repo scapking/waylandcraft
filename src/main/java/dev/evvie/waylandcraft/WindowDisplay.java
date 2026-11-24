@@ -9,6 +9,7 @@ import com.mojang.blaze3d.vertex.PoseStack;
 import dev.evvie.waylandcraft.bridge.WLCAbstractWindow;
 import dev.evvie.waylandcraft.bridge.WLCSurface;
 import dev.evvie.waylandcraft.bridge.WLCToplevel;
+import dev.evvie.waylandcraft.grabs.MoveGrab;
 import dev.evvie.waylandcraft.math.WorldPlane;
 import dev.evvie.waylandcraft.render.RenderUtils;
 import dev.evvie.waylandcraft.utils.WaylandCraftUtils;
@@ -17,6 +18,7 @@ import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.core.Direction;
 import net.minecraft.core.Direction.Axis;
+import net.minecraft.util.ARGB;
 import net.minecraft.util.Mth;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.level.ClipContext;
@@ -118,6 +120,26 @@ public class WindowDisplay {
 	}
 	
 	public void render(LevelRenderContext ctx) {
+		// 上游 d2047ca：单轴吸附（snapActive）时绘制红色十字轴线指引
+		if(WaylandCraft.instance.pointerGrabs.activeExclusiveGrab() instanceof MoveGrab grab && grab.window == this && grab.snapActive) {
+			Vec3 axisCameraPos = ctx.levelState().cameraRenderState.pos;
+			PoseStack axisPose = ctx.poseStack();
+			axisPose.pushPose();
+			axisPose.translate(axisCameraPos.scale(-1));
+			Vec3 points[];
+			points = new Vec3[] {
+					grab.initialPivot.add(right().scale(10)),
+					grab.initialPivot.add(right().scale(-10)),
+			};
+			RenderUtils.renderLineStrip(axisPose, ctx.submitNodeCollector(), points, ARGB.color(255, 0, 0), 2.0f);
+			points = new Vec3[] {
+					grab.initialPivot.add(down().scale(10)),
+					grab.initialPivot.add(down().scale(-10)),
+			};
+			RenderUtils.renderLineStrip(axisPose, ctx.submitNodeCollector(), points, ARGB.color(255, 0, 0), 2.0f);
+			axisPose.popPose();
+		}
+
 		if(window.framebuffer == null) return;
 		updateGeometry();
 		
@@ -147,7 +169,7 @@ public class WindowDisplay {
 	}
 	
 	/* Transform absolute world coordinates to surface-local pixel coordinates relative to toplevel (0, 0)
-	 * 
+	 *
 	 * The resulting vector is the (x, y) pixel location and the z value is the block distance normal to the plane.
 	 */
 	public Vec3 worldToLocal(Vec3 in) {
