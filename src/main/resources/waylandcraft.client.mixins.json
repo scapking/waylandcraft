@@ -12,7 +12,7 @@
 		"MinecraftMixin",
 		"WindowMixin",
 		"GuiMixin",
-		"NativeImageMixin",
+		"INativeImageMixin",
 		"ItemFrameRendererMixin",
 		"ItemFrameRenderStateMixin",
 		"IGlTextureMixin",
