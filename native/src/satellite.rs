@@ -1,14 +1,14 @@
+use rustix::fs::{Access, OFlags, access, lstat, mkdir, open, unlink};
+use rustix::io::{Errno, FdFlags, fcntl_setfd, write};
+use rustix::process::{Pid, getpid, getuid, test_kill_process};
 use std::ffi::OsStr;
-use std::os::unix::net::{SocketAddr, UnixListener};
-#[cfg(target_os = "linux")]
-use std::os::linux::net::SocketAddrExt;
 #[cfg(target_os = "android")]
 use std::os::android::net::SocketAddrExt;
-use std::os::fd::{OwnedFd, RawFd, AsRawFd};
-use std::process::{Command, Child, Stdio};
-use rustix::io::{Errno, write, fcntl_setfd, FdFlags};
-use rustix::fs::{Access, OFlags, access, lstat, mkdir, open, unlink};
-use rustix::process::{Pid, getuid, getpid, test_kill_process};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::linux::net::SocketAddrExt;
+use std::os::unix::net::{SocketAddr, UnixListener};
+use std::process::{Child, Command, Stdio};
 use thiserror::Error;
 
 /* Small parts of this code have been adapted from niri's implementation of
@@ -271,7 +271,7 @@ fn try_lock_display(dpy: i32) -> Result<Option<TmpFileGuard>, SatelliteError> {
         Ok(fd) => fd,
         Err(_) => {
             // Lock could not be acquired
-            return Ok(None)
+            return Ok(None);
         }
     };
     // Create guard immediately after open(...) so the lockfile is deleted when
@@ -343,7 +343,7 @@ fn try_restart_display(
 fn try_invoke_xws(
     wayland_display: &OsStr,
     display: i32,
-    listenfds: &[RawFd]
+    listenfds: &[RawFd],
 ) -> Result<Child, SatelliteError> {
     let mut command = Command::new(xws_binary());
     command
@@ -380,9 +380,10 @@ fn try_invoke_xws(
 // file descriptor will not be correctly passed to the child process
 // (meaning xwayland-satellite)
 fn copy_listenfd(
-    listenfd: &OwnedFd
+    listenfd: &OwnedFd,
 ) -> Result<(OwnedFd, RawFd), SatelliteError> {
-    let listenfd_copy = listenfd.try_clone()
+    let listenfd_copy = listenfd
+        .try_clone()
         .map_err(SatelliteError::FailCloneSocket)?;
     fcntl_setfd(&listenfd_copy, FdFlags::empty())
         .map_err(SatelliteError::FailSetFdFlags)?;
@@ -399,17 +400,15 @@ pub fn start_satellite(
     for dpy in 1..=32 {
         let lock_guard = match try_lock_display(dpy)? {
             Some(g) => g,
-            None => continue
+            None => continue,
         };
 
         let sockets = try_open_sockets(dpy)?;
         let (unix_fd_copy, unix_fd_raw) = copy_listenfd(&sockets.unix_fd)?;
         let (abs_fd_copy, abs_fd_raw) = copy_listenfd(&sockets.abstract_fd)?;
 
-        let mut handle = try_invoke_xws(wayland_display, dpy, &[
-            unix_fd_raw,
-            abs_fd_raw,
-        ])?;
+        let mut handle =
+            try_invoke_xws(wayland_display, dpy, &[unix_fd_raw, abs_fd_raw])?;
 
         // 存活检查：xwayland-satellite 要连上 compositor（WAYLAND_DISPLAY=wayland-1）
         // 才会真正监听 X socket。如果它连不上（socket 不存在 / compositor 没起来），
