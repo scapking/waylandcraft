@@ -198,6 +198,18 @@ public class WaylandCraftSettings {
 		}
 	}
 	
+	// upstream 7f1de7b: 不区分类型地读取设置当前值（供 responder 注册时回放）
+	protected @Nullable Object getSettingAnyType(String name) {
+		try {
+			Field field = WaylandCraftSettings.class.getDeclaredField(name);
+			return field.get(this);
+		} catch (NoSuchFieldException | IllegalArgumentException | IllegalAccessException e) {
+			WaylandCraftCommon.LOGGER.error("Invalid setting accessed: '" + name + "'!");
+			e.printStackTrace();
+		}
+		return null;
+	}
+
 	protected void setStringSetting(String name, String value) {
 		try {
 			Field field = WaylandCraftSettings.class.getDeclaredField(name);

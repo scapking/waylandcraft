@@ -201,6 +201,13 @@ public class WaylandCraft implements ClientModInitializer {
 		WaylandCraftCommand.register();
 	}
 	
+	// upstream 7f1de7b: 设置变更响应器注册（后续 f23fdcb 接入终端启动链路）
+	private void registerSettingsResponders() {
+		settingsManager.registerResponder(WaylandCraftSettings.TERMINAL_CHOICE, (value) -> {
+			WaylandCraftCommon.LOGGER.info("TERMINAL: " + value);
+		});
+	}
+
 	/* Update bridge and clients. May be called at any state of the game, even outside of a level
 	 * Called after game render in Minecraft::runTick
 	 */
@@ -238,6 +245,7 @@ public class WaylandCraft implements ClientModInitializer {
 				}
 				xdgManager = new XDGDesktopManager(this);
 				settingsManager = new WaylandCraftSettingsManager(this);
+				registerSettingsResponders();
 				templateManager.init(Minecraft.getInstance().gameDirectory);
 				layoutManager.setEnabled(settings != null && settings.getLayoutEnabled());
 				
