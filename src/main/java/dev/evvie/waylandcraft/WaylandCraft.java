@@ -186,6 +186,7 @@ public class WaylandCraft implements ClientModInitializer {
 		LevelRenderEvents.END_EXTRACTION.register(this::updateWorld);
 		ClientTickEvents.END_CLIENT_TICK.register(this::onClientTick);
 		ClientPlayConnectionEvents.JOIN.register(this::onClientJoin);
+		ClientPlayConnectionEvents.DISCONNECT.register(this::onClientDisconnect);
 		ItemTooltipCallback.EVENT.register(this::addWindowItemTooltip);
 		ClientTickEvents.START_CLIENT_TICK.register(itemManager);
 		
@@ -594,7 +595,10 @@ public class WaylandCraft implements ClientModInitializer {
 	
 	public void onClientTick(Minecraft minecraft) {
 		if(minecraft.player == null) return;
+		checkKeybinds(minecraft);
+	}
 		
+	private void checkKeybinds(Minecraft minecraft) {
 		if(keyOpenScreen.consumeClick()) {
 			if(bridge == null) {
 				minecraft.getChatListener().handleSystemMessage(Component.literal("WaylandCraft viewer-only mode: local window capture unavailable on this platform; you can still view shared windows"), false);
@@ -637,6 +641,11 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 		minecraft.getChatListener().handleSystemMessage(Component.literal("Wayland compositor running on " + waylandSocket), false);
 		itemManager.giveItemsIfMissing(bridge.getMappedToplevels());
+	}
+	
+	private void onClientDisconnect(ClientPacketListener listener, Minecraft minecraft) {
+		displays.clear();
+		itemManager.reset();
 	}
 	
 	@Nullable
