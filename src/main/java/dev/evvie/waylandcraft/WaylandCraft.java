@@ -461,7 +461,11 @@ public class WaylandCraft implements ClientModInitializer {
 	 */
 	public void enableKeyboardCapture(boolean hardCapture) {
 		if(keyboardCaptureMode != KeyboardCaptureMode.NONE) return;
-		
+
+		// 上游 3822b75：进入捕获前释放所有按住的 MC 键位。捕获期间按键释放事件被
+		// 转发给窗口、不再回到 KeyMapping，若不 releaseAll，进捕获前按住的键会卡住。
+		KeyMapping.releaseAll();
+
 		WaylandCraftCommon.LOGGER.info("[kb-debug] enableKeyboardCapture hardCapture={} hoveredShared={} hoveredLocal={} bridge={}",
 			hardCapture,
 			hoveredSharedDisplay != null ? "yes" : "no",
