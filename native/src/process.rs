@@ -270,6 +270,18 @@ pub fn spawn(
         .stdin(Stdio::null())
         .stdout(Stdio::from(out_file))
         .stderr(Stdio::from(err_file))
+        // 游戏进程继承的启动器环境不应透传给被拉起的客户端 [upstream f21ea6f]：
+        // - LD_LIBRARY_PATH: 启动器为游戏注入的 native 库路径（nix/mesa 等），
+        //   会污染子应用的动态链接（与 satellite.rs 的 env_remove 先例一致）
+        // - RUST_BACKTRACE: 仅对 waylandcraft/游戏自身调试有意义
+        // - NO_COLOR: Prism 等启动器默认设置，不应强制子应用禁色
+        // - __GL_THREADED_OPTIMIZATIONS: 为游戏性能追加的驱动调优，
+        //   泄漏给子进程会改变其 GL 线程模型
+        // （先移除再设置：DISPLAY/WAYLAND_DISPLAY 在下方被显式覆盖，互不影响）
+        .env_remove("LD_LIBRARY_PATH")
+        .env_remove("RUST_BACKTRACE")
+        .env_remove("NO_COLOR")
+        .env_remove("__GL_THREADED_OPTIMIZATIONS")
         // 统一给子进程设置正确的 Wayland 环境
         // （flatpak 运行器需要宿主 XDG_RUNTIME_DIR 才能用 --filesystem=xdg-run 构建沙箱）
         .env("WAYLAND_DISPLAY", &wayland_display)
