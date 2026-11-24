@@ -132,9 +132,14 @@ impl WLCState {
         let dmabuf_global = match egl.and_then(|e| e.get_render_node().ok()) {
             Some(node) => Some(init_dmabuf(&disp, &mut dmabuf_state, egl.unwrap(), &node)),
             None => {
+                // 上游 4a6c11a：说明查询失败常见原因，便于用户排查（移植到 fork 的
+                // Rust 侧等价路径；上游对应代码在 Java EGLHelper，fork 走 native EGL）
                 eprintln!(
                     "[waylandcraft] no usable render node -> dmabuf sharing disabled (shm fallback)"
                 );
+                eprintln!("[waylandcraft] this usually means you are on a software renderer like llvmpipe or using programs that hook into OpenGL");
+                eprintln!("[waylandcraft] make sure to disable or reconfigure things like mangohud, obs-gamecapture or Zink");
+                eprintln!("[waylandcraft] for more information, visit the waylandcraft Github and consult the README");
                 None
             }
         };
