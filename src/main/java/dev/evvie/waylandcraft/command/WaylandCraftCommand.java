@@ -1040,6 +1040,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §epixelsPerBlock§7 = §e" + wlc.settingsManager.getIntSetting(WaylandCraftSettings.PIXELS_PER_BLOCK) + "§r  §8(int, 窗口世界显示像素密度)§r"));
 		source.sendFeedback(Component.literal(" §ewindowAntialiasing§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.WINDOW_ANTIALIASING) + "§r  §8(bool)§r"));
 		source.sendFeedback(Component.literal(" §efocusOnHover§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.FOCUS_ON_HOVER) + "§r  §8(bool)§r"));
+		source.sendFeedback(Component.literal(" §eterminalChoice§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.TERMINAL_CHOICE) + "§r  §8(string, 首选终端命令如 kitty；启动 Terminal=true 应用用, upstream 26350c4/f23fdcb)§r"));
 		source.sendFeedback(Component.literal(" §ehideCursor§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.HIDE_CURSOR) + "§r  §8(bool, 控制窗口时隐藏虚拟鼠标，默认 H 键切换)§r"));
 		source.sendFeedback(Component.literal(" §elayoutEnabled§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.LAYOUT_ENABLED) + "§r  §8(bool, 自动布局开关，默认开启；未 init 时自动用玩家位置初始化)§r"));
 		source.sendFeedback(Component.literal(" §elayoutTemplate§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.LAYOUT_TEMPLATE) + "§r  §8(string, cube=方块 / sphere=圆球)§r"));
@@ -1088,6 +1089,12 @@ public class WaylandCraftCommand {
 				case "focusOnHover" -> {
 					wlc.settingsManager.setBooleanSetting(WaylandCraftSettings.FOCUS_ON_HOVER, Boolean.parseBoolean(value));
 					source.sendFeedback(Component.literal("§a✔ §efocusOnHover§r = §e" + value + "§r"));
+					return 1;
+				}
+				// upstream 26350c4/f23fdcb: 首选终端（responder 会同步下发到 native）
+				case "terminalChoice" -> {
+					wlc.settingsManager.setStringSetting(WaylandCraftSettings.TERMINAL_CHOICE, value);
+					source.sendFeedback(Component.literal("§a✔ §eterminalChoice§r = §e" + value + "§r"));
 					return 1;
 				}
 				case "hideCursor" -> {
