@@ -29,6 +29,7 @@ import net.minecraft.client.renderer.rendertype.RenderType;
 import net.minecraft.client.renderer.rendertype.RenderTypes;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.resources.Identifier;
+import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.util.Util;
 import net.minecraft.world.phys.Vec3;
 
@@ -144,8 +145,9 @@ public class RenderUtils {
 	// === Iris（光影）兼容回退：使用原版管线替代自定义管线 ===
 	// Iris 拦截所有自定义 RenderPipeline（iris$redirectIrisProgram），自定义 rendertype_window
 	// 不被认识 → 抛异常。原版 entity 管线 Iris 认识，可正常渲染。
-	// 注意：原版 entity shader 会乘 diffuse light + lightmap，这里用全亮 lightmap(0xF000F0)
-	// 保证窗口内容始终满亮度显示（与自定义管线一致）。
+	// 注意：原版 entity shader 会乘 diffuse light + lightmap，这里用 FULL_SKY lightmap
+	// 保证窗口内容满亮度显示（与自定义管线一致）。上游实测 FULL_BRIGHT（block+sky 全亮）
+	// 会让部分光影在窗口上渲染出不想要的特效（如 TAA/泛光），只给天空光更干净 [upstream 2aa56bc]。
 	private static final Function<Identifier, RenderType> VANILLA_ENTITY_CUTOUT = Util.memoize(
 		(Identifier identifier) -> RenderTypes.entityCutout(identifier)
 	);
@@ -159,7 +161,7 @@ public class RenderUtils {
 			.setColor(r, g, b, a)
 			.setUv(u, v)
 			.setOverlay(OverlayTexture.NO_OVERLAY)
-			.setLight(0xF000F0) // 全亮 lightmap（block 15 + sky 15）
+			.setLight(LightCoordsUtil.FULL_SKY) // 仅天空光满亮度 lightmap（避免 FULL_BRIGHT 触发光影特效，见上游 2aa56bc）
 			.setNormal(0.0f, 0.0f, 1.0f);
 	}
 	
