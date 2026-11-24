@@ -21,7 +21,9 @@ public class WaylandCraftSettings {
 	int pixelsPerBlock = 500;
 	boolean windowAntialiasing = false;
 	boolean focusOnHover = false;
-	
+	/** 首选终端程序命令名（如 "kitty"），用于直接启动 Terminal=true 的 desktop entry（upstream 26350c4） */
+	String terminalChoice = "";
+
 	/* ---- 控制距离 / 游戏优化 / 布局 ---- */
 	/** 控制窗口时隐藏虚拟鼠标光标（默认不自动隐藏，按键切换） */
 	boolean hideCursor = false;
@@ -59,6 +61,7 @@ public class WaylandCraftSettings {
 	public static final String PIXELS_PER_BLOCK = "pixelsPerBlock";
 	public static final String WINDOW_ANTIALIASING = "windowAntialiasing";
 	public static final String FOCUS_ON_HOVER = "focusOnHover";
+	public static final String TERMINAL_CHOICE = "terminalChoice";
 	public static final String HIDE_CURSOR = "hideCursor";
 	public static final String LAYOUT_ENABLED = "layoutEnabled";
 	public static final String LAYOUT_AUTO_JOIN = "layoutAutoJoin";
@@ -89,6 +92,10 @@ public class WaylandCraftSettings {
 	
 	public boolean getFocusOnHover() {
 		return focusOnHover;
+	}
+
+	public String getTerminalChoice() {
+		return terminalChoice;
 	}
 	
 	public boolean getHideCursor() {
