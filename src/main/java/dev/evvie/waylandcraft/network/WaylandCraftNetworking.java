@@ -8,6 +8,7 @@ import dev.evvie.waylandcraft.WaylandCraftCommon;
 import dev.evvie.waylandcraft.shared.SharedWindowEntry;
 import dev.evvie.waylandcraft.shared.SharedWindowManager;
 import dev.evvie.waylandcraft.shared.WindowPermission;
+import dev.evvie.waylandcraft.utils.IMyServerPlayer;
 import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.server.level.ServerPlayer;
@@ -44,8 +45,17 @@ public class WaylandCraftNetworking {
 		// 窗口所有者（owner）授权管理命令
 		PayloadTypeRegistry.serverboundPlay().register(SharedWindowPermCommandPayload.TYPE, SharedWindowPermCommandPayload.CODEC);
 		
+		ServerPlayNetworking.registerGlobalReceiver(ServerboundAliveWindowsPayload.TYPE, (payload, ctx) -> {
+			IMyServerPlayer plr = (IMyServerPlayer) ctx.player();
+			ArrayList<Long> handles = plr.getAliveWindows();
+			handles.clear();
+
+			for(long handle : payload.handles()) {
+				handles.add(handle);
+			}
+		});
+
 		ServerPlayNetworking.registerGlobalReceiver(ServerboundGiveItemsPayload.TYPE, WaylandCraftCommon.instance.serverItemManager::handleGiveItemsPayload);
-		ServerPlayNetworking.registerGlobalReceiver(ServerboundAliveWindowsPayload.TYPE, WaylandCraftCommon.instance.serverItemManager::handleAliveWindowsPayload);
 		
 		// 处理客户端请求注册共享窗口
 		// v0.2.31：注册会触发窗口列表广播（遍历所有玩家 + send），切到服务端主线程执行，
