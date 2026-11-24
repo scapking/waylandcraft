@@ -316,6 +316,7 @@ Share windows from the X11 desktop (via `xwayland-satellite`) directly, without 
 
 ## 💡 Tips & Best Practices
 
+- **OpenGL hooking tools** — tools like MangoHud or OBS game capture that hook into OpenGL can prevent the mod from fully initializing; launch without them if windows fail to appear.
 - **Windows stay vertical** — windows are always upright; the vertical axis is locked while dragging and the bottom edge never goes below **0.4 blocks** above the floor. `Ctrl+Scroll` rotates the facing (still vertical).
 - **Precise placement** — read the current pose with `/wl pos <handle>`, then set exact coordinates with `/wl move` (`~` relative offsets supported) and facing with `/wl rotate`.
 - **Server must run the mod** — in multiplayer, `give` / `permission` / `share` depend on server-side logic; without the mod on the server, requests are silently dropped.
