@@ -1,11 +1,15 @@
 package dev.evvie.waylandcraft.item;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.stream.StreamSupport;
 
+import dev.evvie.waylandcraft.network.ServerboundAliveWindowsPayload;
+import dev.evvie.waylandcraft.network.ServerboundGiveItemsPayload;
 import dev.evvie.waylandcraft.utils.IMyServerPlayer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.core.particles.ParticleTypes;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
@@ -48,6 +52,31 @@ public class ServerItemManager implements ServerTickEvents.StartLevelTick {
 				level.sendParticles(ParticleTypes.FLAME, false, false, e.getX(), e.getY(), e.getZ(), 10, 0.15, 0.2, 0.15, 0.1);
 				e.discard();
 			});
+	}
+	
+	public void handleAliveWindowsPayload(ServerboundAliveWindowsPayload payload, ServerPlayNetworking.Context ctx) {
+		IMyServerPlayer plr = (IMyServerPlayer) ctx.player();
+		ArrayList<Long> handles = plr.getAliveWindows();
+		handles.clear();
+		
+		for(long handle : payload.handles()) {
+			handles.add(handle);
+		}
+	}
+	
+	public void handleGiveItemsPayload(ServerboundGiveItemsPayload payload, ServerPlayNetworking.Context ctx) {
+		IMyServerPlayer plr = (IMyServerPlayer) ctx.player();
+		if(plr.getItemGiveCooldown() > 0) return;
+		plr.setItemGiveCooldown(10);
+		
+		ArrayList<Long> handles = new ArrayList<Long>();
+		for(long handle : payload.handles()) {
+			if(handles.contains(handle)) continue;
+			handles.add(handle);
+		}
+		
+		if(payload.missingOnly()) giveItemsIfMissing(ctx.player(), handles);
+		else giveItems(ctx.player(), handles);
 	}
 	
 	private static ServerPlayer getPlayer(ServerLevel level, UUID id) {
