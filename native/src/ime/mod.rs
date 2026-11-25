@@ -148,6 +148,15 @@ pub struct ImeState {
 
     /// 嵌套 IME daemon 生命周期 + 路由决策（imeNested auto|on|off）。
     pub(crate) nested: NestedIme,
+
+    /// 观测网（角标原料）：最近一次 emit_ti_batch 交付批次是否携带非空
+    /// 预编辑——"中文引擎工作态"（协议不暴露引擎名，见 popup_work_state）。
+    /// relay 缓冲语义的只读镜像，不参与任何裁决。
+    last_preedit_active: bool,
+
+    /// 最近一次 fcitx5 种子 outcome 的引擎名列表（/wl ime info 透明化；
+    /// 数据在 nested_tick 的种子分支就地留存——nested_daemon 种子逻辑不动）。
+    seed_engines: Vec<String>,
 }
 
 impl ImeState {
@@ -230,7 +239,73 @@ impl ImeState {
             && kb_active;
         let snap = self.popup.snapshot(visible);
         self.popup.mark_delivered();
+        // 观测网（sync8 静默故障复盘）：交付侧记账——"native 采到了帧"
+        // 与"Java 拿到了可见帧"必须可用数字切分，不再靠日志行序人肉对齐。
+        self.popup.record_delivery(snap.visible);
         Some(snap)
+    }
+
+    /// 候选窗状态简报（`/wl status` ime_candidate_popup 行 +
+    /// `/wl ime info` 共用）。kb_active 由调用方传入（seat 与 ime 拆分借用）。
+    pub fn popup_status_brief(&self, kb_active: bool) -> String {
+        let last = match self.popup.last_visible_delivery_ago_secs() {
+            Some(s) => format!("{s}s前"),
+            None => "从未".to_string(),
+        };
+        format!(
+            "frames={} deliveries={} seq={} epoch={} delivered={} \
+             gate=[role={} frame={} im2active={} focus={} kb={}] last_visible_delivery={}",
+            self.popup.frames_captured(),
+            self.popup.deliveries(),
+            self.popup.seq_for_diag(),
+            self.popup.epoch(),
+            self.popup.delivered(),
+            self.popup.surface().is_some(),
+            self.popup.has_frame(),
+            self.popup_ime_active(),
+            self.has_focus,
+            kb_active,
+            last,
+        )
+    }
+
+    /// 中文引擎工作态（角标原料）：会话激活 + 最近一次交付批次携带非空
+    /// 预编辑。**协议限制**：im2 不暴露引擎名，语义=「有预编辑/候选流的
+    /// 工作态」而非「引擎=拼音」；keyboard-us 直通永不产生预编辑 → 无角标。
+    pub fn popup_work_state(&self) -> bool {
+        self.popup_ime_active() && self.last_preedit_active
+    }
+
+    /// `/wl ime info` 多行报告：nested、种子引擎、候选窗统计、工作态、
+    /// 路由决策原料、serial 诊断计数。全部纯读，零副作用。
+    pub fn ime_info(&self, kb_active: bool) -> String {
+        use crate::ime::NestedPhase;
+        let engines = if self.seed_engines.is_empty() {
+            "(尚未种植/未 spawn fcitx5)".to_string()
+        } else {
+            self.seed_engines.join(", ")
+        };
+        let route = if self.nested_route_live() {
+            if self.keyboard_grabbed() { "im2-grab" } else { "im2" }
+        } else {
+            "host_bridge/raw 回退"
+        };
+        let phase = match self.nested.phase() {
+            NestedPhase::Active => "active",
+            NestedPhase::Starting => "starting",
+            NestedPhase::Disabled => "disabled",
+            NestedPhase::Unconfigured => "unconfigured",
+            NestedPhase::NoBinary => "no_binary",
+            NestedPhase::Failed(_) => "failed",
+        };
+        let mut out = String::new();
+        out.push_str(&format!("nested: {} (phase={phase} route={route})\n", self.nested_status_line()));
+        out.push_str(&format!("已种引擎(种子 outcome): {engines}\n"));
+        out.push_str(&format!("会话: app_active={} focus={} grab={} serial_mismatch={}\n",
+            self.relay.app_active(), self.has_focus, self.keyboard_grabbed(), self.serial_mismatch_commits));
+        out.push_str(&format!("候选窗: {}\n", self.popup_status_brief(kb_active)));
+        out.push_str(&format!("引擎工作态(预编辑流在场): {} —— 协议不暴露引擎名，此为「中文引擎工作态」判定\n", self.popup_work_state()));
+        out
     }
 
     /// 是否有激活的文本输入会话（relay 是唯一事实源，ti3 enable 驱动）。
@@ -284,6 +359,8 @@ impl ImeState {
                         &nested_daemon::SeedPaths::from_process_env(),
                     );
                     self.nested.note_seed_engines(&outcome);
+                    // /wl ime info 透明化：引擎名列表就地留存（种子逻辑不动）。
+                    self.seed_engines = outcome.engines.clone();
                     for note in &outcome.notes {
                         crate::bridge::ime_log_write(&format!(
                             "[waylandcraft][ime][nested] 种子: {note}"
@@ -448,6 +525,9 @@ impl ImeState {
         // 影子计数「记了数但 wire 没发」的漂移来源之一。必须照常执行。
         self.has_focus = false;
         let cmds = self.relay.focus_lost();
+        // 失焦 = 组合流终结兜底（focus_lost 在无激活会话时不产 Deactivate，
+        // exec_on_im2 的复位分支会被跳过——这里统一清工作态角标原料）。
+        self.last_preedit_active = false;
         self.execute_ime_commands(cmds);
         self.popup_touch(); // 可见性原料（ti3 焦点）变化 → 轮询端须感知
     }
@@ -681,6 +761,10 @@ impl ImeState {
         let Some(inst) = self.ti3.instance_mut(&active_id) else {
             return;
         };
+        // 观测网：批次实际交付 → 记录"引擎工作态"原料（非空预编辑在场）。
+        // 放在 DROPPED/无实例早退之后，保证 flag 反映真实交付给应用的形态。
+        self.last_preedit_active =
+            commands.iter().any(|c| matches!(c, TiCommand::Preedit(t, _, _) if !t.is_empty()));
         for cmd in commands {
             match cmd {
                 TiCommand::Preedit(t, b, e) => {
@@ -733,6 +817,9 @@ impl ImeState {
                 self.send_im2_done();
                 // 协议：deactivate 必须使全部现有 popup 不可见 → 同上。
                 self.popup_touch();
+                // 会话终结 = 组合流终结：工作态角标原料必须同步复位
+                //（否则下次 activate 到第一个新批次之间角标虚假在场）。
+                self.last_preedit_active = false;
             }
             ImeCommand::PushState(st) => {
                 self.im2.push_state_events(&st);
@@ -1004,6 +1091,46 @@ mod facade_tests {
         })]);
         let snap = ime.take_lookup_table().expect("应有候选窗");
         assert_eq!(snap.candidates.len(), 2);
+    }
+
+    // ── 观测面（sync8 静默故障复盘）：工作态 / popup 简报 / ime_info ──
+
+    #[test]
+    fn popup_work_state_requires_active_session_and_preedit() {
+        // 默认态：无 im2 端点 → 工作态必须 false（keyboard-us/未激活无角标）。
+        let mut ime = ImeState::default();
+        assert!(!ime.popup_work_state());
+        // 会话 enable 但 im2 端点不在 → 仍 false（popup_ime_active 门）。
+        ime.relay.set_app_enabled(true, "test");
+        assert!(!ime.popup_work_state());
+    }
+
+    #[test]
+    fn popup_status_brief_lists_gate_materials() {
+        // 简报必须包含采集/交付计数、epoch/delivered 与五道可见性门原料，
+        // 让 "/wl status" 一行切分"native 采到帧"与"Java 收到可见帧"。
+        let ime = ImeState::default();
+        let brief = ime.popup_status_brief(true);
+        assert!(brief.contains("frames=0"), "{brief}");
+        assert!(brief.contains("deliveries=0"), "{brief}");
+        assert!(brief.contains("epoch="), "{brief}");
+        assert!(brief.contains("gate=["), "{brief}");
+        assert!(brief.contains("kb=true"), "{brief}");
+        assert!(brief.contains("last_visible_delivery=从未"), "{brief}");
+    }
+
+    #[test]
+    fn ime_info_reports_all_sections() {
+        // 报告分节齐全且为纯读（调用两次结果一致、不消耗任何状态）。
+        let ime = ImeState::default();
+        let a = ime.ime_info(true);
+        let b = ime.ime_info(true);
+        assert_eq!(a, b, "ime_info 必须零副作用");
+        assert!(a.contains("nested:"), "{a}");
+        assert!(a.contains("已种引擎"), "{a}");
+        assert!(a.contains("候选窗:"), "{a}");
+        assert!(a.contains("引擎工作态"), "{a}");
+        assert!(a.contains("会话:"), "{a}");
     }
 
     #[test]

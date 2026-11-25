@@ -217,6 +217,23 @@ impl StatusReport {
             subsystems.push(("nested_ime", entry));
         }
 
+        // ── ime_candidate_popup（游戏内候选窗 overlay 的 native 侧观测面）──
+        // sync8 复盘：候选窗静默不显示，日志无法切分"native 采到帧但
+        // Java 从未收到"。这行把采集/交付/可见性门原料变成可对比数字；
+        // Java 侧 /wl status 逐子系统透传，无需改 Java 解析。
+        {
+            let ime = &wc.state.ime;
+            let brief = ime.popup_status_brief(wc.state.seat.kb_active);
+            let entry = if ime.popup.frames_captured() == 0 {
+                SubEntry::na(format!("{brief}; 尚无采集帧（未组合或 popup 未在场）"))
+            } else if ime.popup.deliveries() == 0 {
+                SubEntry::error(format!("{brief}; 已采集但 Java 从未轮询到变化（tick/JNI 断链）"))
+            } else {
+                SubEntry::ok(brief)
+            };
+            subsystems.push(("ime_candidate_popup", entry));
+        }
+
         // ── xwayland-satellite ──────────────────────────────────
         if let Some(sat) = &wc.state.satellite {
             subsystems.push((

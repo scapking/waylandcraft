@@ -95,6 +95,14 @@ pub struct InputPopupState {
     delivered: u32,
     /// 非 shm 缓冲告警一次性标志（防刷屏）。
     dmabuf_warned: bool,
+    /// 诊断计数（观测网，`/wl status` + `/wl ime info` 消费）：
+    /// 累计采到的帧数（note_frame 次数）。"native 采到帧"与"Java 收到
+    /// 可见帧"之间的断链（生产 sync8 故障形态）靠这组数字切分。
+    frames_captured: u32,
+    /// 累计 JNI 交付次数（take_popup_snapshot 返回 Some 的次数）。
+    deliveries: u32,
+    /// 最后一次交付 visible=true 的时刻（Instant，仅相对时长用）。
+    last_visible_delivery: Option<std::time::Instant>,
 }
 
 impl InputPopupState {
@@ -162,6 +170,7 @@ impl InputPopupState {
         self.frame = Some(PopupFrame { width, height, argb });
         self.seq = self.seq.wrapping_add(1);
         self.epoch = self.epoch.wrapping_add(1);
+        self.frames_captured = self.frames_captured.wrapping_add(1);
     }
 
     /// 缓冲移除（attach(NULL) = fcitx5 隐藏候选窗第一步）：帧清空，
@@ -219,6 +228,36 @@ impl InputPopupState {
 
     pub(crate) fn mark_delivered(&mut self) {
         self.delivered = self.epoch;
+    }
+
+    /// 观测网：take_popup_snapshot 每返回一个 Some(snap) 调用一次，记账
+    /// 交付次数与"最后一次可见交付"时刻（排错时区分"native 采到了但
+    /// Java 从未见 visible"——sync8 生产故障的核心切分点）。
+    pub(crate) fn record_delivery(&mut self, visible: bool) {
+        self.deliveries = self.deliveries.wrapping_add(1);
+        if visible {
+            self.last_visible_delivery = Some(std::time::Instant::now());
+        }
+    }
+
+    /// 观测网访问器（status.rs / ime_info 消费）。
+    pub(crate) fn frames_captured(&self) -> u32 {
+        self.frames_captured
+    }
+    pub(crate) fn deliveries(&self) -> u32 {
+        self.deliveries
+    }
+    pub(crate) fn last_visible_delivery_ago_secs(&self) -> Option<u64> {
+        self.last_visible_delivery.map(|t| t.elapsed().as_secs())
+    }
+    pub(crate) fn epoch(&self) -> u32 {
+        self.epoch
+    }
+    pub(crate) fn seq_for_diag(&self) -> u32 {
+        self.seq
+    }
+    pub(crate) fn delivered(&self) -> u32 {
+        self.delivered
     }
 }
 
@@ -565,6 +604,25 @@ mod tests {
         assert_eq!(snap2.width, 0);
         st.mark_delivered();
         assert!(!st.changed());
+    }
+
+    #[test]
+    fn delivery_stats_track_frames_and_visible_delivery() {
+        // 观测网记账：采集计数随 note_frame 增长；record_delivery 区分
+        // 可见/不可见交付（last_visible 只在 visible=true 时刷新）。
+        let mut st = InputPopupState::default();
+        assert_eq!(st.frames_captured(), 0);
+        assert_eq!(st.deliveries(), 0);
+        assert!(st.last_visible_delivery_ago_secs().is_none());
+        st.note_frame(2, 2, vec![0u8; 16]);
+        st.note_frame(2, 2, vec![1u8; 16]);
+        assert_eq!(st.frames_captured(), 2);
+        st.record_delivery(false);
+        assert_eq!(st.deliveries(), 1);
+        assert!(st.last_visible_delivery_ago_secs().is_none(), "不可见交付不刷新 last_visible");
+        st.record_delivery(true);
+        assert!(st.last_visible_delivery_ago_secs().is_some());
+        assert_eq!(st.deliveries(), 2);
     }
 
     #[test]

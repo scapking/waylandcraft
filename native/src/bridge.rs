@@ -436,6 +436,18 @@ bind_java_type! {
             name = "imePopupFrameNative",
             fn = ime_popup_frame,
         },
+        // 状态透明度：中文引擎工作态（预编辑流在场）——角标判定原料，纯读。
+        static extern fn ime_popup_work_state {
+            sig = (instance: jlong) -> jboolean,
+            name = "imePopupWorkStateNative",
+            fn = ime_popup_work_state,
+        },
+        // /wl ime info：nested/种子/候选窗统计/工作态 多行报告，纯读。
+        static extern fn ime_info {
+            sig = (instance: jlong) -> JString,
+            name = "imeInfoNative",
+            fn = ime_info,
+        },
         // Phase 3 候选窗点选/滚轮回传（进帧序列见 seat popup pointer 通道）。
         static extern fn ime_popup_click {
             sig = (instance: jlong, x: jint, y: jint, button: jint, pressed: jboolean),
@@ -1987,15 +1999,32 @@ fn take_lookup_table<'local>(
     env.new_string(json).map_err(BridgeError::JniError)
 }
 
+/// 候选窗快照 → JNI 字节流（纯函数，编码合同的唯一事实源——
+/// `ime_popup_frame` 生产路径与 tests_popup 合同测试共用，杜绝
+/// "测试复刻编码器漂移"）。格式：`[w i32][h i32][seq u32][visible u8][argb…]`
+/// （小端；argb 仅在场时 w*h*4 字节；总长 = 13 + pixels）。
+pub(crate) fn encode_popup_snapshot(snap: &crate::ime::PopupSnapshot) -> Vec<u8> {
+    let pixels = snap.argb.as_ref().map(|a| a.len()).unwrap_or(0);
+    let mut data = Vec::with_capacity(13 + pixels);
+    data.extend_from_slice(&snap.width.to_le_bytes());
+    data.extend_from_slice(&snap.height.to_le_bytes());
+    data.extend_from_slice(&snap.seq.to_le_bytes());
+    data.push(snap.visible as u8);
+    if let Some(argb) = &snap.argb {
+        data.extend_from_slice(argb);
+    }
+    data
+}
+
 /// imePopupFrame(instance) —— 轮询嵌套 fcitx5 候选窗帧（Phase 1）。
 ///
-/// 编码（小端）：`[width i32][height i32][seq u32][visible u8][argb…]`，
-/// 其中 argb 仅 visible=1 时在场（w*h*4 字节，ARGB8888 小端内存序，
-/// 即 u32 0xAARRGGBB/像素——Java 侧 ByteBuffer.getInt() 直接解出标准
-/// ARGB int）。**返回 null = 自上次轮询以来无任何状态变化**（无新帧且
-/// 可见性原料未变），零拷贝；无 popup 时同样落在这条极廉价路径。
+/// 编码见 [`encode_popup_snapshot`]（合同测试双语言锚定：
+/// tests_popup::popup_java_polling_sequence_matches_wire_encoding_contract
+/// + ImeCandidateLayoutTest.nativeGoldenFrameDecodesExactly）。
+/// **返回 null = 自上次轮询以来无任何状态变化**（无新帧且可见性原料未变），
+/// 零拷贝；无 popup 时同样落在这条极廉价路径。
 ///
-/// Java 侧解码为 `ImeCandidateOverlay.PopupFrame`：null→保持现状；
+/// Java 侧解码为 `ImeCandidateLayout.Frame`：null→保持现状；
 /// visible=false→隐藏；visible=true+新 seq→上传纹理并显示。
 fn ime_popup_frame<'local>(
     env: &mut Env<'local>,
@@ -2008,16 +2037,35 @@ fn ime_popup_frame<'local>(
     let Some(snap) = instance.state.ime.take_popup_snapshot(kb_active) else {
         return Ok(JPrimitiveArray::null());
     };
-    let pixels = snap.argb.as_ref().map(|a| a.len()).unwrap_or(0);
-    let mut data = Vec::with_capacity(13 + pixels);
-    data.extend_from_slice(&snap.width.to_le_bytes());
-    data.extend_from_slice(&snap.height.to_le_bytes());
-    data.extend_from_slice(&snap.seq.to_le_bytes());
-    data.push(snap.visible as u8);
-    if let Some(argb) = &snap.argb {
-        data.extend_from_slice(argb);
-    }
+    let data = encode_popup_snapshot(&snap);
     Ok(env.byte_array_from_slice(&data)?)
+}
+
+/// imePopupWorkState(instance) —— 中文引擎工作态（状态透明度角标用）。
+/// 语义：im2 端点在位且会话激活 **且** 最近一次交付给应用的批次携带
+/// 非空预编辑（= 拼音引擎正在组合）。协议限制如实标注：im2 不向合成器
+/// 暴露引擎名，这里不是"引擎 == 拼音"，而是"有预编辑/候选流的工作态"。
+/// 纯读（不消耗 epoch、零拷贝），每帧轮询安全。
+fn ime_popup_work_state<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<jboolean, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imePopupWorkState")?;
+    Ok(instance.state.ime.popup_work_state())
+}
+
+/// imeInfo(instance) —— /wl ime info 多行报告：nested 状态、已种引擎、
+/// 候选窗统计、工作态、路由与 serial 诊断计数。纯读。
+fn ime_info<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeInfo")?;
+    let kb_active = instance.state.seat.kb_active;
+    let text = instance.state.ime.ime_info(kb_active);
+    env.new_string(text).map_err(BridgeError::JniError)
 }
 
 /// imePopupClick(instance, x, y, button, pressed) —— 候选窗 overlay 区域

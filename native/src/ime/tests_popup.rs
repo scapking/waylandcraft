@@ -707,6 +707,82 @@ fn popup_double_role_posts_protocol_error() {
     assert!(f.ime.flush_err(), "协议错误后 client 连接必须已死");
 }
 
+// ═══════════════ Java 轮询 × JNI 编码合同（sync8 静默故障复盘）═══════════════
+
+/// Java 每 tick 轮询的 native 半程复刻：`ImeCandidateOverlay.tick()` 每帧
+/// 调 `take_popup_snapshot(kb_active)` 再按 `bridge::encode_popup_snapshot`
+/// 编码——**这是编码合同测试**：若这里断，根因在 native；全绿则根因锁定
+/// Java 运行时链（tick→upload→extract）。断言：
+/// - 角色登记轮：13 字节不可见帧（epoch 由 created 推进）；
+/// - 提交帧轮：`13 + w*h*4`、头 `[w i32][h i32][seq u32][visible u8]` 逐字段、
+///   像素与 shm 图案逐字节，且与 Java 测试固化的 golden hexdump 全等；
+/// - 无变化连续 60 轮：全部 null（零拷贝——Java 靠保留 current 维持显示）；
+/// - attach(NULL) 隐藏轮：13 字节 visible=0；
+/// - 观测网统计：frames_captured/deliveries/last_visible 与轮次一致。
+#[test]
+fn popup_java_polling_sequence_matches_wire_encoding_contract() {
+    let mut f = setup_popup();
+    f.focus_and_enable();
+
+    // 1) popup 角色登记（尚无帧）→ tick 应见 13 字节不可见交付。
+    let qh = f.ime.qh();
+    let surface = f.ime.state.compositor.as_ref().unwrap().create_surface(&qh, ());
+    let _popup = f.ime.state.im.as_ref().unwrap().get_input_popup_surface(&surface, &qh, ());
+    assert!(f.drive());
+    let raw = poll_java_tick(&mut f, true).expect("角色登记推进 epoch，tick 应有交付");
+    assert_eq!(raw.len(), 13, "无帧交付必须恰为 13 字节头");
+    assert_eq!(raw[12], 0, "无帧时 visible=0");
+
+    // 2) attach/damage/commit 一帧 4x3（经典 fcitx5 classicui shm ARGB8888）。
+    let px = argb_pattern(4, 3, 0);
+    let buf = ShmBuf::new(&f.ime.state, &qh, 4, 3, 16, wl_shm::Format::Argb8888);
+    buf.write(&px);
+    surface.attach(Some(&buf.buffer), 0, 0);
+    surface.damage_buffer(0, 0, 4, 3);
+    surface.commit();
+    assert!(f.drive());
+    let raw = poll_java_tick(&mut f, true).expect("新帧必须在下一 tick 交付");
+    assert_eq!(raw.len(), 13 + 4 * 3 * 4, "编码总长 = 13 + w*h*4");
+    assert_eq!(&raw[0..4], &4i32.to_le_bytes(), "w");
+    assert_eq!(&raw[4..8], &3i32.to_le_bytes(), "h");
+    assert_eq!(&raw[8..12], &1i32.to_le_bytes(), "seq（首帧=1）");
+    assert_eq!(raw[12], 1, "四门全开（frame/im2+active/focus/kb）→ visible=1");
+    assert_eq!(&raw[13..], &px[..], "像素逐字节直通 shm ARGB8888 小端图案");
+
+    // Golden fixture：与 Java ImeCandidateLayoutTest.nativeGoldenFrameMatchesBridgeEncoding
+    // 固化的 hexdump 逐字节对齐（跨语言合同——编码改了两侧一起红）。
+    const GOLDEN_HEX: &str = "04000000030000000100000001112244ff102345ff132046ff122147ff\
+        013254ff003355ff033056ff023157ff310264ff300365ff330066ff320167ff";
+    let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, GOLDEN_HEX, "JNI 字节流必须与 Java 侧解码 fixture 全等");
+
+    // 3) 无变化连续轮询（模拟 Java 60 tick）→ 全部 null（零拷贝路径）。
+    for i in 0..60 {
+        assert!(poll_java_tick(&mut f, true).is_none(), "第 {i} 轮无变化必须 null");
+    }
+
+    // 4) attach(NULL)（WaylandShmWindow::hide 第一步）→ 13 字节 visible=0。
+    surface.attach(None, 0, 0);
+    surface.commit();
+    assert!(f.drive());
+    let raw = poll_java_tick(&mut f, true).expect("隐藏应交付状态");
+    assert_eq!(raw.len(), 13);
+    assert_eq!(raw[12], 0);
+
+    // 5) 观测网统计与轮次一致（/wl status ime_candidate_popup 原料）。
+    assert_eq!(f.server.ime.popup.frames_captured(), 1, "采集帧计数");
+    assert_eq!(f.server.ime.popup.deliveries(), 3, "13B登记 + 可见帧 + 隐藏 = 3 次交付");
+    assert!(f.server.ime.popup.last_visible_delivery_ago_secs().is_some(), "visible 交付时刻已记账");
+    assert_eq!(f.server.ime.popup.epoch(), f.server.ime.popup.delivered(), "轮询耗尽后 epoch==delivered");
+}
+
+/// Java tick 的 native 半程：take_popup_snapshot + bridge 编码（共用生产
+/// 纯函数，非复刻实现——编码漂移这里直接红）。
+fn poll_java_tick(f: &mut PopupFixture, kb_active: bool) -> Option<Vec<u8>> {
+    let snap = f.server.ime.take_popup_snapshot(kb_active)?;
+    Some(crate::bridge::encode_popup_snapshot(&snap))
+}
+
 // ═══════════════════════ Phase 3：pointer 点选回传 ═══════════════════════
 
 /// overlay 区域点击 → native 向 popup surface 发 enter→(motion)→button
