@@ -45,30 +45,17 @@ public class WaylandCraftNetworking {
 		// 窗口所有者（owner）授权管理命令
 		PayloadTypeRegistry.serverboundPlay().register(SharedWindowPermCommandPayload.TYPE, SharedWindowPermCommandPayload.CODEC);
 		
-		ServerPlayNetworking.registerGlobalReceiver(ServerboundGiveItemsPayload.TYPE, (payload, ctx) -> {
-			IMyServerPlayer plr = (IMyServerPlayer) ctx.player();
-			if(plr.getItemGiveCooldown() > 0) return;
-			plr.setItemGiveCooldown(10);
-			
-			ArrayList<Long> handles = new ArrayList<Long>();
-			for(long handle : payload.handles()) {
-				if(handles.contains(handle)) continue;
-				handles.add(handle);
-			}
-			
-			if(payload.missingOnly()) WaylandCraftCommon.instance.serverItemManager.giveItemsIfMissing(ctx.player(), handles);
-			else WaylandCraftCommon.instance.serverItemManager.giveItems(ctx.player(), handles);
-		});
-		
 		ServerPlayNetworking.registerGlobalReceiver(ServerboundAliveWindowsPayload.TYPE, (payload, ctx) -> {
 			IMyServerPlayer plr = (IMyServerPlayer) ctx.player();
 			ArrayList<Long> handles = plr.getAliveWindows();
 			handles.clear();
-			
+
 			for(long handle : payload.handles()) {
 				handles.add(handle);
 			}
 		});
+
+		ServerPlayNetworking.registerGlobalReceiver(ServerboundGiveItemsPayload.TYPE, WaylandCraftCommon.instance.serverItemManager::handleGiveItemsPayload);
 		
 		// 处理客户端请求注册共享窗口
 		// v0.2.31：注册会触发窗口列表广播（遍历所有玩家 + send），切到服务端主线程执行，

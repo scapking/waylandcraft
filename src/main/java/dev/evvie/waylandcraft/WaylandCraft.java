@@ -167,7 +167,6 @@ public class WaylandCraft implements ClientModInitializer {
 	
 	public PointerCapture pointerCapture = null;
 	
-	private boolean playerUsingWindowItem = false;
 	private boolean playerWasUsingWindowItem = false;
 	
 	public @Nullable CursorShape cursorShape = null;
@@ -186,6 +185,7 @@ public class WaylandCraft implements ClientModInitializer {
 		LevelRenderEvents.END_EXTRACTION.register(this::updateWorld);
 		ClientTickEvents.END_CLIENT_TICK.register(this::onClientTick);
 		ClientPlayConnectionEvents.JOIN.register(this::onClientJoin);
+		ClientPlayConnectionEvents.DISCONNECT.register(this::onClientDisconnect);
 		ItemTooltipCallback.EVENT.register(this::addWindowItemTooltip);
 		ClientTickEvents.START_CLIENT_TICK.register(itemManager);
 		
@@ -423,32 +423,34 @@ public class WaylandCraft implements ClientModInitializer {
 			}
 		}
 		
-		if(Minecraft.getInstance().player == null || !Minecraft.getInstance().player.isUsingItem()) playerUsingWindowItem = false;
-		if(playerUsingWindowItem) {
-			ItemStack item = Minecraft.getInstance().player.getUseItem();
-			if(item.is(WindowItem.WINDOW)) {
-				WLCToplevel toplevel = getToplevel(item);
-				
-				if(toplevel != null) {
-					WindowDisplay display = getOrCreateDisplay(toplevel);
-					if(!playerWasUsingWindowItem) {
-						display.anchorDistance = 2.0;
-					}
-					
-					display.doGrabMove(camera.position(), new Vec3(camera.forwardVector()), new Vec3(camera.upVector()), camera.yRot());
-					
-					WaylandCraft.instance.bridge.focusSurface(toplevel);
+		ItemStack useItem;
+		if((useItem = getPlayerUseWindowItem()) != null) {
+			WLCToplevel toplevel = getToplevel(useItem);
+			
+			if(toplevel != null) {
+				WindowDisplay display = getOrCreateDisplay(toplevel);
+				if(!playerWasUsingWindowItem) {
+					display.anchorDistance = 2.0;
 				}
+				
+				display.doGrabMove(camera.position(), new Vec3(camera.forwardVector()), new Vec3(camera.upVector()), camera.yRot());
+				
+				WaylandCraft.instance.bridge.focusSurface(toplevel);
 			}
-			else playerUsingWindowItem = false;
 		}
-		playerWasUsingWindowItem = playerUsingWindowItem;
+		playerWasUsingWindowItem = useItem != null;
 		
 		updateOutputSize(inWMScreen);
 	}
 	
-	public void startUsingWindowItem() {
-		playerUsingWindowItem = true;
+	public @Nullable ItemStack getPlayerUseWindowItem() {
+		LocalPlayer player = Minecraft.getInstance().player;
+		if(player == null) return null;
+		
+		ItemStack useItem = player.getUseItem();
+		if(useItem == null) return null;
+		
+		return useItem.getItem() instanceof WindowItem ? useItem : null;
 	}
 	
 	/**
@@ -598,7 +600,10 @@ public class WaylandCraft implements ClientModInitializer {
 	
 	public void onClientTick(Minecraft minecraft) {
 		if(minecraft.player == null) return;
+		checkKeybinds(minecraft);
+	}
 		
+	private void checkKeybinds(Minecraft minecraft) {
 		if(keyOpenScreen.consumeClick()) {
 			if(bridge == null) {
 				minecraft.getChatListener().handleSystemMessage(Component.literal("WaylandCraft viewer-only mode: local window capture unavailable on this platform; you can still view shared windows"), false);
@@ -641,6 +646,11 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 		minecraft.getChatListener().handleSystemMessage(Component.literal("Wayland compositor running on " + waylandSocket), false);
 		itemManager.giveItemsIfMissing(bridge.getMappedToplevels());
+	}
+	
+	private void onClientDisconnect(ClientPacketListener listener, Minecraft minecraft) {
+		displays.clear();
+		itemManager.reset();
 	}
 	
 	@Nullable
@@ -1142,8 +1152,9 @@ public class WaylandCraft implements ClientModInitializer {
 	 * Returns true when the mouse scroll action has been consumed
 	 */
 	public boolean onScroll(long windowHandle, double scrollX, double scrollY) {
-		if(playerUsingWindowItem) {
-			WLCToplevel toplevel = getToplevel(Minecraft.getInstance().player.getUseItem());
+		ItemStack useItem = getPlayerUseWindowItem();
+		if(useItem != null) {
+			WLCToplevel toplevel = getToplevel(useItem);
 			if(toplevel != null) {
 				WindowDisplay display = getDisplay(toplevel);
 				if(display != null) {
