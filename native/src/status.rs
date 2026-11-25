@@ -241,10 +241,23 @@ impl StatusReport {
         }
 
         // ── audio / portal ──────────────────────────────────────
-        subsystems.push((
-            "audio_capture",
-            SubEntry::na("see waylandcraft-audio.log"),
-        ));
+        // per-app 捕获上线后不再只指路日志：直接报捕获模式
+        // （per-app / monitor-fallback / idle）+ 目标节点。
+        // audio_capture_brief 用 try_lock，状态采集绝不阻塞帧循环。
+        match crate::audio_capture::audio_capture_brief() {
+            crate::audio_capture::CaptureBrief::PerApp(d) => {
+                subsystems.push(("audio_capture", SubEntry::ok(format!("mode=per-app {}", d))));
+            }
+            crate::audio_capture::CaptureBrief::MonitorFallback(d) => {
+                subsystems.push((
+                    "audio_capture",
+                    SubEntry::degraded(format!("mode=monitor-fallback {}", d)),
+                ));
+            }
+            crate::audio_capture::CaptureBrief::Idle(d) => {
+                subsystems.push(("audio_capture", SubEntry::na(format!("{}; see waylandcraft-audio.log", d))));
+            }
+        }
         subsystems.push((
             "portal_capture",
             SubEntry::na("see waylandcraft-launch.log"),
