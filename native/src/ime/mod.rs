@@ -56,6 +56,7 @@
 
 mod ime_event;
 mod input_method_v2;
+pub(crate) mod input_popup;
 mod nested_daemon;
 mod relay;
 mod text_input_v3;
@@ -65,12 +66,15 @@ mod virtual_keyboard;
 mod tests;
 #[cfg(test)]
 mod tests_real;
+#[cfg(test)]
+mod tests_popup;
 
 pub use ime_event::{
     Commit, CursorRect, DeleteSurrounding, Done, DownEvent, FocusChange, KeyEvent,
     LookupTable, PreeditUpdate, SurroundingText, UpEvent,
 };
 pub use input_method_v2::InputMethodV2State;
+pub use input_popup::{InputPopupState, PopupFrame, PopupSnapshot};
 pub use nested_daemon::{NestedIme, NestedMode, NestedPhase};
 pub use relay::{AppState, ImeCommand, ImeOp, Relay, TiCommand};
 pub use text_input_v3::TextInputV3State;
@@ -126,6 +130,12 @@ pub struct ImeState {
     /// zwp_virtual_keyboard_v1 实例（引擎未消费键的直通回注通道）。
     pub(crate) vks: VirtualKeyboardState,
 
+    /// `zwp_input_popup_surface_v2` 候选窗 surface 的角色登记 + 帧采集队列
+    /// （Phase 1）。挂在这里而非 `im2.popup` 字段：后者只维护协议对象与
+    /// 矩形上报（input_method_v2.rs 职责），本字段负责像素采集与 JNI 取帧，
+    /// 两者生命周期一致但关注点分离。
+    pub(crate) popup: InputPopupState,
+
     /// 协议中继状态机：serial 记账、原子缓冲、丢弃判定。
     pub(crate) relay: Relay,
 
@@ -149,6 +159,78 @@ impl ImeState {
     /// 设置候选窗快照（host_bridge 上行 LookupTable 时缓存，Java 拉取）。
     pub(crate) fn set_lookup_table(&mut self, snap: LookupTableSnapshot) {
         self.lookup_table = Some(snap);
+    }
+
+    // ── 候选窗 popup surface 采集（Phase 1，input_popup.rs 门面）──
+
+    /// `zwp_input_method_v2.get_input_popup_surface` 落地：登记 input_popup 角色、
+    /// 记住该 surface 以便 commit 时认领缓冲。由 input_method_v2.rs 调用。
+    pub(crate) fn register_popup_role(
+        &mut self,
+        popup: &smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::server::zwp_input_popup_surface_v2::ZwpInputPopupSurfaceV2,
+        surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) {
+        self.popup.created(popup.id(), surface);
+    }
+
+    /// popup 角色对象销毁（`zwp_input_popup_surface_v2.destroy` 或客户端断连）：
+    /// 仅当销毁的就是当前登记对象时解除采集。
+    pub(crate) fn clear_popup_role(
+        &mut self,
+        popup_id: smithay::reexports::wayland_server::backend::ObjectId,
+    ) {
+        self.popup.gone_for(popup_id);
+    }
+
+    /// 可见性原料（焦点/激活态）变化时推进 epoch，让 Java 轮询感知
+    /// "内容没变但可见性变了"（候选窗须即时显隐）。
+    pub(crate) fn popup_touch(&mut self) {
+        self.popup.touch();
+    }
+
+    /// 供 `input_popup::on_popup_commit` 采集帧后判定可见性用：IME 是否处于
+    /// 激活会话（im2 端点在位且 relay 判定会话 active）。
+    pub(crate) fn popup_ime_active(&self) -> bool {
+        self.im2.instance.is_some() && self.relay.app_active()
+    }
+
+    /// 当前存活的 popup 底层 surface（Phase 3 点击回传目标；已销毁 → None）。
+    pub(crate) fn popup_surface(&self) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
+        self.popup.surface().cloned()
+    }
+
+    /// 若销毁对象就是当前 popup 且其 surface 仍存活 → 返回它以补 pointer
+    /// leave（client 侧 pointer 焦点一致性，见 seat::popup_pointer_leave）。
+    pub(crate) fn popup_pointer_target(&self, popup_id: smithay::reexports::wayland_server::backend::ObjectId) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
+        if self.popup.role_matches(popup_id) {
+            self.popup.surface().cloned()
+        } else {
+            None
+        }
+    }
+
+    /// Java 每帧轮询候选窗帧（Phase 1 JNI 出口）。
+    ///
+    /// 返回 `None` 表示"无新状态，零拷贝"（seq 未变且可见性原料未变）；
+    /// 返回 `Some(snapshot)` 时 snapshot 携带最新可见性与（可见时的）ARGB8888
+    /// 像素。无 popup 角色时走极廉价路径（一次布尔比较即返回 None）。
+    ///
+    /// 可见性 = popup 角色在场 && 已采到帧 && IME 激活会话 && ti3 键盘焦点在
+    /// && 游戏 focused（`kb_active`，Java keyboardActivate/Deactivate 维护）。
+    /// 这是协议 activate/deactivate"popup 仅在 IM active 时可见"语义的本地
+    /// 落实（v2 无显式 visible 事件，见 input_popup.rs 模块头）。
+    /// Java 侧再叠加"聊天框 focused"等屏幕语境决定是否真的绘制。
+    pub fn take_popup_snapshot(&mut self, kb_active: bool) -> Option<PopupSnapshot> {
+        if !self.popup.changed() {
+            return None;
+        }
+        let visible = self.popup.has_frame()
+            && self.popup_ime_active()
+            && self.has_focus
+            && kb_active;
+        let snap = self.popup.snapshot(visible);
+        self.popup.mark_delivered();
+        Some(snap)
     }
 
     /// 是否有激活的文本输入会话（relay 是唯一事实源，ti3 enable 驱动）。
@@ -286,6 +368,7 @@ impl ImeState {
         state: &mut crate::WLCState,
     ) {
         self.has_focus = true;
+        self.popup_touch(); // 可见性原料（ti3 焦点）变化 → 轮询端须感知
         let had_focus = self.ti3.focus_surface().is_some();
         // 1. ti3 wire 层：enter 该 surface（协议要求：enter 必须发给聚焦
         // client 的全部 ti3 实例）。
@@ -366,6 +449,7 @@ impl ImeState {
         self.has_focus = false;
         let cmds = self.relay.focus_lost();
         self.execute_ime_commands(cmds);
+        self.popup_touch(); // 可见性原料（ti3 焦点）变化 → 轮询端须感知
     }
 
     /// 激活的 ti3 实例被销毁（text_input_v3.rs Dispatch 调用）：
@@ -416,6 +500,9 @@ impl ImeState {
         self.im2.instance = None;
         self.im2.grab = None;
         self.im2.popup = None;
+        // popup 角色随 input_method 对象一并销毁（协议 destroy 语义：input_method
+        // 销毁即销毁其 popup 子对象）：解除采集轨道、让 Java 轮询看到消失。
+        self.popup.cleared();
         crate::bridge::ime_log_write(
             "[waylandcraft][ime][im2] 输入法客户端断开 → 回退 host_bridge/raw",
         );
@@ -635,12 +722,17 @@ impl ImeState {
                 }
                 self.im2.push_state_events(&st);
                 self.send_im2_done();
+                // 协议：activate 使全部现有 popup 可见 → 推进采集轨道 epoch，
+                // 让 Java 轮询即时反映候选窗显隐（v2 无显式 visible 事件）。
+                self.popup_touch();
             }
             ImeCommand::Deactivate => {
                 if let Some(inst) = &self.im2.instance {
                     inst.obj.deactivate();
                 }
                 self.send_im2_done();
+                // 协议：deactivate 必须使全部现有 popup 不可见 → 同上。
+                self.popup_touch();
             }
             ImeCommand::PushState(st) => {
                 self.im2.push_state_events(&st);

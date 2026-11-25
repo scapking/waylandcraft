@@ -1095,7 +1095,27 @@ public class WaylandCraft implements ClientModInitializer {
 	/* Handle mouse button input
 	 * Returns true when the mouse button action has been consumed
 	 */
+	/** GUI 逻辑坐标鼠标位置（MC 26.1.2 mouseHandler，与 overlay 绘制同坐标系）。 */
+	private static double imeMouseX() {
+		Minecraft mc = Minecraft.getInstance();
+		return mc.mouseHandler.getScaledXPos(mc.getWindow());
+	}
+
+	private static double imeMouseY() {
+		Minecraft mc = Minecraft.getInstance();
+		return mc.mouseHandler.getScaledYPos(mc.getWindow());
+	}
+
 	public boolean onButtonPress(long windowHandle, int button, int action, int modifiers) {
+		// IME 候选窗 overlay 优先拦截（Phase 3）：仅在 overlay 显示期间且点在
+		// 其区域内才消费——事件经 imePopupClick 回传嵌套 fcitx5 的 popup
+		// surface（引擎自绘命中，waylandpointer.cpp 取证）。不满足则整段跳过，
+		// 既有窗口直通语义零改变；键盘（含 ESC 关聊天框）不经此路径，无影响。
+		if(dev.evvie.waylandcraft.ime.ImeCandidateOverlay.handleClick(
+				imeMouseX(), imeMouseY(), button, action != 0)) {
+			return true;
+		}
+
 		if(pointerCapture != null) {
 			if(action == 1 && !pointerCapture.pressedButtons.contains(button)) {
 				bridge.sendButton(0x110 + button, 1);
@@ -1230,6 +1250,13 @@ public class WaylandCraft implements ClientModInitializer {
 	 * Returns true when the mouse scroll action has been consumed
 	 */
 	public boolean onScroll(long windowHandle, double scrollX, double scrollY) {
+		// IME 候选窗 overlay 优先拦截（Phase 3，与 onButtonPress 同规则：
+		// 仅 overlay 区域内消费；窗外滚轮维持窗口缩放/聊天历史等既有语义）。
+		if(dev.evvie.waylandcraft.ime.ImeCandidateOverlay.handleScroll(
+				imeMouseX(), imeMouseY(), scrollY)) {
+			return true;
+		}
+
 		ItemStack useItem = getPlayerUseWindowItem();
 		if(useItem != null) {
 			WLCToplevel toplevel = getToplevel(useItem);

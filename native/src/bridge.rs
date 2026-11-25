@@ -429,6 +429,24 @@ bind_java_type! {
             name = "takeLookupTableNative",
             fn = take_lookup_table,
         },
+        // Phase 1 候选窗帧轮询：byte[] = [w i32][h i32][seq u32][visible u8]
+        // [argb w*h*4]；**null = 无新状态**（零拷贝廉价路径，见 ime_popup_frame）。
+        static extern fn ime_popup_frame {
+            sig = (instance: jlong) -> byte[],
+            name = "imePopupFrameNative",
+            fn = ime_popup_frame,
+        },
+        // Phase 3 候选窗点选/滚轮回传（进帧序列见 seat popup pointer 通道）。
+        static extern fn ime_popup_click {
+            sig = (instance: jlong, x: jint, y: jint, button: jint, pressed: jboolean),
+            name = "imePopupClickNative",
+            fn = ime_popup_click,
+        },
+        static extern fn ime_popup_axis {
+            sig = (instance: jlong, x: jint, y: jint, dy: jdouble),
+            name = "imePopupAxisNative",
+            fn = ime_popup_axis,
+        },
         static extern fn update_cursor_rect {
             sig = (instance: jlong, x: jint, y: jint, w: jint, h: jint),
             name = "updateCursorRectNative",
@@ -1556,6 +1574,9 @@ fn keyboard_activate<'local>(
 ) -> Result<(), BridgeError> {
     let instance = jptr_to_instance!(instance, "keyboardActivate")?;
     instance.state.seat.activate_keyboard();
+    // 游戏 focused 原料变化 → 候选窗可见性可能翻转，推进采集 epoch
+    // （否则 kb_active false→true 而内容不变时，轮询看不到 visible=true）。
+    instance.state.ime.popup_touch();
 
     Ok(())
 }
@@ -1567,6 +1588,7 @@ fn keyboard_deactivate<'local>(
 ) -> Result<(), BridgeError> {
     let instance = jptr_to_instance!(instance, "keyboardDeactivate")?;
     instance.state.seat.deactivate_keyboard();
+    instance.state.ime.popup_touch();
 
     Ok(())
 }
@@ -1963,6 +1985,91 @@ fn take_lookup_table<'local>(
         None => String::new(),
     };
     env.new_string(json).map_err(BridgeError::JniError)
+}
+
+/// imePopupFrame(instance) —— 轮询嵌套 fcitx5 候选窗帧（Phase 1）。
+///
+/// 编码（小端）：`[width i32][height i32][seq u32][visible u8][argb…]`，
+/// 其中 argb 仅 visible=1 时在场（w*h*4 字节，ARGB8888 小端内存序，
+/// 即 u32 0xAARRGGBB/像素——Java 侧 ByteBuffer.getInt() 直接解出标准
+/// ARGB int）。**返回 null = 自上次轮询以来无任何状态变化**（无新帧且
+/// 可见性原料未变），零拷贝；无 popup 时同样落在这条极廉价路径。
+///
+/// Java 侧解码为 `ImeCandidateOverlay.PopupFrame`：null→保持现状；
+/// visible=false→隐藏；visible=true+新 seq→上传纹理并显示。
+fn ime_popup_frame<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imePopupFrame")?;
+    // 拆分借用：kb_active 在 seat、快照在 ime——顺序读避免双 &mut。
+    let kb_active = instance.state.seat.kb_active;
+    let Some(snap) = instance.state.ime.take_popup_snapshot(kb_active) else {
+        return Ok(JPrimitiveArray::null());
+    };
+    let pixels = snap.argb.as_ref().map(|a| a.len()).unwrap_or(0);
+    let mut data = Vec::with_capacity(13 + pixels);
+    data.extend_from_slice(&snap.width.to_le_bytes());
+    data.extend_from_slice(&snap.height.to_le_bytes());
+    data.extend_from_slice(&snap.seq.to_le_bytes());
+    data.push(snap.visible as u8);
+    if let Some(argb) = &snap.argb {
+        data.extend_from_slice(argb);
+    }
+    Ok(env.byte_array_from_slice(&data)?)
+}
+
+/// imePopupClick(instance, x, y, button, pressed) —— 候选窗 overlay 区域
+/// 点击回传（Phase 3）。x/y = popup surface 局部像素；button = evdev 码
+/// （BTN_LEFT=0x110）。native 走 seat popup pointer 通道发
+/// enter（必要时 leave 旧面）→ motion → button，每事件后补 frame。
+/// 候选命中与上屏由 fcitx5 InputPanel 自己完成（inputwindow.cpp 取证）。
+/// 无存活 popup 时极廉价返回。
+fn ime_popup_click<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    x: jint,
+    y: jint,
+    button: jint,
+    pressed: jboolean,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "imePopupClick")?;
+    let Some(surface) = instance.state.ime.popup_surface() else {
+        return Ok(());
+    };
+    instance.state.seat.popup_pointer_click(
+        &surface,
+        x.max(0) as f64,
+        y.max(0) as f64,
+        button as u32,
+        pressed, // jni 0.22 的 jboolean 即 Rust bool
+    );
+    Ok(())
+}
+
+/// imePopupAxis(instance, x, y, dy) —— 候选窗区域滚轮回传（Phase 3）。
+/// dy = notch 数（已按游戏窗口通路约定取负：正=向下翻页方向同 sendScroll）。
+fn ime_popup_axis<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    x: jint,
+    y: jint,
+    dy: jdouble,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "imePopupAxis")?;
+    let Some(surface) = instance.state.ime.popup_surface() else {
+        return Ok(());
+    };
+    instance.state.seat.popup_pointer_axis(
+        &surface,
+        x.max(0) as f64,
+        y.max(0) as f64,
+        dy,
+    );
+    Ok(())
 }
 
 /// C 方案：Java 端 CursorRectReporter 已不再需要（嵌套应用通过自己的 ti3
