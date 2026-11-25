@@ -456,6 +456,16 @@ impl<'a> WaylandCraft<'a> {
             }
         }
 
+        // v0.14 嵌套 IME daemon：探活/bind 超时/退避/spawn 每帧裁决
+        // （5s 退避、10s bind 超时、连续 3 次封顶；决策全走 ime.log ⑥
+        // 时间戳行，失败进 error ring）。spawn 双 fork 同步返回，无阻塞。
+        // 未拿到 Java 注入的隔离 HOME（settings 未同步）时只会停在
+        // Unconfigured——不会有孤儿进程。
+        {
+            let st = &mut self.state;
+            st.ime.nested_tick(std::time::Instant::now(), &st.socket);
+        }
+
         // v0.13.6：每帧检查 satellite 是否还活着——死了自动 restart。
         // 这是修复"firefox 30 秒后 crash / cannot open display: :2"的根因：
         // xwayland-satellite panic 死掉后，DISPLAY=:2 永久不可用。restart 让

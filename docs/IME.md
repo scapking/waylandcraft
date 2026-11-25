@@ -3,6 +3,16 @@
 > 本文档描述 v0.9.27+ 的输入法实现。该版本是一次**协议层重构**：
 > 删除了旧的 text-input-v1 / input-method-v1 路径与全部 workaround，
 > 以标准现代协议栈（zwp_text_input_v3 + zwp_input_method_v2）为核心重建。
+>
+> **v0.14 更新（本文以「v0.9.27 重构摘要」一节为准的协议内核已恢复并沿用）**：
+> v0.10 曾删除 im2/relay 路线改走 host dbus 穿透，但实测天花板已到——宿主
+> 引擎的 focus 状态归宿主会话管理（GNOME/mutter 隔离），每个
+> ProcessKeyEvent 恒返回 consumed=false，中文永远打不出（详见
+> IME_RESEARCH_CONCLUSIONS.md）。v0.14 恢复 v0.9.27 的 im2+relay 架构，并
+> 升级为**嵌套 IM 守护进程路线**：在我们的嵌套 WAYLAND_DISPLAY 上拉起一个
+> 独立的 fcitx5/ibus 实例作为 IME 客户端，引擎状态完全归嵌套会话所有，
+> 宿主 focus 隔离问题从根上消失。host_bridge（dbus 穿透）保留为**可选后备
+> 路径**。完整设计与路由决策表见文末「v0.14 嵌套 IM 守护进程路线」。
 
 ## v0.9.27 重构摘要：为什么旧实现无法工作 & 新实现如何解决
 
@@ -287,4 +297,101 @@ ProcessKeyEvent 异步往返后在下一帧 `poll` 里裁决 —— 消费则丢
   等 dbus-fcitx5 后端）。
 - ibus 进程僵死时其回复不会到达，被接管的按键将不再投递（如实失败，
   不猜测语义）；连接失效会进入 TRANSIENT 重试链路。
+
+## v0.14 嵌套 IM 守护进程路线（Nested IM Daemon）
+
+### 背景：为什么必须放弃"宿主穿透为主"
+
+host dbus-ibus/dbus-fcitx5 路线在实测中的硬天花板：宿主桌面会话
+（GNOME/mutter、KWin）自己管理 IME 的 focus 状态，waylandcraft 进程提交的
+按键在宿主引擎里**永远不会让对应 input context 成为 focused**。实测每个
+`ProcessKeyEvent` 都返回 `consumed=false`，引擎永不激活——英文/符号靠
+raw 直通可用（sync4/5 修复），**中文始终打不出**。这是宿主会话隔离的
+结构性后果，不是我们代码的 bug，无法在 dbus 客户端侧绕过。
+
+结论：要兼容全部输入法、全部桌面端，**输入法引擎的所有权必须夺回嵌套
+会话**——不再问宿主"这个键你消费吗"，而是在我们自己的合成器里跑一个
+独立引擎。
+
+### 架构
+
+```
+   嵌套 WAYLAND_DISPLAY（我们的 socket）
+   ├─ 我们导出三个 global：
+   │     zwp_text_input_manager_v3        （嵌套应用：firefox/GTK/Qt…）
+   │     zwp_input_method_manager_v2      （嵌套 IME 客户端：daemon）
+   │     zwp_virtual_keyboard_manager_v1  （IME 未消费键的直通回注通道）
+   │
+   ├─ 应用（ti3 client）──enable/commit──┐
+   │                                     ▼
+   │                             Relay（serial 记账/原子批次/丢弃判定）
+   │                                     ▲
+   ├─ 嵌套 daemon（im2 client）─commit───┘
+   │     fcitx5（首选，5.1.12 实测 libwaylandim.so 含 im2 + VK 符号）
+   │     或 ibus-daemon（独立 --address，前台由我们管；无 im2 时如实回退）
+   └─ 宿主引擎不再参与中文组合
+```
+
+- `ime/input_method_v2.rs`：im2 服务器 wire 层（Manager/InputMethod/
+  KeyboardGrab/Popup 四对象 Dispatch）。daemon bind 后按 grab→forward 送键，
+  commit/preedit/delete/lookup 上行灌入 Relay，commit(serial) 做协议强制的
+  serial 校验（不符整批丢弃）。
+- `ime/virtual_keyboard.rs`（**新增**）：`zwp_virtual_keyboard_v1` 服务器。
+  fcitx5 在引擎**未消费**某键时，不丢弃而是经 VK 重新注入合成器
+  （`waylandimserverv2.cpp::sendKeyToVK/mayCommitAsText`）——本层把注入的
+  key 落回 seat 原始路由。**没有它，grab 期间方向键/Esc/快捷键/裸字母
+  全部被吞**。这是 sync4 "consumed 分流" 在 im2 通道上的对偶。
+- `ime/nested_daemon.rs`（**新增**）：daemon 生命周期状态机 + 隔离
+  spawn。纯逻辑（`decide`）与 spawn 计划（`build_spawn_plan`）可无进程
+  单测；实 spawn 用 process.rs 的双 fork + setsid 惯例，孙 pid 写 pidfile。
+
+### 隔离纪律（绝不污染宿主）
+
+- 环境：`WAYLAND_DISPLAY`=我们的 socket；`HOME`/`XDG_CONFIG_HOME`/
+  `XDG_DATA_HOME`/`XDG_CACHE_HOME`=`gameDir/waylandcraft/ime-nested`
+  隔离目录；`XDG_RUNTIME_DIR` 沿用宿主（socket 文件在那）；**删除**
+  `DBUS_SESSION_BUS_ADDRESS`/`DISPLAY`/`XAUTHORITY`。
+- 参数：fcitx5 `-D --disable=dbus`（前台、禁 dbus addon，避免
+  org.fcitx.Fcitx5 与宿主实例抢总线）；ibus 用独立 `--address=unix:path=…`
+  且禁 panel/config/emoji 子进程。
+- **绝不 `--replace`/`-r`**——那会踢掉用户的宿主输入法实例；单测
+  `spawn_plan_is_isolated_and_never_replaces` 把这条纪律写死在断言里。
+
+### 路由决策表
+
+| 条件（每帧 `nested_tick` 裁决） | phase | im2 路由 | grab 键去向 | 无 grab 键去向 |
+|---|---|---|---|---|
+| settings `imeNested=off` | Disabled | 关 | host_bridge/raw | host_bridge/raw |
+| 用户 `/wl ime nested stop` | Disabled(锁) | 关 | host_bridge/raw | host_bridge/raw |
+| 配置未同步（Java 未注入 home） | Unconfigured | 关 | host_bridge/raw | host_bridge/raw |
+| PATH 无 fcitx5/ibus-daemon | NoBinary | 关 | host_bridge/raw | host_bridge/raw |
+| 已 spawn，等 im2 bind（≤10s） | Starting | 关 | host_bridge/raw | host_bridge/raw |
+| **im2 客户端已 bind** | **Active** | **开** | **im2 grab** | **raw 直通（跳过 host）** |
+| daemon 进程消失/连续 3 次超时 | Failed | 关（回退） | host_bridge/raw | host_bridge/raw |
+
+- 探活主信号 = **im2 client bind**（比 pidfile 强：进程活着但连不上我们
+  的 socket 没有意义）。
+- bind 超时 10s、失败退避 5s、连续 3 次封顶停手（防 fork 炸弹），手动
+  `start` 复位。全部决策行走 `ime.log` ⑥ 时间戳，失败进 ⑥ error ring。
+- host_bridge（dbus 穿透）在 `apply_ti3_outcome` 里**双发保持热**（FocusIn/
+  Surrounding/CursorRect 幂等），daemon 中途挂掉回退时宿主侧焦点是现成的。
+
+### 命令与配置
+
+- settings 键 `imeNested`（auto|on|off，默认 auto），`/wl settings set
+  imeNested auto|on|off`（别名 `nestedIme`）；responder 注册即触发启动期
+  同步。
+- `/wl ime nested status` → mode/phase/kind/pid/im2/grab/vk 一行；
+  `start` 复位重试；`stop` 杀 pidfile 进程 + 进 Disabled 锁。
+- `status.log` 新增 `nested_ime` 子系统 + metrics `ime_route`
+  （im2-grab|im2|host_bridge|raw）。
+
+### 端到端实测清单（逻辑与 wire 层已用模拟 client 全测；以下需真机）
+
+1. 隔离 HOME 首次 profile 只含 keyboard-us；需把宿主 fcitx5 profile（含
+   pinyin）拷入 `<home>/config/fcitx5/` 或在隔离 HOME 下跑 `fcitx5-configtool`。
+2. fcitx5 在 `--disable=dbus` 下 pinyin 引擎加载/候选行为（备选方案：保留
+   dbus addon 但删 DBUS_SESSION_BUS_ADDRESS 环境，见 FCITX5_ARGS 注释）。
+3. 嵌套 firefox ti3 + 嵌套 fcitx5 im2 + VK 直通全链路真机验证。
+4. ibus 路预计不 bind im2 → Starting 超时 → Failed 回退（如实上报，非 bug）。
 

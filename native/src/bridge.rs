@@ -392,6 +392,18 @@ bind_java_type! {
             name = "nativeVersionNative",
             fn = native_version,
         },
+        // v0.14 嵌套输入法守护进程：/wl ime nested [status|start|stop]。
+        static extern fn ime_nested_command {
+            sig = (instance: jlong, sub: JString) -> JString,
+            name = "imeNestedCommandNative",
+            fn = ime_nested_command,
+        },
+        // v0.14 嵌套输入法 settings 下发（mode auto|on|off + 隔离 HOME）。
+        static extern fn set_ime_nested {
+            sig = (instance: jlong, mode: JString, home: JString),
+            name = "setImeNestedNative",
+            fn = set_ime_nested,
+        },
         static extern fn get_status_report {
             sig = (instance: jlong, java_thread: JString) -> JString,
             name = "getStatusReportNative",
@@ -1574,7 +1586,11 @@ fn keyboard_input<'local>(
     let action = KeyboardAction::from_i32(action)
         .ok_or(BridgeError::UnknownKeyboardState(action))?;
 
-    // 1) 输入法已 grab 键盘（游戏内 im2）→ 按键先发给 IME。
+    // 1) v0.14 嵌套 IM 主路径：输入法 grab 在场（嵌套 daemon 已激活键盘）
+    //    → 按键**只**发给 IME。引擎对按键的命运自行裁决：
+    //      消费 → im2 preedit/commit 经 relay 推给应用 ti3；
+    //      未消费 → fcitx5 自己经 zwp_virtual_keyboard_v1 重新注入
+    //               （ime/virtual_keyboard.rs 落回 seat 原始路由）。
     let mods = instance.state.seat.modifiers_tuple();
     let mut handled = instance
         .state
@@ -1591,33 +1607,42 @@ fn keyboard_input<'local>(
     //    （历史：v0.11 为修"拼音+数字双路乱序"删掉了无条件 fall-through——方向对、
     //    力度错：应该按 consumed 分流，而不是全部吞掉。本实现保持单路不变式：
     //    引擎消费时绝无 raw，引擎未消费时绝无静默丢失。）
+    //
+    //    v0.14：nested 主路径在线（im2 客户端在位）但 grab 不在场 = 引擎
+    //    未接管本键 → 直接 raw 直通，**跳过** host_bridge dbus 提交——
+    //    避免同一键被宿主引擎与嵌套引擎两个通道同时裁决造成双发。
     if !handled {
         use crate::seat::KeyboardAction as KA;
         let keycode = scancode as u32;
+        let nested_live = instance.state.ime.nested_route_live();
         let mut key_result: Option<crate::host_bridge::KeyResult> = None;
-        if let Some(hb) = &mut instance.host_bridge {
-            if hb.is_ready() {
-                // v0.10.2：xkb 解码 keysym（ibus/fcitx keyval，不是 evdev）
-                let keysym = instance
-                    .state
-                    .seat
-                    .xkb_state
-                    .key_get_one_sym(xkbcommon::xkb::Keycode::new(keycode))
-                    .raw() as u32;
-                crate::bridge::ime_log_write(&format!(
-                    "[waylandcraft][ime] bridge submit_key scancode={keycode} keysym={keysym:#x} action={action:?}"
-                ));
-                let ke = crate::ime::KeyEvent {
-                    keysym,
-                    keycode,
-                    action,
-                    mods,
-                };
-                key_result = Some(hb.submit_key_sync(&crate::ime::DownEvent::Key(ke)));
+        if !nested_live {
+            if let Some(hb) = &mut instance.host_bridge {
+                if hb.is_ready() {
+                    // v0.10.2：xkb 解码 keysym（ibus/fcitx keyval，不是 evdev）
+                    let keysym = instance
+                        .state
+                        .seat
+                        .xkb_state
+                        .key_get_one_sym(xkbcommon::xkb::Keycode::new(keycode))
+                        .raw() as u32;
+                    crate::bridge::ime_log_write(&format!(
+                        "[waylandcraft][ime] bridge submit_key scancode={keycode} keysym={keysym:#x} action={action:?}"
+                    ));
+                    let ke = crate::ime::KeyEvent {
+                        keysym,
+                        keycode,
+                        action,
+                        mods,
+                    };
+                    key_result = Some(hb.submit_key_sync(&crate::ime::DownEvent::Key(ke)));
+                }
             }
         }
-        // None=没有就绪桥（⑧ 原始回退：纯 raw）；Unavailable=超时/通道断按未消费处理
-        let raw_needed = !matches!(key_result, Some(crate::host_bridge::KeyResult::Consumed));
+        // None=没有就绪桥（⑧ 原始回退：纯 raw）；Unavailable=超时/通道断按未消费处理；
+        // nested_live=true 时 key_result 恒 None——grab 缺席即引擎不接管，raw 直通。
+        let raw_needed =
+            nested_live || !matches!(key_result, Some(crate::host_bridge::KeyResult::Consumed));
         if matches!(action, KA::Release) {
             if instance.state.ime.raw_keys.remove(&keycode) || raw_needed {
                 instance.state.seat.keyboard_key(keycode, action);
@@ -1626,7 +1651,8 @@ fn keyboard_input<'local>(
             if raw_needed {
                 instance.state.ime.raw_keys.insert(keycode);
                 crate::bridge::ime_log_write(&format!(
-                    "[waylandcraft][ime] ⑧ raw forward scancode={keycode} key_result={key_result:?}"
+                    "[waylandcraft][ime] ⑧ raw forward scancode={keycode} key_result={key_result:?} route={}",
+                    if nested_live { "nested-no-grab" } else { "host" }
                 ));
                 instance.state.seat.keyboard_key(keycode, action);
             }
@@ -1836,6 +1862,53 @@ fn run_ime_diagnostic<'local>(
     let instance = jptr_to_instance!(instance, "runImeDiagnostic")?;
     let report = instance.state.run_diagnostic();
     env.new_string(report).map_err(BridgeError::JniError)
+}
+
+/// imeNestedCommand(instance, "status"|"start"|"stop") —— v0.14 嵌套 IME
+/// 守护进程三级命令，转发到 Rust NestedIme（ime/nested_daemon.rs）。
+/// 返回状态/决策文本；未知 sub 返回错误提示。绝不 panic——命令路径在
+/// 游戏主线程（update 循环外），异常会崩游戏。
+fn ime_nested_command<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    sub: JString<'local>,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeNestedCommand")?;
+    let sub: String = env.get_string(&sub)?.into();
+    let reply = match instance.state.ime.nested_command(&sub, std::time::Instant::now()) {
+        Some(s) => s,
+        None => format!(
+            "未知子命令: {sub}（合法: status|start|stop）\n当前: {}",
+            instance.state.ime.nested_status_line()
+        ),
+    };
+    env.new_string(reply).map_err(BridgeError::JniError)
+}
+
+/// setImeNested(instance, mode, home) —— settings（imeNested auto|on|off）
+/// 下发到 Rust NestedIme：设置隔离 HOME（不存在则建）+ 路由模式。
+/// 非法 mode 字符串被 NestedIme::set_mode 拒绝（返回 false，这里如实记日志，
+/// 不改内部状态）。home 空串跳过（服务端/未初始化路径）。
+fn set_ime_nested<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    mode: JString<'local>,
+    home: JString<'local>,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "setImeNested")?;
+    let mode: String = env.get_string(&mode)?.into();
+    let home: String = env.get_string(&home)?.into();
+    if !home.is_empty() {
+        instance.state.ime.nested_set_home(std::path::Path::new(&home));
+    }
+    if !instance.state.ime.nested_set_mode(&mode) {
+        crate::bridge::ime_log_write(&format!(
+            "[waylandcraft][ime][nested] 忽略非法 mode={mode:?}（合法 auto|on|off）"
+        ));
+    }
+    Ok(())
 }
 
 /// notifyHostFocusGained(instance) —— Minecraft 窗口重新获得 OS 键盘焦点。

@@ -173,7 +173,7 @@ impl StatusReport {
                 if hb.is_ready() {
                     subsystems.push((
                         "host_bridge",
-                        SubEntry::ok(format!("dbus-ibus → active")),
+                        SubEntry::ok(format!("{} → active", hb.name())),
                     ));
                 } else if hb.is_dead() {
                     subsystems.push((
@@ -193,6 +193,28 @@ impl StatusReport {
                     SubEntry::error("host_bridge = None; ibus/fcitx5 not bridged"),
                 ));
             }
+        }
+
+        // ── nested_ime（v0.14 嵌套 IME daemon 路线）──────────────────
+        // 状态如实上报：Active=主路径在线；Failed/NoBinary=回退
+        // host_bridge/raw 且已进 error ring。详见 ime.log 的 ⑥ 决策行。
+        {
+            use crate::ime::NestedPhase;
+            let ime = &wc.state.ime;
+            let line = ime.nested_status_line();
+            let entry = match ime.nested.phase() {
+                NestedPhase::Active => SubEntry::ok(format!("{line}; route=im2")),
+                NestedPhase::Starting => SubEntry::degraded(format!("{line}; 等 im2 bind")),
+                NestedPhase::Failed(_) => {
+                    SubEntry::error(format!("{line}; 回退 host_bridge/raw"))
+                }
+                NestedPhase::NoBinary => {
+                    SubEntry::degraded(format!("{line}; 无 fcitx5/ibus-daemon，走 host_bridge/raw"))
+                }
+                NestedPhase::Disabled => SubEntry::disabled(line),
+                NestedPhase::Unconfigured => SubEntry::na(format!("{line}; 等 Java settings 同步")),
+            };
+            subsystems.push(("nested_ime", entry));
         }
 
         // ── xwayland-satellite ──────────────────────────────────
@@ -289,6 +311,25 @@ impl StatusReport {
         // ── metrics ─────────────────────────────────────────────
         let mut metrics = Vec::new();
         metrics.push(("wlc_socket", wc.state.socket.to_string_lossy().to_string()));
+        // v0.14 当前按键路由（im2=嵌套 daemon 主路径；host=host_bridge；
+        // raw=纯直通）——status.log 一行定位"中文到底走哪条路"。
+        metrics.push((
+            "ime_route",
+            if wc.state.ime.nested_route_live() {
+                if wc.state.ime.keyboard_grabbed() { "im2-grab" } else { "im2" }
+            } else if wc
+                .host_bridge
+                .as_ref()
+                .or(wc.state.host_bridge.as_ref())
+                .map(|h| h.is_ready())
+                .unwrap_or(false)
+            {
+                "host_bridge"
+            } else {
+                "raw"
+            }
+            .to_string(),
+        ));
         let uptime = wc.start_time.elapsed().as_secs();
         metrics.push(("uptime_s", uptime.to_string()));
         let (toplevels, popups) = wc.count_surfaces();
