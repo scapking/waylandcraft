@@ -65,6 +65,61 @@ class ImeCandidateLayoutTest {
 		assertNull(ImeCandidateLayout.decode(raw));
 	}
 
+	// ── 跨语言编码合同：golden hexdump ──────────────────────────────
+	//
+	// 下面这段字节流是 native 侧 tests_popup::
+	// popup_java_polling_sequence_matches_wire_encoding_contract 实测一次
+	// 4x3 可见帧（argb_pattern seed=0）的 JNI byte[] 逐字节固化。两侧断言
+	// 同一串：native 编码改了 → Rust 测试红；Java 解码改了 → 这里红。
+	// 这是"Java 半程静默不显示"故障的回归锚点——Java 侧 decode/decideShowing
+	// 必须与真实字节流逐字节对齐，而不是只测自造的 encode。
+	private static final String GOLDEN_NATIVE_FRAME_HEX =
+			"04000000030000000100000001112244ff102345ff132046ff122147ff"
+			+ "013254ff003355ff033056ff023157ff310264ff300365ff330066ff320167ff";
+
+	@Test
+	void nativeGoldenFrameDecodesExactly() {
+		byte[] raw = hexToBytes(GOLDEN_NATIVE_FRAME_HEX);
+		assertEquals(13 + 4 * 3 * 4, raw.length, "golden 长度 = 13 + w*h*4");
+		Frame f = ImeCandidateLayout.decode(raw);
+		assertNotNull(f, "真实 native 字节流必须能解码");
+		assertEquals(4, f.width());
+		assertEquals(3, f.height());
+		assertEquals(1, f.seq());
+		assertTrue(f.visible());
+		assertEquals(48, f.argb().length);
+		// 首像素 [B,G,R,A] = [11,22,44,ff]（与 argb_pattern(x=0,y=0,seed=0) 一致）。
+		assertArrayEquals(new byte[] {0x11, 0x22, 0x44, (byte) 0xff},
+				java.util.Arrays.copyOf(f.argb(), 4));
+		// 尾像素 [32,01,67,ff]（x=3,y=2）。
+		assertArrayEquals(new byte[] {0x32, 0x01, 0x67, (byte) 0xff},
+				java.util.Arrays.copyOfRange(f.argb(), 44, 48));
+		// decideShowing：可见 golden + 聚焦框 → 显示。
+		assertTrue(ImeCandidateLayout.decideShowing(false, f, true),
+				"真实帧 + hasBox 必须判定显示——若这里 false 即根因在 Java 判定");
+	}
+
+	@Test
+	void nativeGoldenInvisibleDeliveryDecodes() {
+		// 角色登记/隐藏交付：13 字节头，visible=0（无像素）。
+		byte[] raw = hexToBytes("040000000300000007000000" + "00");
+		Frame f = ImeCandidateLayout.decode(raw);
+		assertNotNull(f);
+		assertFalse(f.visible());
+		assertNull(f.argb());
+		// 可见性翻 false → decideShowing 必须隐藏。
+		assertFalse(ImeCandidateLayout.decideShowing(true, f, true));
+	}
+
+	private static byte[] hexToBytes(String hex) {
+		int n = hex.length() / 2;
+		byte[] out = new byte[n];
+		for(int i = 0; i < n; i++) {
+			out[i] = (byte) Integer.parseInt(hex.substring(i * 2, i * 2 + 2), 16);
+		}
+		return out;
+	}
+
 	// ── positionOverlay ──
 
 	@Test
@@ -139,6 +194,27 @@ class ImeCandidateLayoutTest {
 		Frame inv = new Frame(0, 0, 2, false, null);
 		assertTrue(ImeCandidateLayout.decideShowing(false, vis, true));
 		assertFalse(ImeCandidateLayout.decideShowing(true, inv, true));
+	}
+
+	// ── shouldReshowCurrent（焦点恢复补显，sync8 复盘 bug 的回归锚点）──
+
+	@Test
+	void reshowCurrentAfterFocusBlipWhenNativeStillVisible() {
+		Frame vis = new Frame(10, 10, 1, true, new byte[400]);
+		// 失焦隐藏 → 恢复聚焦后 native 不再重投（epoch 已消耗），轮询恒 null。
+		// 此时必须用保留的 visible 帧补显，否则候选窗"消失后直到下次按键才回来"。
+		assertTrue(ImeCandidateLayout.shouldReshowCurrent(false, null, true, vis));
+	}
+
+	@Test
+	void noReshowWhenInvisibleNoBoxOrFreshFrame() {
+		Frame vis = new Frame(10, 10, 1, true, new byte[400]);
+		Frame inv = new Frame(0, 0, 2, false, null);
+		assertFalse(ImeCandidateLayout.shouldReshowCurrent(true, null, true, vis));  // 本已显示
+		assertFalse(ImeCandidateLayout.shouldReshowCurrent(false, null, false, vis)); // 仍无聚焦框
+		assertFalse(ImeCandidateLayout.shouldReshowCurrent(false, inv, true, vis));   // 有新帧走 decideShowing
+		assertFalse(ImeCandidateLayout.shouldReshowCurrent(false, null, true, inv));  // retained 不可见
+		assertFalse(ImeCandidateLayout.shouldReshowCurrent(false, null, true, null)); // retained 为空
 	}
 
 	// ── Rect.contains ──

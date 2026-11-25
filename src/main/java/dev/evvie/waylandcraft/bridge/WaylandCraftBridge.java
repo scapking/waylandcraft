@@ -1010,6 +1010,19 @@ public class WaylandCraftBridge {
 		return imePopupFrameNative(instance);
 	}
 
+	/** 中文引擎工作态（角标原料，状态透明度）：im2 端点在位 + 会话激活 +
+	 * 最近一次交付批次携带非空预编辑。纯读零拷贝，每 tick 轮询安全。
+	 * **协议限制**：im2 不向合成器暴露引擎名——true 的语义是「有预编辑/
+	 * 候选流的中文引擎工作态」，不是「引擎 == 拼音」。 */
+	public boolean imePopupWorkState() {
+		return imePopupWorkStateNative(instance);
+	}
+
+	/** {@code /wl ime info}：nested/种子引擎/候选窗统计/工作态/路由 多行报告。 */
+	public String imeInfo() {
+		return imeInfoNative(instance);
+	}
+
 	/** 候选窗区域点击回传（Phase 3）。x/y = popup surface 局部像素；
 	 * button = evdev 码（BTN_LEFT=0x110）；native 侧向 popup surface 发
 	 * wl_pointer enter/motion/button（进帧序列），候选命中/上屏由 fcitx5
@@ -1350,6 +1363,10 @@ public class WaylandCraftBridge {
 
 	// Poll nested fcitx5 popup surface pixels (Phase 1/2; null = no state change)
 	private static native byte[] imePopupFrameNative(long instance);
+	// Chinese-engine work state (preedit stream live) — overlay badge input, pure read.
+	private static native boolean imePopupWorkStateNative(long instance);
+	// /wl ime info: nested + seeded engines + popup stats + work state, multi-line.
+	private static native String imeInfoNative(long instance);
 	// Forward a click on the in-game candidate overlay back to the popup surface (Phase 3).
 	// x/y are popup-surface-local pixels. button = evdev code, pressed = true/false.
 	private static native void imePopupClickNative(long instance, int x, int y, int button, boolean pressed);

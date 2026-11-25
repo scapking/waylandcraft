@@ -106,4 +106,19 @@ public final class ImeCandidateLayout {
 		if(f == null) return wasShowing;
 		return f.visible();
 	}
+
+	/**
+	 * 焦点恢复补显判据（decideShowing 的补充，不改变其合同）。
+	 *
+	 * 背景（sync8 复盘 bug）：因失焦抖动隐藏时，native 侧那份 visible 帧的
+	 * epoch 已被交付消耗（delivered==epoch），恢复聚焦后的轮询只会拿到
+	 * null——decideShowing(false, null, true) 恒 false，候选窗必须等到
+	 * 下一次按键新帧才可能回来。本判据允许 overlay 用保留的 current 帧
+	 * 立即补显：语义与 decideShowing "跟 native visible"一致（native 并未
+	 * 宣告隐藏，只是不再重复投递），不违反既有状态机合同。
+	 */
+	public static boolean shouldReshowCurrent(boolean wasShowing, Frame f, boolean hasFocusedBox, Frame retained) {
+		return !wasShowing && f == null && hasFocusedBox
+				&& retained != null && retained.visible();
+	}
 }
