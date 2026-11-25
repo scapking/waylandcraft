@@ -28,8 +28,8 @@ use smithay::{
     utils::{Logical, Point, Size},
     wayland::{
         compositor::{
-            BufferAssignment, SubsurfaceCachedState, SurfaceAttributes,
-            SurfaceData, TraversalAction, with_states, Damage,
+            BufferAssignment, Damage, SubsurfaceCachedState, SurfaceAttributes,
+            SurfaceData, TraversalAction, with_states,
             with_states as with_surface_data, with_surface_tree_upward,
         },
         dmabuf::get_dmabuf,
@@ -1117,23 +1117,19 @@ fn update_surface_data<'local>(
         for damage in &attr.damage {
             match damage {
                 Damage::Surface(d) => {
-                    jsurface.add_surface_damage(
-                        env,
-                        d.loc.x,
-                        d.loc.y,
-                        d.size.w,
-                        d.size.h
-                    ).unwrap();
-                },
+                    jsurface
+                        .add_surface_damage(
+                            env, d.loc.x, d.loc.y, d.size.w, d.size.h,
+                        )
+                        .unwrap();
+                }
                 Damage::Buffer(d) => {
-                    jsurface.add_buffer_damage(
-                        env,
-                        d.loc.x,
-                        d.loc.y,
-                        d.size.w,
-                        d.size.h
-                    ).unwrap();
-                },
+                    jsurface
+                        .add_buffer_damage(
+                            env, d.loc.x, d.loc.y, d.size.w, d.size.h,
+                        )
+                        .unwrap();
+                }
             }
         }
         attr.damage.clear();
