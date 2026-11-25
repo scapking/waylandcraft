@@ -1300,9 +1300,9 @@ public class WaylandCraftCommand {
 		boolean found = false;
 		for(int i = 0; i < inventory.getContainerSize(); i++) {
 			var stack = inventory.getItem(i);
-			Long itemHandle = stack.get(dev.evvie.waylandcraft.item.WindowItem.WINDOW_HANDLE);
+			dev.evvie.waylandcraft.item.WindowHandle itemHandle = stack.get(dev.evvie.waylandcraft.item.WindowItem.WINDOW_HANDLE);
 			if(itemHandle != null) {
-				if(itemHandle == handle || Long.toHexString(itemHandle).endsWith(handleStr.toLowerCase().replace("0x", ""))) {
+				if(itemHandle.handle() == handle || Long.toHexString(itemHandle.handle()).endsWith(handleStr.toLowerCase().replace("0x", ""))) {
 					inventory.removeItem(i, 1);
 					found = true;
 					break;

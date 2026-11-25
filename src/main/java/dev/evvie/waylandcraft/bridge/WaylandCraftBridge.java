@@ -822,7 +822,12 @@ public class WaylandCraftBridge {
 	public String getSatelliteDisplay() {
 		return getSatelliteDisplay(this.instance);
 	}
-	
+
+	/** 收集全子系统 JSON 状态报告（v0.13.4 status.log 系统）；javaThread 为当前 Java 线程名 */
+	public String getStatusReport(String javaThread) {
+		return getStatusReportNative(this.instance, javaThread);
+	}
+
 	/** 获取原生 wayland 窗口所属客户端进程 PID（SO_PEERCRED）；0 = 未知/X11 窗口 */
 	public int toplevelPid(long topLevelHandle) {
 		return toplevelPid(this.instance, topLevelHandle);
@@ -1132,6 +1137,7 @@ public class WaylandCraftBridge {
 	private static native void update(long instance);
 	private static native String socket(long instance);
 	private static native String getSatelliteDisplay(long instance);
+	private static native String getStatusReportNative(long instance, String javaThread);
 	private static native void sendFrame(long surfaceHandle);
 	
 	private static native void updateSurfaceData(long instance, WLCSurface surface);

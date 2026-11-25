@@ -32,6 +32,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.util.LightCoordsUtil;
 import net.minecraft.util.Util;
 import net.minecraft.world.phys.Vec3;
+import org.joml.Vector3f;
 
 public class RenderUtils {
 	
