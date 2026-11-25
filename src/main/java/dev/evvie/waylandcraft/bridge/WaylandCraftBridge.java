@@ -20,7 +20,6 @@ import org.jetbrains.annotations.Nullable;
 import org.lwjgl.glfw.GLFW;
 import org.lwjgl.glfw.GLFWNativeEGL;
 import org.lwjgl.glfw.GLFWNativeWayland;
-import org.lwjgl.system.Platform;
 
 import dev.evvie.waylandcraft.WaylandCraftCommon;
 import dev.evvie.waylandcraft.bridge.WLCAbstractWindow.SurfaceGeometry;
@@ -56,7 +55,16 @@ public class WaylandCraftBridge {
 	
 	static {
 		boolean loaded = false;
-		InputStream inputStream = openNativeLibraryFromJar();
+		InputStream inputStream;
+		// ⑤ 类初始化绝不抛：即使未来又引入平台性依赖问题，也只降级为
+		// "native 不可用"（各入口已有 nativeAvailable/nativeDisabled 处理），
+		// 不允许把宿主（尤其无 LWJGL 的 dedicated server）直接点炸。
+		try {
+			inputStream = openNativeLibraryFromJar();
+		} catch(Throwable t) {
+			WaylandCraftCommon.LOGGER.warn("Native library probe failed (class init guarded): {}", t.toString());
+			inputStream = null;
+		}
 		if(inputStream != null) {
 			try {
 				byte[] data = inputStream.readAllBytes();
@@ -145,12 +153,8 @@ public class WaylandCraftBridge {
 	}
 	
 	private static String satelliteResourcePath() {
-		String arch;
-		switch(Platform.getArchitecture()) {
-		case X64: arch = "x86_64"; break;
-		case ARM64: arch = "arm64"; break;
-		default: return null;
-		}
+		String arch = archName();
+		if(arch == null) return null;
 		return "/xwayland-satellite-linux-gnu-" + arch;
 	}
 	
@@ -203,6 +207,17 @@ public class WaylandCraftBridge {
 	 * the mod then runs in viewer-only mode — local window capture is unavailable,
 	 * but shared windows can still be received and rendered.
 	 */
+	/** ⑤ 修服务器崩溃：org.lwjgl.system.Platform 在纯 Java 的 server jar 里不存在，
+	 * 但类初始化（static 块 → openNativeLibraryFromJar）引用它 → 服务端 main 入口
+	 * NoClassDefFoundError 直接起不来。LWJGL 的 Platform 也只是解析 os.arch 属性，
+	 * 这里用等价语义的 JVM 属性判定替代，消除类初始化对 LWJGL 的依赖。 */
+	private static @Nullable String archName() {
+		String osArch = System.getProperty("os.arch", "").toLowerCase();
+		if(osArch.equals("amd64") || osArch.equals("x86_64") || osArch.equals("i386") || osArch.equals("i686")) return "x86_64";
+		if(osArch.equals("aarch64") || osArch.equals("arm64")) return "arm64";
+		return null;
+	}
+	
 	private static String nativePlatform() {
 		if(isWindows() || isMac() || isIOS()) return null;
 		return isAndroid() ? "android" : "linux-gnu";
@@ -218,12 +233,7 @@ public class WaylandCraftBridge {
 		 * NOT be preferred, otherwise an arm64 device will try to load an x86_64
 		 * build. On Android (bionic) we prefer the android build; on desktop the
 		 * linux-gnu build. */
-		String arch;
-		switch(Platform.getArchitecture()) {
-		case X64: arch = "x86_64"; break;
-		case ARM64: arch = "arm64"; break;
-		default: arch = null; break;
-		}
+		String arch = archName();
 		
 		if(arch != null) {
 			String platform = nativePlatform();
@@ -289,12 +299,8 @@ public class WaylandCraftBridge {
 	 * reliably available inside Fabric's KnotClassLoader.
 	 */
 	private static boolean loadBundledNativeDeps() {
-		String arch;
-		switch(Platform.getArchitecture()) {
-		case X64: arch = "x86_64"; break;
-		case ARM64: arch = "arm64"; break;
-		default: return false;
-		}
+		String arch = archName();
+		if(arch == null) return false;
 		// On Android (bionic) prefer the android bundle (built against bionic libc);
 		// fall back to the linux-gnu bundle for jars that only ship glibc deps.
 		String resourceDir = "/native-deps/" + nativePlatform() + "-" + arch + "/";
@@ -1143,6 +1149,7 @@ public class WaylandCraftBridge {
 	/** ⑥ 把 Fabric metadata 的真实 mod 版本注入 native，供 status.log / getStatusReport
 	 *  使用（替代 Rust 硬编码 "1.2.13" 的版本谎报）。旧 .so 无此符号时静默跳过。 */
 	public static void setModVersion(String version) {
+		if(!nativeAvailable) return; // server/viewer 无 native：静默跳过
 		try {
 			setModVersionNative(version);
 		} catch(Throwable t) {
