@@ -177,13 +177,17 @@ impl InputPopupState {
         if self.role.is_none() && self.surface.is_none() && self.frame.is_none() {
             return;
         }
-        self.take_over_undelivered();
+        let held = self.take_over_undelivered();
         self.role = None;
         self.surface = None;
         self.frame = None;
         self.seq = 0;
         self.epoch = self.epoch.wrapping_add(1);
-        crate::bridge::ime_log_write("[waylandcraft][ime][popup] popup 角色解除（候选窗销毁/断连）");
+        crate::bridge::ime_log_write(if held {
+            "[waylandcraft][ime][popup] popup 角色解除（候选窗销毁/断连）；未交付帧进入 display hold（≤400ms 续交付）"
+        } else {
+            "[waylandcraft][ime][popup] popup 角色解除（候选窗销毁/断连）"
+        });
     }
 
     /// 统一时钟入口：display hold 的到期判定、last_visible_delivery 的相对
@@ -211,14 +215,16 @@ impl InputPopupState {
 
     /// 从未交付的 live 帧移入 hold（note_frame_removed/cleared/created 共用）。
     /// 已交付过的帧（frame_pending_deliver=false）是真实隐藏的起点——
-    /// 协议语义照旧立即清，不伪造续显。
-    fn take_over_undelivered(&mut self) {
+    /// 协议语义照旧立即清，不伪造续显。返回是否发生了接管（观测日志区分用）。
+    fn take_over_undelivered(&mut self) -> bool {
         if self.frame.is_some() && self.frame_pending_deliver {
             let frame = self.frame.take().expect("just checked");
             self.held = Some(HeldFrame { frame, seq: self.seq });
             self.hold_until = Some(self.now() + std::time::Duration::from_millis(POPUP_HOLD_MS));
             self.frame_pending_deliver = false;
+            return true;
         }
+        false
     }
 
     /// 轮询驱动的 hold 到期结算：到期仍无新帧 → 清暂存、推进 epoch
@@ -281,10 +287,14 @@ impl InputPopupState {
         if self.frame.is_none() {
             return;
         }
-        self.take_over_undelivered();
+        let held = self.take_over_undelivered();
         self.frame = None;
         self.epoch = self.epoch.wrapping_add(1);
-        crate::bridge::ime_log_write("[waylandcraft][ime][popup] attach(NULL) → 帧清空（候选窗隐藏）");
+        crate::bridge::ime_log_write(if held {
+            "[waylandcraft][ime][popup] attach(NULL)：帧尚未交付 → display hold 接管（≤400ms 续交付）"
+        } else {
+            "[waylandcraft][ime][popup] attach(NULL) → 帧清空（候选窗隐藏）"
+        });
     }
 
     pub(crate) fn has_frame(&self) -> bool {
