@@ -85,6 +85,11 @@ public class WaylandCraft implements ClientModInitializer {
 	 * with a bionic runtime); the mod disables itself instead of crashing. */
 	private boolean nativeDisabled = false;
 	
+	/** ⑥ /wl status：native 是否因加载失败被整体禁用 */
+	public boolean isNativeDisabled() {
+		return nativeDisabled;
+	}
+	
 	public ArrayList<WindowDisplay> displays = new ArrayList<WindowDisplay>();
 	
 	public boolean overridePickBlock = false;

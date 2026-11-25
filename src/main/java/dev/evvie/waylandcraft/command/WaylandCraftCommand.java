@@ -298,6 +298,10 @@ public class WaylandCraftCommand {
 						.executes(WaylandCraftCommand::imeDiagnostic)
 					)
 				)
+				// ⑥ 全局状态摘要进聊天（此前 status 报告只写文件；排错要开游戏翻目录）
+				.then(ClientCommands.literal("status")
+					.executes(WaylandCraftCommand::statusSummary)
+				)
 				.then(ClientCommands.literal("pos")
 					.then(ClientCommands.argument("handle", StringArgumentType.word())
 						.executes(WaylandCraftCommand::posWindow)
@@ -2547,6 +2551,75 @@ public class WaylandCraftCommand {
 			source.sendError(Component.literal("§c✘ Invalid permission: " + permStr + " (NONE/VIEW/INTERACT/CONTROL)§r"));
 			return null;
 		}
+	}
+
+	// ===== ⑥ 全局状态摘要（/wl status）=====
+	//
+	// Rust StatusReport（status.log 的同一份数据）行式打进聊天 + Java 侧
+	// 独有状态（serverHasMod、接收端 playout 缓冲、音频回放流）。
+	// 排错入口从"翻 4 个文件"收敛为一条命令。
+	private static int statusSummary(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		// Java 侧头行
+		source.sendFeedback(Component.literal("§e§l— WaylandCraft status —§r"));
+		source.sendFeedback(Component.literal("§7serverMod: §f" + (wlc.serverHasMod ? "installed" : "MISSING (local direct-display)")
+			+ " §7| bridge: §f" + (wlc.bridge != null ? "up" : (wlc.isNativeDisabled() ? "disabled" : "down")) + "§r"));
+
+		// ⑦ viewer 侧 playout 缓冲概览（无观众窗口时跳过）
+		if(wlc.remoteWindowRenderer != null) {
+			for(long h : dev.evvie.waylandcraft.network.SharedWindowClientHandler.getKnownWindowHandles()) {
+				long bytes = wlc.remoteWindowRenderer.getBufferedBytes(h);
+				int frames = wlc.remoteWindowRenderer.getBufferedFrames(h);
+				if(bytes > 0 || frames > 0) {
+					source.sendFeedback(Component.literal("§7buffer 0x" + Long.toHexString(h) + ": §f" + frames + " frames / " + (bytes / 1024) + " KB"));
+				}
+			}
+		}
+
+		// Rust 全子系统报告
+		if(wlc.bridge == null) {
+			source.sendFeedback(Component.literal("§7(native down — Rust report unavailable)§r"));
+			return 1;
+		}
+		try {
+			String raw = wlc.bridge.getStatusReport(Thread.currentThread().getName());
+			if(raw == null || raw.isEmpty()) {
+				source.sendFeedback(Component.literal("§c✘ empty status report§r"));
+				return 0;
+			}
+			int brace = raw.indexOf('{');
+			String json = brace >= 0 ? raw.substring(brace) : raw;
+			com.google.gson.JsonObject root = com.google.gson.JsonParser.parseString(json).getAsJsonObject();
+			source.sendFeedback(Component.literal("§7version: §f" + str(root, "version") + " §7native: §f" + str(root, "native_version") + " §7uptime: §f" + str(root, "uptime_s") + "s"));
+			if(root.has("subsystems")) {
+				for(Map.Entry<String, com.google.gson.JsonElement> e : root.getAsJsonObject("subsystems").entrySet()) {
+					com.google.gson.JsonObject s = e.getValue().getAsJsonObject();
+					String st = str(s, "state");
+					String col = st.equalsIgnoreCase("ok") || st.equalsIgnoreCase("ready") ? "§a" : (st.equalsIgnoreCase("dead") || st.equalsIgnoreCase("error") || st.equalsIgnoreCase("fatal") ? "§c" : "§e");
+					source.sendFeedback(Component.literal("§7" + e.getKey() + ": §r" + col + st + " §f" + str(s, "details")));
+				}
+			}
+			if(root.has("errors")) {
+				com.google.gson.JsonArray errs = root.getAsJsonArray("errors");
+				if(errs.size() > 0) {
+					source.sendFeedback(Component.literal("§c✘ errors(" + errs.size() + "): §f" + errs.toString()));
+				}
+			}
+		} catch(Throwable t) {
+			source.sendFeedback(Component.literal("§c✘ status report parse failed: §f" + t));
+			return 0;
+		}
+		return 1;
+	}
+
+	private static String str(com.google.gson.JsonObject o, String key) {
+		return o != null && o.has(key) ? o.get(key).getAsString() : "?";
 	}
 
 	// ===== 音频全链路状态 =====

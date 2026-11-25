@@ -39,7 +39,12 @@ public class SharedWindowClientHandler {
 	private static final int PENDING_AUDIO_MAX_PACKETS = 100;
 	private static volatile long lastPendingAudioLogMs = 0;
 	
-	/** ⑦ 音频范围衰减用：窗口在世界中的 pivot（未知返回 null，播放侧保持上次增益） */
+	/** ⑥ /wl status：viewer 侧已知共享窗口句柄集合（只读视图） */
+	public static java.util.Collection<Long> getKnownWindowHandles() {
+		return remoteWindows.keySet();
+	}
+	
+		/** ⑦ 音频范围衰减用：窗口在世界中的 pivot（未知返回 null，播放侧保持上次增益） */
 	public static Vec3 getWindowPivot(long windowHandle) {
 		WindowInfo info = remoteWindows.get(windowHandle);
 		return info != null ? info.pivot() : null;
