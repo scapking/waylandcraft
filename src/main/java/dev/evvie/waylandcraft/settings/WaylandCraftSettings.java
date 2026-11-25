@@ -64,7 +64,17 @@ public class WaylandCraftSettings {
 	int sharePlayoutDelayMs = 4000;
 	/** 共享窗口声音的可听范围（格）：窗口位置超过该距离衰减到 0；0=全局恒响（旧行为） */
 	double audioShareRangeBlocks = 32.0;
-	
+
+	/* ---- v0.14 嵌套输入法守护进程（imeNested）---- */
+	/**
+	 * 嵌套 IM 路线开关：auto=有 fcitx5/ibus-daemon 才在我们的 WAYLAND_DISPLAY
+	 * 上拉起独立 IME 实例（引擎状态归嵌套会话，绕开宿主 focus 隔离天花板）；
+	 * on=强制（失败如实进 Failed 并回退 host_bridge/raw）；off=彻底禁用（回到
+	 * v0.13 行为）。隔离 HOME=gameDir/waylandcraft/ime-nested，绝不 --replace
+	 * 宿主实例。仅客户端有效；服务端无 native，静默忽略。
+	 */
+	String imeNested = "auto";
+
 	/* This is where the field names go to avoid typos */
 	public static final String PIXELS_PER_BLOCK = "pixelsPerBlock";
 	public static final String WINDOW_ANTIALIASING = "windowAntialiasing";
@@ -89,6 +99,7 @@ public class WaylandCraftSettings {
 	public static final String MOVE_STEP = "moveStep";
 	public static final String SHARE_PLAYOUT_DELAY_MS = "sharePlayoutDelayMs";
 	public static final String AUDIO_SHARE_RANGE_BLOCKS = "audioShareRangeBlocks";
+	public static final String IME_NESTED = "imeNested";
 	
 	/* This is where the getters go */
 	
@@ -182,6 +193,10 @@ public class WaylandCraftSettings {
 	
 	public double getAudioShareRangeBlocks() {
 		return audioShareRangeBlocks;
+	}
+
+	public String getImeNested() {
+		return imeNested;
 	}
 	
 	/* Methods to modifiy settings by name */

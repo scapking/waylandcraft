@@ -297,6 +297,18 @@ public class WaylandCraftCommand {
 					.then(ClientCommands.literal("diagnostic")
 						.executes(WaylandCraftCommand::imeDiagnostic)
 					)
+					// v0.14 嵌套 IM 守护进程三级子命令（裁决全在 Rust NestedIme）
+					.then(ClientCommands.literal("nested")
+						.then(ClientCommands.literal("status")
+							.executes(c -> imeNested(c, "status"))
+						)
+						.then(ClientCommands.literal("start")
+							.executes(c -> imeNested(c, "start"))
+						)
+						.then(ClientCommands.literal("stop")
+							.executes(c -> imeNested(c, "stop"))
+						)
+					)
 				)
 				// ⑥ 全局状态摘要进聊天（此前 status 报告只写文件；排错要开游戏翻目录）
 				.then(ClientCommands.literal("status")
@@ -1065,6 +1077,8 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §elayoutDefaultWidth/Height§7 = §e" + wlc.settingsManager.getIntSetting(WaylandCraftSettings.LAYOUT_DEFAULT_WIDTH) + "×" + wlc.settingsManager.getIntSetting(WaylandCraftSettings.LAYOUT_DEFAULT_HEIGHT) + "§r  §8(int, 新窗口自动分辨率)§r"));
 		source.sendFeedback(Component.literal(" §egroundClearance§7 = §e" + wlc.settingsManager.getDoubleSetting(WaylandCraftSettings.GROUND_CLEARANCE) + "§r  §8(double, 窗口底部距地面最小净空格)§r"));
 		source.sendFeedback(Component.literal(" §emoveStep§7 = §e" + wlc.settingsManager.getDoubleSetting(WaylandCraftSettings.MOVE_STEP) + "§r  §8(double, 手动 Ctrl+方向键平移步长格)§r"));
+		// v0.14 嵌套输入法守护进程
+		source.sendFeedback(Component.literal(" §eimeNested§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.IME_NESTED) + "§r  §8(auto|on|off, 嵌套 WAYLAND_DISPLAY 上拉起独立 fcitx5/ibus；/wl ime nested status 看裁决)§r"));
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
 		source.sendFeedback(Component.literal(" §7Use §e/wl settings set <key> <value>§7 to set§r"));
 		return 1;
@@ -1106,6 +1120,18 @@ public class WaylandCraftCommand {
 				case "terminalChoice" -> {
 					wlc.settingsManager.setStringSetting(WaylandCraftSettings.TERMINAL_CHOICE, value);
 					source.sendFeedback(Component.literal("§a✔ §eterminalChoice§r = §e" + value + "§r"));
+					return 1;
+				}
+				// v0.14 嵌套输入法守护进程开关（settings 键 imeNested；/wl 用
+				// nestedIme 别名）。responder 会同步下发到 native；非法值拒绝。
+				case "imeNested", "nestedIme" -> {
+					String v = value.toLowerCase();
+					if(!v.equals("auto") && !v.equals("on") && !v.equals("off")) {
+						source.sendError(Component.literal("§c✘ imeNested 只能是 auto|on|off（当前: " + value + "）§r"));
+						return 0;
+					}
+					wlc.settingsManager.setStringSetting(WaylandCraftSettings.IME_NESTED, v);
+					source.sendFeedback(Component.literal("§a✔ §eimeNested§r = §e" + v + "§r  §8(下一帧生效；/wl ime nested status 看裁决)§r"));
 					return 1;
 				}
 				// ⑦ 共享接收端预缓冲深度：用延迟换零卡顿
@@ -2690,6 +2716,32 @@ public class WaylandCraftCommand {
 			}
 		}
 		source.sendFeedback(Component.literal(" §7Rust 侧全链路日志文件: §ewaylandcraft-ime.log§r"));
+		return 1;
+	}
+
+	// ===== v0.14 嵌套输入法守护进程 /wl ime nested [status|start|stop] =====
+
+	/**
+	 * 路由到 Rust NestedIme（ime/nested_daemon.rs）：status 回报
+	 * mode/phase/kind/pid/im2/grab/vk 一行；start/stop 手动复位/停手。
+	 * native 不可用（bridge null / imeNested 返回 null）如实报错，不假成功。
+	 */
+	private static int imeNested(CommandContext<FabricClientCommandSource> context, String sub) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.bridge == null) {
+			source.sendError(Component.literal("§c✘ native bridge 不可用（平台不支持 / native 未加载）§r"));
+			return 0;
+		}
+		String reply = wlc.bridge.imeNested(sub);
+		if(reply == null) {
+			source.sendError(Component.literal("§c✘ imeNested(" + sub + ") 无响应（旧 .so 缺符号或 instance==0）§r"));
+			return 0;
+		}
+		source.sendFeedback(Component.literal("§6▬▬▬ nested IM §7(" + sub + ")§6 ▬▬▬"));
+		for(String line : reply.split("\\n")) {
+			source.sendFeedback(Component.literal(" §7" + line + "§r"));
+		}
 		return 1;
 	}
 }

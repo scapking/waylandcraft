@@ -392,6 +392,18 @@ bind_java_type! {
             name = "nativeVersionNative",
             fn = native_version,
         },
+        // v0.14 嵌套输入法守护进程：/wl ime nested [status|start|stop]。
+        static extern fn ime_nested_command {
+            sig = (instance: jlong, sub: JString) -> JString,
+            name = "imeNestedCommandNative",
+            fn = ime_nested_command,
+        },
+        // v0.14 嵌套输入法 settings 下发（mode auto|on|off + 隔离 HOME）。
+        static extern fn set_ime_nested {
+            sig = (instance: jlong, mode: JString, home: JString),
+            name = "setImeNestedNative",
+            fn = set_ime_nested,
+        },
         static extern fn get_status_report {
             sig = (instance: jlong, java_thread: JString) -> JString,
             name = "getStatusReportNative",
@@ -1850,6 +1862,53 @@ fn run_ime_diagnostic<'local>(
     let instance = jptr_to_instance!(instance, "runImeDiagnostic")?;
     let report = instance.state.run_diagnostic();
     env.new_string(report).map_err(BridgeError::JniError)
+}
+
+/// imeNestedCommand(instance, "status"|"start"|"stop") —— v0.14 嵌套 IME
+/// 守护进程三级命令，转发到 Rust NestedIme（ime/nested_daemon.rs）。
+/// 返回状态/决策文本；未知 sub 返回错误提示。绝不 panic——命令路径在
+/// 游戏主线程（update 循环外），异常会崩游戏。
+fn ime_nested_command<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    sub: JString<'local>,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeNestedCommand")?;
+    let sub: String = env.get_string(&sub)?.into();
+    let reply = match instance.state.ime.nested_command(&sub, std::time::Instant::now()) {
+        Some(s) => s,
+        None => format!(
+            "未知子命令: {sub}（合法: status|start|stop）\n当前: {}",
+            instance.state.ime.nested_status_line()
+        ),
+    };
+    env.new_string(reply).map_err(BridgeError::JniError)
+}
+
+/// setImeNested(instance, mode, home) —— settings（imeNested auto|on|off）
+/// 下发到 Rust NestedIme：设置隔离 HOME（不存在则建）+ 路由模式。
+/// 非法 mode 字符串被 NestedIme::set_mode 拒绝（返回 false，这里如实记日志，
+/// 不改内部状态）。home 空串跳过（服务端/未初始化路径）。
+fn set_ime_nested<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    mode: JString<'local>,
+    home: JString<'local>,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "setImeNested")?;
+    let mode: String = env.get_string(&mode)?.into();
+    let home: String = env.get_string(&home)?.into();
+    if !home.is_empty() {
+        instance.state.ime.nested_set_home(std::path::Path::new(&home));
+    }
+    if !instance.state.ime.nested_set_mode(&mode) {
+        crate::bridge::ime_log_write(&format!(
+            "[waylandcraft][ime][nested] 忽略非法 mode={mode:?}（合法 auto|on|off）"
+        ));
+    }
+    Ok(())
 }
 
 /// notifyHostFocusGained(instance) —— Minecraft 窗口重新获得 OS 键盘焦点。

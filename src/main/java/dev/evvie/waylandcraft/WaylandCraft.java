@@ -216,6 +216,18 @@ public class WaylandCraft implements ClientModInitializer {
 				WaylandCraftCommon.LOGGER.warn("[terminal] setPreferredTerminal failed: {}", t.toString());
 			}
 		});
+		// v0.14：嵌套输入法路由开关 imeNested（auto|on|off）。responder 在
+		// 注册时立即触发一次，故这同时是启动期同步；后续 /wl settings set
+		// 或 GUI 改动都会重新下发。隔离 HOME=gameDir/waylandcraft/ime-nested。
+		settingsManager.registerResponder(WaylandCraftSettings.IME_NESTED, (value) -> {
+			try {
+				String home = new File(Minecraft.getInstance().gameDirectory,
+						"waylandcraft/ime-nested").getAbsolutePath();
+				bridge.setImeNested((String) value, home);
+			} catch (Throwable t) {
+				WaylandCraftCommon.LOGGER.warn("[ime][nested] setImeNested failed: {}", t.toString());
+			}
+		});
 	}
 
 	/* Update bridge and clients. May be called at any state of the game, even outside of a level

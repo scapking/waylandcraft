@@ -1156,6 +1156,44 @@ public class WaylandCraftBridge {
 			dev.evvie.waylandcraft.WaylandCraftCommon.LOGGER.warn("[status] setModVersion unavailable: {}", t.toString());
 		}
 	}
+
+	/* ---- v0.14 嵌套输入法守护进程 ----
+	 * sync5 教训：**任何新 native 调用点都必须能在无 native 时安全跳过**——
+	 * server jar 无 .so，两个 wrapper 都做 nativeAvailable/instance 门 +
+	 * catch(Throwable)（旧 .so 缺符号 = UnsatisfiedLinkError，不致命）。
+	 */
+
+	/**
+	 * /wl ime nested [status|start|stop] → native 路由决策（Rust
+	 * ime/nested_daemon.rs）。返回决策/状态文本；native 不可用返回 null
+	 * （调用方降级提示，不抛异常）。
+	 */
+	public String imeNested(String sub) {
+		if(!nativeAvailable || instance == 0) return null;
+		try {
+			return imeNestedCommandNative(instance, sub);
+		} catch(Throwable t) {
+			WaylandCraftCommon.LOGGER.warn("[ime][nested] imeNested({}) unavailable: {}", sub, t.toString());
+			return null;
+		}
+	}
+	private static native String imeNestedCommandNative(long instance, String sub);
+
+	/**
+	 * settings 下发：mode（auto|on|off）+ 隔离 HOME（gameDir/waylandcraft/
+	 * ime-nested，Rust 侧建目录并作为嵌套 daemon 的 HOME/XDG_CONFIG_HOME）。
+	 * 启动时应用一次，settings responder 在变更时再推。native 不可用时静默。
+	 */
+	public void setImeNested(String mode, String homeDir) {
+		if(!nativeAvailable || instance == 0) return;
+		try {
+			setImeNestedNative(instance, mode, homeDir);
+		} catch(Throwable t) {
+			WaylandCraftCommon.LOGGER.warn("[ime][nested] setImeNested unavailable: {}", t.toString());
+		}
+	}
+	private static native void setImeNestedNative(long instance, String mode, String homeDir);
+
 	private static native void sendFrame(long surfaceHandle);
 	
 	private static native void updateSurfaceData(long instance, WLCSurface surface);
