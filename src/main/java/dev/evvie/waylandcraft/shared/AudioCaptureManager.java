@@ -69,18 +69,19 @@ public class AudioCaptureManager {
 			stop();
 		}
 		
+		// ⑦ 方案A（整机 sink monitor 捕获）下 pid 仅作日志/状态记录
+		// （native audio_capture.rs:194 "窗口 pid 仅作日志记录"）——此前 PID 解析
+		// 失败直接放弃捕获，是"共享画面正常但没有声音"的根因之一。现在降级继续。
 		int pid = findPidForWindow(windowHandle, title, appId);
 		if(pid <= 0) {
-			lastError = "cannot resolve PID for window (no wayland client pid & no X11 _NET_WM_PID match)";
-			sourceStage = "none";
-			LOGGER.warn("Audio capture: cannot resolve PID for window '{}' (appId={}) — audio sharing unavailable for this window",
+			LOGGER.warn("Audio capture: cannot resolve PID for window '{}' (appId={}) — continuing with machine-monitor capture (pid recorded as 0; sound is the whole session, not per-window)",
 				title, appId);
-			return false;
+			sourceStage = "monitor(no-pid)";
 		}
-		resolvedPid = pid;
+		resolvedPid = Math.max(0, pid);
 		
 		try {
-			clientMod.bridge.audioCaptureStart(pid);
+			clientMod.bridge.audioCaptureStart(resolvedPid);
 		} catch(Throwable t) {
 			lastError = "audioCaptureStart failed: " + t.toString();
 			LOGGER.error("Audio capture start failed: {}", t.toString());
