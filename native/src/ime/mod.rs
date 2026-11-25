@@ -63,6 +63,8 @@ mod virtual_keyboard;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_real;
 
 pub use ime_event::{
     Commit, CursorRect, DeleteSurrounding, Done, DownEvent, FocusChange, KeyEvent,

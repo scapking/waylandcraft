@@ -353,7 +353,18 @@ raw 直通可用（sync4/5 修复），**中文始终打不出**。这是宿主�
   `DBUS_SESSION_BUS_ADDRESS`/`DISPLAY`/`XAUTHORITY`。
 - 参数：fcitx5 `-D --disable=dbus`（前台、禁 dbus addon，避免
   org.fcitx.Fcitx5 与宿主实例抢总线）；ibus 用独立 `--address=unix:path=…`
-  且禁 panel/config/emoji 子进程。
+  且禁 panel/config/emoji 子进程。实测（fcitx5 5.1.12，`ime/tests_real.rs`）
+  pinyin 引擎**不依赖** dbus——libpinyin 直链，`--disable=dbus` 下
+  preedit/候选/commit 全通。
+- **spawn 前种子配置**（`seed_fcitx5_home`，v0.14.1）：隔离 HOME 缺少
+  fcitx5 全局配置文件时，每个输入上下文都以"未激活"启动——
+  fcitx5 `Instance::inputMethod(ic)` 在未激活时用**组内第一个 IM**
+  （keyboard-us 直通引擎），这就是 sync6 实机"每键未消费、汉字永不出"
+  的根因（`[Behavior] ActiveByDefault` 无显式默认值=false；取证链见
+  `nested_daemon` 模块注释与 `tests_real` 三组对照实验）。种子策略：
+  `config/fcitx5/profile`（keyboard-us+pinyin 组，DefaultIM=pinyin）与
+  `config/fcitx5/config`（`[Behavior] ActiveByDefault=True`）仅**缺失时**
+  写默认，已有用户文件绝不覆盖（缺关键项时在 ime.log 如实警告）。
 - **绝不 `--replace`/`-r`**——那会踢掉用户的宿主输入法实例；单测
   `spawn_plan_is_isolated_and_never_replaces` 把这条纪律写死在断言里。
 
@@ -373,8 +384,14 @@ raw 直通可用（sync4/5 修复），**中文始终打不出**。这是宿主�
   的 socket 没有意义）。
 - bind 超时 10s、失败退避 5s、连续 3 次封顶停手（防 fork 炸弹），手动
   `start` 复位。全部决策行走 `ime.log` ⑥ 时间戳，失败进 ⑥ error ring。
-- host_bridge（dbus 穿透）在 `apply_ti3_outcome` 里**双发保持热**（FocusIn/
-  Surrounding/CursorRect 幂等），daemon 中途挂掉回退时宿主侧焦点是现成的。
+- host_bridge（dbus 穿透）的路由门（**v0.14.1 收紧**）：
+  `nested_route_live()` 为 true 时 `set_focus`/`clear_focus`/
+  `apply_ti3_outcome` **完全不再向宿主提交** FocusIn/FocusOut/
+  Surrounding/CursorRect——sync6 实机取证：嵌套主路径已激活，
+  dbus-ibus 仍持续收到 FocusIn/Out（宿主输入法弹自己的候选窗、
+  维持热焦点，纯干扰且语义含糊）。daemon 掉线回退后 route_live
+  变 false，下一次 ti3 事件即恢复 v0.13 的双发喂法（submit 幂等，
+  宿主状态自动补热）。wire 断言见 `tests::nested_live_suppresses_host_bridge_submits`。
 
 ### 命令与配置
 
@@ -386,12 +403,18 @@ raw 直通可用（sync4/5 修复），**中文始终打不出**。这是宿主�
 - `status.log` 新增 `nested_ime` 子系统 + metrics `ime_route`
   （im2-grab|im2|host_bridge|raw）。
 
-### 端到端实测清单（逻辑与 wire 层已用模拟 client 全测；以下需真机）
+### 端到端实测清单（逻辑与 wire 层已用模拟 client 全测）
 
-1. 隔离 HOME 首次 profile 只含 keyboard-us；需把宿主 fcitx5 profile（含
-   pinyin）拷入 `<home>/config/fcitx5/` 或在隔离 HOME 下跑 `fcitx5-configtool`。
-2. fcitx5 在 `--disable=dbus` 下 pinyin 引擎加载/候选行为（备选方案：保留
-   dbus addon 但删 DBUS_SESSION_BUS_ADDRESS 环境，见 FCITX5_ARGS 注释）。
-3. 嵌套 firefox ti3 + 嵌套 fcitx5 im2 + VK 直通全链路真机验证。
+1. **[已修]** 隔离 HOME 首次 profile/全局 config：spawn 前自动种默认
+   （`seed_fcitx5_home`），用户已有文件不覆盖。sync6 的"每键未消费"
+   根因即缺 `[Behavior] ActiveByDefault=True`（IC 未激活 → keyboard-us
+   直通），与 dbus/协议细节无关。
+2. **[已验证]** 真 fcitx5 端到端（`ime/tests_real.rs`，#[ignore]，
+   本机跑通）：`real_fcitx5_production_spawn_path` 走完整生产链路
+   nested_tick→种子→build_spawn_plan→spawn_daemon，nihao+空格 →
+   preedit×5 + `commit("你哈登")` 经 im2→relay→ti3 回到编辑器；
+   `real_fcitx5_seed_config_active_by_default` / `real_fcitx5_private_dbus`
+   对照证明 ActiveByDefault 是唯一决定变量、私有总线形态行为一致。
+3. 待用户实测：游戏内（Minecraft 聊天框）打中文。
 4. ibus 路预计不 bind im2 → Starting 超时 → Failed 回退（如实上报，非 bug）。
 

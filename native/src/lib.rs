@@ -322,7 +322,9 @@ pub(crate) struct WLCClient {
 }
 
 impl WLCClient {
-    fn new() -> Self {
+    // pub(crate)：ime 集成测试（tests_real）需按生产路径给外部 client
+    // 挂同样的 WLCClient 数据（wl_compositor 请求要求该 data 在场）。
+    pub(crate) fn new() -> Self {
         Self {
             compositor_state: CompositorClientState::default(),
         }

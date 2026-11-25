@@ -31,14 +31,14 @@ use crate::WLCState;
 
 // ═══════════════════════════ 服务端 ═══════════════════════════
 
-struct ServerClientData;
+pub(crate) struct ServerClientData;
 
 impl ClientData for ServerClientData {
     fn initialized(&self, _id: ClientId) {}
     fn disconnected(&self, _id: ClientId, _reason: DisconnectReason) {}
 }
 
-fn server_setup() -> (Display<WLCState>, WLCState) {
+pub(crate) fn server_setup() -> (Display<WLCState>, WLCState) {
     let display: Display<WLCState> = Display::new().unwrap();
     // 无 GPU：EGL 传 None，dmabuf 全局跳过（这正是 Option 化的目的）。
     let mut state = WLCState::new(display.handle(), None);
@@ -52,7 +52,7 @@ fn server_setup() -> (Display<WLCState>, WLCState) {
 
 // ═══════════════════════════ 客户端 ═══════════════════════════
 
-mod clients {
+pub(crate) mod clients {
     use std::os::unix::net::UnixStream;
     use wayland_client::{
         delegate_noop,
@@ -431,7 +431,7 @@ use clients::{EditorState, ImeClientState, TestClient};
 
 /// 编辑器客户端的初始化流程：bind → 建 surface → 建 text_input。
 /// 注意：roundtrip 会永久阻塞（服务端由本测试手动驱动），全程用交替驱动。
-fn editor_connect(
+pub(crate) fn editor_connect(
     stream: UnixStream,
     display: &mut Display<WLCState>,
     server: &mut WLCState,
