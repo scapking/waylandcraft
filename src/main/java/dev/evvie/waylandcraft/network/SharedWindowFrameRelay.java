@@ -153,8 +153,31 @@ public class SharedWindowFrameRelay {
 				forwarded++;
 			}
 		}
-		WaylandCraftCommon.LOGGER.info("[SERVER] forwarded image from {} to {} players ({} bytes)",
+		// ⑥ 帧级日志降为 debug（24fps×多窗口下这是最大的日志洪水源）；
+		// INFO 改为 1s 聚合摘要，保留吞吐可观测性
+		WaylandCraftCommon.LOGGER.debug("[SERVER] forwarded image from {} to {} players ({} bytes)",
 			senderUUID, forwarded, payload.imageData().length);
+		synchronized (statsLock) {
+			statsFrames++;
+			statsBytes += payload.imageData().length;
+			statsReceivers += forwarded;
+			long now = System.currentTimeMillis();
+			if (now - statsWindowStartMs >= 1000) {
+				if (statsFrames > 0) {
+					WaylandCraftCommon.LOGGER.info("[SERVER] relay stats ({}ms): {} frames, {} KB/s, {} sends",
+						now - statsWindowStartMs, statsFrames, String.format("%.1f", statsBytes / 1024.0), statsReceivers);
+				}
+				statsWindowStartMs = now;
+				statsFrames = 0; statsBytes = 0; statsReceivers = 0;
+			}
+		}
 	}
+
+	/** ⑥ 1 秒聚合转发统计 */
+	private final Object statsLock = new Object();
+	private long statsWindowStartMs = System.currentTimeMillis();
+	private long statsFrames;
+	private long statsBytes;
+	private int statsReceivers;
 
 }
