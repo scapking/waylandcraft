@@ -274,7 +274,16 @@ pub fn spawn(
         // （flatpak 运行器需要宿主 XDG_RUNTIME_DIR 才能用 --filesystem=xdg-run 构建沙箱）
         .env("WAYLAND_DISPLAY", &wayland_display)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env("DISPLAY", &display);
+        .env("DISPLAY", &display)
+        // upstream f21ea6f：游戏进程继承的调试/启动器变量不应透传给 spawn 出的客户端。
+        // （loom dev 环境会显式设置 RUST_BACKTRACE=1 与 __GL_THREADED_OPTIMIZATIONS=0，
+        // Prism launcher 默认设置 NO_COLOR；这些泄漏给窗口应用会干扰其输出/GL 行为。）
+        // 注意：与上游不同，fork 特意不删 DISPLAY/WAYLAND_DISPLAY——嵌套合成器
+        // 需要客户端连它们；也不删 LD_LIBRARY_PATH——Android jar 依赖捆绑 .so
+        // 的加载路径追加逻辑（见 v0.2.x 起 build.gradle/native-deps 说明）需要它。
+        .env_remove("RUST_BACKTRACE")
+        .env_remove("NO_COLOR")
+        .env_remove("__GL_THREADED_OPTIMIZATIONS");
 
     // double-fork：子进程立即退出，孙进程被 init 收养，避免僵尸；
     // 孙进程里直接 exec（不再调用 Command::spawn，避免 fork 后重用 std 的锁/allocator 风险）

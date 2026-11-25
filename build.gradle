@@ -84,6 +84,9 @@ java {
 	targetCompatibility = JavaVersion.VERSION_25
 }
 
+import org.gradle.internal.logging.text.StyledTextOutputFactory;
+import static org.gradle.internal.logging.text.StyledTextOutput.Style;
+
 jar {
 	inputs.property "archivesName", project.base.archivesName
 	version = null
@@ -187,8 +190,14 @@ jar {
 	}
 
 	// Viewer-only and server jars intentionally carry no native library.
+	// Upstream (22f9286): non-linux build hosts cannot compile the native lib,
+	// so warn instead of failing the whole jar task.
 	if(natives.size() < 1 && !isViewer && !isServer) {
-		ant.fail("native library not built!")
+		services
+			.get(StyledTextOutputFactory)
+			.create("waylandcraft")
+			.withStyle(Style.Failure)
+			.println("WARNING: Native library not built! The built mod will not contain native code");
 	}
 }
 
