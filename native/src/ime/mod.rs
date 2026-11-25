@@ -54,6 +54,9 @@ mod relay;
 mod text_input_v3;
 mod virtual_keyboard;
 
+#[cfg(test)]
+mod tests;
+
 pub use ime_event::{
     Commit, CursorRect, DeleteSurrounding, Done, DownEvent, FocusChange, KeyEvent,
     LookupTable, PreeditUpdate, SurroundingText, UpEvent,
@@ -661,7 +664,7 @@ impl ImeStateMachine {
 }
 
 #[cfg(test)]
-mod tests {
+mod facade_tests {
     use super::*;
 
     fn make_state() -> crate::WLCState {
