@@ -46,6 +46,13 @@
 //!   └─ nested 未激活（daemon 没起来/mode=off）→ v0.13 原路：
 //!         host_bridge submit_key_sync consumed 分流 → raw 兜底
 //! ```
+//!
+//! 路由门（v0.14.1 收紧）：`nested_route_live()` 为 true 时，
+//! set_focus / clear_focus / apply_ti3_outcome **一律不再向
+//! host_bridge 提交 FocusIn/FocusOut/Surrounding/CursorRect**——
+//! sync6 实机取证：嵌套主路径已激活，宿主 dbus-ibus 仍在收
+//! FocusIn/FocusOut（弹候选窗、维持热焦点，纯干扰）。daemon 掉线
+//! 回退后 route_live 变 false，ti3 事件恢复喂宿主（幂等补热）。
 
 mod ime_event;
 mod input_method_v2;
@@ -285,13 +292,24 @@ impl ImeState {
         // daemon 中途挂掉回退时宿主 ibus 侧焦点状态是热的。
         // v0.13 修正：firefox enable 后不调 commit，所以 focus 切换即发
         // FocusIn（apply_ti3_outcome 仍会再发一次，submit 幂等）。
+        // v0.14.1 路由门收紧：嵌套主路径在线时**不发**——宿主输入法
+        // （GNOME/ibus）收到 FocusIn 会弹自己的候选窗/状态栏抢焦点，
+        // 实测（sync6 ime.log）是"嵌套已激活但宿主仍持续 FocusIn/Out"
+        // 的干扰源。daemon 掉线回退时下一次 set_focus / ti3 enable 会
+        // 重新补热宿主状态（submit 幂等）。
         if let Some(hb) = state.host_bridge.as_mut() {
             if hb.is_ready() {
-                crate::bridge::ime_log_write(&format!(
-                    "[waylandcraft][ime][host_bridge] FocusIn（set_focus 路径，switched={}）",
-                    switched
-                ));
-                hb.submit(DownEvent::State(FocusChange::Activate));
+                if self.nested_route_live() {
+                    crate::bridge::ime_log_write(
+                        "[waylandcraft][ime][host_bridge] FocusIn 跳过（nested 主路径在线，路由门收紧）"
+                    );
+                } else {
+                    crate::bridge::ime_log_write(&format!(
+                        "[waylandcraft][ime][host_bridge] FocusIn（set_focus 路径，switched={}）",
+                        switched
+                    ));
+                    hb.submit(DownEvent::State(FocusChange::Activate));
+                }
             }
         }
     }
@@ -306,13 +324,21 @@ impl ImeState {
             // focus_lost 才清 pending_ops，ti3.disable 抖动保留）。
             let cmds = self.relay.focus_lost();
             self.execute_ime_commands(cmds);
-            // host_bridge FocusOut（后备路径）。
+            // host_bridge FocusOut（后备路径）。路由门收紧：nested 主
+            // 路径在线时不发（宿主本就不该跟踪我们的焦点；见 set_focus
+            // 同款注释）。
             if let Some(hb) = state.host_bridge.as_mut() {
                 if hb.is_ready() {
-                    hb.submit(DownEvent::State(FocusChange::Deactivate));
-                    crate::bridge::ime_log_write(&format!(
-                        "[waylandcraft][ime][host_bridge] FocusOut（ti3 焦点离开）"
-                    ));
+                    if self.nested_route_live() {
+                        crate::bridge::ime_log_write(
+                            "[waylandcraft][ime][host_bridge] FocusOut 跳过（nested 主路径在线，路由门收紧）"
+                        );
+                    } else {
+                        hb.submit(DownEvent::State(FocusChange::Deactivate));
+                        crate::bridge::ime_log_write(&format!(
+                            "[waylandcraft][ime][host_bridge] FocusOut（ti3 焦点离开）"
+                        ));
+                    }
                 }
             }
         }
@@ -381,8 +407,18 @@ impl ImeState {
 
     /// ti3 commit 的两条出口都喂：relay（嵌套 im2 主路径）与 host_bridge
     /// （dbus 后备路径）。host 侧 submit 是幂等的，双发无副作用。
+    ///
+    /// v0.14.1 路由门收紧：**nested 主路径在线时完全跳过 host_bridge**
+    /// （FocusIn/FocusOut/Surrounding/CursorRect 一律不发）。实机取证
+    /// （sync6 ime.log 14:34+）：嵌套 daemon 已 Active、按键走 im2，
+    /// 但 dbus-ibus 的 FocusIn/FocusOut 仍在持续进宿主会话——宿主
+    /// GNOME/ibus 会因此弹自己的候选 UI、维持焦点状态，干扰用户并让
+    /// 回退瞬间的宿主状态语义含糊。daemon 掉线回退后 nested_route_live
+    /// 变 false，下一次 ti3 事件即恢复 v0.13 的宿主喂法（焦点切窗口
+    /// /enable 抖动都会重发，状态重新补热）。
     pub(crate) fn apply_ti3_outcome(state: &mut crate::WLCState, outcome: Ti3CommitOutcome) {
         let ime = &mut state.ime;
+        let nested_live = ime.nested_route_live();
         let hb = state.host_bridge.as_mut();
 
         let cmds = match outcome {
@@ -402,7 +438,12 @@ impl ImeState {
                 // host_bridge（后备路径）：FocusIn + Surrounding + CursorRect。
                 // v0.13.2 修复保留：**始终**发 Surrounding（即使 text 为空）——
                 // 引擎需要 surrounding 上下文决定 consumed，否则拒收所有按键。
-                if let Some(hb) = hb {
+                // v0.14.1 路由门收紧：nested 主路径在线时整段跳过。
+                if nested_live {
+                    crate::bridge::ime_log_write(
+                        "[waylandcraft][ime] apply_ti3_outcome Enabled: host_bridge 提交跳过（nested 主路径在线，路由门收紧）"
+                    );
+                } else if let Some(hb) = hb {
                     if hb.is_ready() {
                         hb.submit(DownEvent::State(FocusChange::Activate));
                         hb.submit(DownEvent::Surrounding(SurroundingText {
@@ -429,9 +470,12 @@ impl ImeState {
                 crate::bridge::ime_log_write(
                     "[waylandcraft][ime] apply_ti3_outcome Disabled -> relay/host FocusOut"
                 );
-                if let Some(hb) = hb {
-                    if hb.is_ready() {
-                        hb.submit(DownEvent::State(FocusChange::Deactivate));
+                // 路由门收紧：nested 在线时不向宿主发 FocusOut。
+                if !nested_live {
+                    if let Some(hb) = hb {
+                        if hb.is_ready() {
+                            hb.submit(DownEvent::State(FocusChange::Deactivate));
+                        }
                     }
                 }
                 ime.relay.set_app_enabled(false, "ti3.disable")
@@ -443,15 +487,20 @@ impl ImeState {
                     st.surrounding_cursor, st.surrounding_anchor, st.cursor_rect
                 ));
                 let cmds = ime.relay.push_app_state(st.clone());
-                if let Some(hb) = hb {
-                    if hb.is_ready() {
-                        hb.submit(DownEvent::Surrounding(SurroundingText {
-                            text: st.surrounding_text.clone(),
-                            cursor: st.surrounding_cursor,
-                            anchor: st.surrounding_anchor,
-                        }));
-                        if let Some((x, y, w, h)) = st.cursor_rect {
-                            hb.submit(DownEvent::CursorRect(CursorRect { x, y, w, h }));
+                // 路由门收紧：nested 在线时不再向宿主喂 Surrounding/
+                // 光标矩形（这类提交在 sync6 实机日志里与 FocusIn/Out
+                // 一同泄漏，宿主 ibus 因此维持热焦点状态）。
+                if !nested_live {
+                    if let Some(hb) = hb {
+                        if hb.is_ready() {
+                            hb.submit(DownEvent::Surrounding(SurroundingText {
+                                text: st.surrounding_text.clone(),
+                                cursor: st.surrounding_cursor,
+                                anchor: st.surrounding_anchor,
+                            }));
+                            if let Some((x, y, w, h)) = st.cursor_rect {
+                                hb.submit(DownEvent::CursorRect(CursorRect { x, y, w, h }));
+                            }
                         }
                     }
                 }

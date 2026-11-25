@@ -1099,6 +1099,98 @@ fn virtual_keyboard_engine_unconsumed_key_hits_app() {
     );
 }
 
+/// v0.14.1 路由门收紧（wire 级）：nested 主路径在线（im2 bound +
+/// relay ime_present + mode≠off）时，set_focus / ti3 enable/disable /
+/// clear_focus 必须**完全不向 host_bridge 提交** FocusIn/FocusOut/
+/// Surrounding——sync6 实机取证正是这条泄漏（嵌套已激活，宿主
+/// dbus-ibus 仍持续 FocusIn/Out）。对照组：im2 不在场（回退路径）
+/// 时宿主喂法保持 v0.13 语义。
+#[test]
+fn nested_live_suppresses_host_bridge_submits() {
+    use crate::host_bridge::{HostBridge, HostBridgeHandle};
+    use crate::ime::{CursorRect, DownEvent, FocusChange, UpEvent};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct RecordingBridge(Arc<Mutex<Vec<&'static str>>>);
+    impl HostBridge for RecordingBridge {
+        fn name(&self) -> &'static str { "rec" }
+        fn is_ready(&self) -> bool { true }
+        fn is_dead(&self) -> bool { false }
+        fn submit(&mut self, ev: DownEvent) {
+            let tag = match ev {
+                DownEvent::State(FocusChange::Activate) => "FocusIn",
+                DownEvent::State(FocusChange::Deactivate) => "FocusOut",
+                DownEvent::Surrounding(_) => "Surrounding",
+                DownEvent::CursorRect(_) => "CursorRect",
+                DownEvent::Key(_) => "Key",
+            };
+            self.0.lock().unwrap().push(tag);
+        }
+        fn take_up_events(&mut self) -> Vec<UpEvent> {
+            Vec::new()
+        }
+        fn update_cursor_rect(&mut self, _rect: CursorRect) {}
+    }
+
+    let attach = |f: &mut Fixture| -> RecordingBridge {
+        let b = RecordingBridge(Arc::new(Mutex::new(Vec::new())));
+        f.server.host_bridge = Some(HostBridgeHandle::new(Box::new(b.clone())));
+        b
+    };
+    let tags = |b: &RecordingBridge| b.0.lock().unwrap().clone();
+
+    // ── 主路径在线：im2 客户端在场 + enable ──
+    let mut f = setup(); // setup() 里 im2 已 bind
+    let b = attach(&mut f);
+    assert!(f.server.ime.nested_route_live(), "setup 后 nested 路由应在线");
+    f.focus_and_enable();
+    assert_eq!(
+        tags(&b),
+        Vec::<&'static str>::new(),
+        "nested 主路径在线时 host_bridge 必须收不到任何提交"
+    );
+    // IME 侧正常收到 activate+done（跳过的只是宿主通道）。
+    assert_eq!(f.ime.state.events, vec!["activate", "done"]);
+
+    // disable（State 批次还会喂 Surrounding 的路径也一并验证）
+    let ti = f.editor.state.ti.clone().unwrap();
+    ti.set_surrounding_text("abc".into(), 3, 3);
+    ti.commit();
+    f.drive();
+    ti.disable();
+    ti.commit();
+    f.drive();
+    assert_eq!(
+        tags(&b),
+        Vec::<&'static str>::new(),
+        "激活期间的 State/Disabled 提交同样必须被路由门拦下"
+    );
+
+    // 失焦：FocusOut 也不得泄漏给宿主。
+    f.clear_focus();
+    f.drive();
+    assert_eq!(
+        tags(&b),
+        Vec::<&'static str>::new(),
+        "clear_focus 在 nested 在线时不得向 host_bridge 发 FocusOut"
+    );
+
+    // ── 对照组：无 im2 客户端（回退 v0.13）→ 宿主喂法原样 ──
+    let mut g = setup_with_ime(false);
+    let gb = attach(&mut g);
+    assert!(!g.server.ime.nested_route_live(), "无 im2 → 主路径不在线");
+    g.focus_and_enable();
+    let t = tags(&gb);
+    assert!(
+        t.contains(&"FocusIn") && t.contains(&"Surrounding"),
+        "回退路径必须保持 v0.13 的宿主 FocusIn/Surrounding 提交；实际 {t:?}"
+    );
+    g.clear_focus();
+    g.drive();
+    assert!(tags(&gb).contains(&"FocusOut"), "回退路径 FocusOut 照发");
+}
+
 /// v0.14 路由门：`/wl ime nested stop` 之后 im2 通道立即失效——
 /// handle_key 不再吃键（回退 host_bridge/raw），route_live=false；
 /// 手动 start 复位。决策状态机不依赖真 daemon 进程（spawn 细节另有单测）。
