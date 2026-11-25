@@ -2692,7 +2692,9 @@ fn audio_capture_start<'local>(
     _instance: jlong,
     pid: jint,
 ) -> Result<(), BridgeError> {
-    if pid <= 0 {
+    // pid==0 = 窗口 PID 解析失败：仍然启动捕获（audio_capture.rs 会走
+    // monitor-fallback 整机捕获），只有负数才是非法入参。
+    if pid < 0 {
         return Err(BridgeError::Null("audio_capture_invalid_pid"));
     }
     crate::audio_capture::start_audio_capture(pid as u32)
