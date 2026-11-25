@@ -26,7 +26,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pipewire as pw;
-use pw::prelude::*;
 
 /// [audio] 日志宏：同时写 stderr 和 audio 日志文件（bridge::audio_log_write）。
 macro_rules! audio_log {
@@ -567,7 +566,7 @@ fn connect_capture(
     // 有效（connect 刚返回时恒为 ID_NONE——旧实现状态里 stream_node 一直
     // 是 -1 的原因），mainloop 线程启动后再补读一次。
     std::thread::sleep(Duration::from_millis(400));
-    let mut stream_node = stream.node_id();
+    let stream_node = stream.node_id();
     audio_log!(
         "[audio] connect_capture: our capture node={}（AUTOCONNECT → target {}）",
         stream_node,
