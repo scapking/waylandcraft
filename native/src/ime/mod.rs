@@ -149,9 +149,10 @@ pub struct ImeState {
     /// 嵌套 IME daemon 生命周期 + 路由决策（imeNested auto|on|off）。
     pub(crate) nested: NestedIme,
 
-    /// 观测网（角标原料）：最近一次 emit_ti_batch 交付批次是否携带非空
-    /// 预编辑——"中文引擎工作态"（协议不暴露引擎名，见 popup_work_state）。
-    /// relay 缓冲语义的只读镜像，不参与任何裁决。
+    /// 观测网（角标原料）：预编辑流是否在场（置位=非空 preedit 批次 /
+    /// im2 无内容 commit 心跳 / 候选窗新帧采集；清除=会话终结 / 失焦 /
+    /// 候选窗内容真消失）。"中文引擎工作态"（协议不暴露引擎名，见
+    /// popup_work_state）。只读镜像语义不变：不参与任何裁决。
     last_preedit_active: bool,
 
     /// 最近一次 fcitx5 种子 outcome 的引擎名列表（/wl ime info 透明化；
@@ -183,12 +184,17 @@ impl ImeState {
     }
 
     /// popup 角色对象销毁（`zwp_input_popup_surface_v2.destroy` 或客户端断连）：
-    /// 仅当销毁的就是当前登记对象时解除采集。
+    /// 仅当销毁的就是当前登记对象时解除采集；内容彻底终结（无 live 帧且
+    /// 无 hold 接管）→ 组字证据清零（角标落）。
     pub(crate) fn clear_popup_role(
         &mut self,
         popup_id: smithay::reexports::wayland_server::backend::ObjectId,
     ) {
         self.popup.gone_for(popup_id);
+        let now = self.popup.now();
+        if !self.popup.has_content(now) {
+            self.note_popup_content_gone();
+        }
     }
 
     /// 可见性原料（焦点/激活态）变化时推进 epoch，让 Java 轮询感知
@@ -231,9 +237,11 @@ impl ImeState {
     /// Java 侧再叠加"聊天框 focused"等屏幕语境决定是否真的绘制。
     pub fn take_popup_snapshot(&mut self, kb_active: bool) -> Option<PopupSnapshot> {
         // display hold 到期结算（轮询驱动，无需定时器）：到期仍无新帧 →
-        // 快照通道回落不可见（Java 隐藏）。
+        // 快照通道回落不可见（Java 隐藏），同时终结组字证据（角标落）。
         let now = self.popup.now();
-        self.popup.expire_hold(now);
+        if self.popup.expire_hold(now) {
+            self.note_popup_content_gone();
+        }
         if !self.popup.changed() {
             return None;
         }
@@ -286,11 +294,29 @@ impl ImeState {
         )
     }
 
-    /// 中文引擎工作态（角标原料）：会话激活 + 最近一次交付批次携带非空
-    /// 预编辑。**协议限制**：im2 不暴露引擎名，语义=「有预编辑/候选流的
+    /// 中文引擎工作态（角标原料）：会话激活 + 预编辑流在场。信号源
+    /// （sync9 根因修复后，弹窗/客户端预编辑两种形态都覆盖）：
+    /// 1. 交付批次含非空 preedit（clientPreedit 模式）；
+    /// 2. im2 无内容 commit 心跳（弹窗模式 updatePreeditDelegate——面板
+    ///    在变而 clientPreedit 恒空）；
+    /// 3. 候选窗采集到新帧（classicui 只在面板有内容时绘制）。
+    /// 终结信号：Deactivate / clear_focus / 候选窗内容真消失（无 live 帧
+    /// 且 hold 已到期）。
+    /// **协议限制**：im2 不暴露引擎名，语义=「有预编辑/候选流的
     /// 工作态」而非「引擎=拼音」；keyboard-us 直通永不产生预编辑 → 无角标。
     pub fn popup_work_state(&self) -> bool {
         self.popup_ime_active() && self.last_preedit_active
+    }
+
+    /// 候选窗采到新帧 → 组字证据置位（input_popup::on_popup_commit 调用）。
+    pub(crate) fn note_popup_frame_activity(&mut self) {
+        self.last_preedit_active = true;
+    }
+
+    /// 候选窗内容真消失（attach(NULL) 已交付帧 / 角色解除且无 hold /
+    /// hold 到期）→ 组字证据清零。
+    pub(crate) fn note_popup_content_gone(&mut self) {
+        self.last_preedit_active = false;
     }
 
     /// `/wl ime info` 多行报告：nested、种子引擎、候选窗统计、工作态、
@@ -599,8 +625,12 @@ impl ImeState {
         self.im2.popup = None;
         // popup 角色随 input_method 对象一并销毁（协议 destroy 语义：input_method
         // 销毁即销毁其 popup 子对象）：解除采集轨道、让 Java 轮询看到消失
-        // （未交付帧仍走 hold 窗口）。
+        // （未交付帧仍走 hold 窗口；内容真终结 → 角标原料清零）。
         self.popup.cleared();
+        let now = self.popup.now();
+        if !self.popup.has_content(now) {
+            self.note_popup_content_gone();
+        }
         crate::bridge::ime_log_write(
             "[waylandcraft][ime][im2] 输入法客户端断开 → 回退 host_bridge/raw",
         );
@@ -741,6 +771,14 @@ impl ImeState {
             // 无内容裸 commit：fcitx5 updatePreeditDelegate 面板为空时
             // 也照发 commit(serial)（waylandimserverv2.cpp），属正常心跳，
             // 与 sync7 时代混在 DROPPED 文案里的真丢字是两回事。
+            //
+            // 角标原料（sync9 根因的另一半）：clientPreedit 为空但面板在变
+            // = 弹窗模式组字中——这是生产预编辑流唯一的 im2 线级证据
+            // （updatePreeditDelegate 每次面板更新都以 commit(serial) 收尾；
+            // preedit 像素走 popup 采集轨道，不经过本批处理点）。
+            if self.popup_ime_active() {
+                self.last_preedit_active = true;
+            }
             crate::bridge::ime_log_write(&format!(
                 "[waylandcraft][ime][relay] im2 commit(serial={serial}) 无内容（wire done={done_sent}），忽略"
             ));
@@ -781,8 +819,18 @@ impl ImeState {
         };
         // 观测网：批次实际交付 → 记录"引擎工作态"原料（非空预编辑在场）。
         // 放在 DROPPED/无实例早退之后，保证 flag 反映真实交付给应用的形态。
-        self.last_preedit_active =
-            commands.iter().any(|c| matches!(c, TiCommand::Preedit(t, _, _) if !t.is_empty()));
+        //
+        // sync9 根因修复：**只置位、不清除**。旧实现每批无条件赋值
+        // `any(非空 Preedit)`，而生产弹窗模式（fcitx5 classicui 绘制
+        // preedit，clientPreedit 恒空）下能到达这里的批次只有
+        // commit_string/delete_surrounding（选字上屏、退格）——flag 被
+        // 这些"输出批次"反复清零，组字期间角标永不出现（用户实锤
+        // workState=false 且 commit 正常）。清除改由显式终结信号负责：
+        // Deactivate（会话终结）、clear_focus（失焦兜底）、候选窗内容
+        // 真消失（note_popup_content_gone / hold 到期）。
+        if commands.iter().any(|c| matches!(c, TiCommand::Preedit(t, _, _) if !t.is_empty())) {
+            self.last_preedit_active = true;
+        }
         for cmd in commands {
             match cmd {
                 TiCommand::Preedit(t, b, e) => {

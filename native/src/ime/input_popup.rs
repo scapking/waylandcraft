@@ -411,7 +411,14 @@ pub(crate) fn on_popup_commit(wlc: &mut WLCState, surface: &WlSurface) {
 
     match slot {
         None => {}
-        Some(BufferAssignment::Removed) => wlc.ime.popup.note_frame_removed(),
+        Some(BufferAssignment::Removed) => {
+            wlc.ime.popup.note_frame_removed();
+            // 真实隐藏（已交付帧、无 hold 接管）→ 组字证据终结，角标落。
+            let now = wlc.ime.popup.now();
+            if !wlc.ime.popup.has_content(now) {
+                wlc.ime.note_popup_content_gone();
+            }
+        }
         Some(BufferAssignment::NewBuffer(buffer)) => {
             capture_buffer(wlc, &buffer);
             buffer.release();
@@ -436,6 +443,10 @@ fn capture_buffer(wlc: &mut WLCState, buffer: &WlBuffer) {
     match outcome {
         Ok((Some(argb), width, height)) => {
             wlc.ime.popup.note_frame(width, height, argb);
+            // 弹窗模式组字证据：classicui 只在面板有内容时绘制候选窗——
+            // 采到新帧 = 预编辑/候选流在场（角标原料，见 mod.rs
+            // popup_work_state 的生产形态注释）。
+            wlc.ime.note_popup_frame_activity();
         }
         Ok((None, width, height)) => {
             crate::bridge::ime_log_write(&format!(

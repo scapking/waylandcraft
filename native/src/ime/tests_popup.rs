@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use smithay::reexports::wayland_server::{Client, Display};
 
+use crate::ime::input_popup::POPUP_HOLD_MS;
 use crate::ime::tests::{editor_connect, server_setup, ServerClientData};
 use crate::ime::tests::clients::{EditorState, TestClient};
 use crate::WLCState;
@@ -876,6 +877,84 @@ fn poll_java_tick(f: &mut PopupFixture, kb_active: bool) -> Option<Vec<u8>> {
     Some(crate::bridge::encode_popup_snapshot(&snap))
 }
 
+// ═══════════ 角标工作态（sync9 生产形态：弹窗模式预编辑流证据）═══════════
+
+/// workState 生产根因回归（用户日志 workState=false 而 commit 正常）：
+/// 弹窗模式下 fcitx5 的 clientPreedit 恒空——预编辑像素走 popup 采集轨道、
+/// 面板更新走**无内容 commit(serial) 心跳**（waylandimserverv2.cpp
+/// updatePreeditDelegate），到达 emit_ti_batch 的只有选字上屏的
+/// commit_string 批次。旧实现每批无条件 `flag = any(非空 preedit)`，
+/// 这些"输出批次"把角标原料反复清零 → 组字期间角标永不出现。
+///
+/// 本测试按生产事件序列逐步断言三种置位证据与两种终结信号：
+/// 采帧置位 → commit 批次不清除 → 真隐藏（已交付帧 attach(NULL)）清零 →
+/// 竞态 hold 期间保持 → hold 到期清零。
+#[test]
+fn popup_work_state_production_shapes() {
+    let mut f = setup_popup();
+    f.focus_and_enable();
+    assert!(
+        !f.server.ime.popup_work_state(),
+        "刚激活、零证据 → 角标不得虚位"
+    );
+
+    let qh = f.ime.qh();
+    let im = f.ime.state.im.as_ref().unwrap().clone();
+
+    // 证据 1：弹窗模式心跳——无内容 commit(serial)（clientPreedit 空的
+    // updatePreeditDelegate 形态）。
+    im.commit(f.server.ime.im2.done_count());
+    assert!(f.drive());
+    assert!(f.server.ime.popup_work_state(), "面板更新心跳 = 组字中 → 角标必须置位");
+
+    // 采一帧并交付（overlay 显示候选窗）。
+    let (surface, _popup, _px) = popup_with_frame(&mut f, 6, 2, 1);
+    let s = f.server.ime.take_popup_snapshot(true).expect("首帧").visible;
+    assert!(s);
+
+    // 证据 2 + 旧 bug 锁定：选字上屏 = 纯 commit_string 批次。新语义
+    // 不得清除已有证据（组字可能在 commit 后继续；终结另有显式信号）。
+    im.commit_string("你".into());
+    im.commit(f.server.ime.im2.done_count());
+    assert!(f.drive());
+    assert!(
+        f.server.ime.popup_work_state(),
+        "commit-only 批次不得翻转工作态（sync9 角标根因）"
+    );
+
+    // 终结 1：真实隐藏——已交付的帧被 attach(NULL)（弹窗收起 = 组字结束）。
+    surface.attach(None, 0, 0);
+    surface.commit();
+    assert!(f.drive());
+    assert!(
+        !f.server.ime.popup_work_state(),
+        "已交付帧真隐藏 → 候选窗内容终结 → 角标落"
+    );
+
+    // 终结 2 / 保帧：同回合竞态（采到未交付 → attach(NULL)）期间 hold
+    // 交付保持可见，组字证据不被误终结；到期后才落。
+    let px2 = argb_pattern(4, 2, 4);
+    let buf = ShmBuf::new(&f.ime.state, &qh, 4, 2, 16, wl_shm::Format::Argb8888);
+    buf.write(&px2);
+    surface.attach(Some(&buf.buffer), 0, 0);
+    surface.damage_buffer(0, 0, 4, 2);
+    surface.commit();
+    surface.attach(None, 0, 0);
+    surface.commit();
+    std::mem::forget(buf);
+    assert!(f.drive());
+    assert!(f.server.ime.popup_work_state(), "采到新帧 = 组字证据置位");
+    let s = f.server.ime.take_popup_snapshot(true).expect("hold 交付");
+    assert!(s.visible && s.argb.as_deref() == Some(&px2[..]));
+    assert!(f.server.ime.popup_work_state(), "hold 交付期间证据保持");
+    // 假时钟推过 hold 窗口 → 轮询到期 → 可见性与角标同步回落。
+    let t = f.server.ime.popup.now();
+    f.server.ime.popup.set_clock(t + std::time::Duration::from_millis(POPUP_HOLD_MS + 1));
+    let s = f.server.ime.take_popup_snapshot(true).expect("到期应推进");
+    assert!(!s.visible);
+    assert!(!f.server.ime.popup_work_state(), "hold 到期无新帧 → 角标终结");
+}
+
 // ═══════════════════════ Phase 3：pointer 点选回传 ═══════════════════════
 
 /// overlay 区域点击 → native 向 popup surface 发 enter→(motion)→button
@@ -1119,18 +1198,61 @@ fn real_fcitx5_popup_frame_capture_and_click() {
         let grabbed = server.ime.im2.grab.is_some();
 
         if grabbed {
-            // 4) 打 "niha"（不空格：候选窗应挂在 preedit 展示期间）
-            for evdev in [49u32, 23, 35, 30] {
-                let mods = server.seat.modifiers_tuple();
-                server.ime.handle_key(evdev + 8, crate::seat::KeyboardAction::Press, mods);
-                burst(std::time::Duration::from_millis(220), &mut display, &mut server, &mut editor, &listener);
-                server.ime.handle_key(evdev + 8, crate::seat::KeyboardAction::Release, mods);
-                burst(std::time::Duration::from_millis(120), &mut display, &mut server, &mut editor, &listener);
+            // 4) 打 "niha"（不空格：候选窗应挂在 preedit 展示期间）。
+            //    本修复的最终门槛（sync9 真机验证）：真 fcitx5 classicui 的
+            //    "同回合 attach 内容 → attach(NULL)（常伴角色更替）"竞态
+            //    形态下，按 Java overlay 的 16ms 节奏模拟轮询，统计
+            //    visible=true 且带完整像素的交付次数——修复前该计数恒 0
+            //    （帧生命周期 < 轮询间隔，快照永远 has_frame=false），
+            //    修复后 display hold 保证每个真实采到的帧至少交付一次。
+            let mut visible_polls = 0u32;
+            let mut snap_opt: Option<crate::ime::PopupSnapshot> = None;
+            {
+                let mut poll_tick = |display: &mut Display<WLCState>,
+                                     server: &mut WLCState,
+                                     editor: &mut TestClient<EditorState>,
+                                     listener: &std::os::unix::net::UnixListener,
+                                     dur: std::time::Duration| {
+                    let t = Instant::now();
+                    while t.elapsed() < dur {
+                        pump(display, server, editor, listener);
+                        if server.ime.popup_surface().is_some() {
+                            popup_seen = true;
+                        }
+                        if let Some(s) = server.ime.take_popup_snapshot(true) {
+                            let full_pixels = s
+                                .argb
+                                .as_ref()
+                                .is_some_and(|a| a.len() == (s.width * s.height * 4) as usize);
+                            if s.visible && full_pixels {
+                                visible_polls += 1;
+                                if snap_opt.is_none() {
+                                    snap_opt = Some(s);
+                                }
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    }
+                };
+                for evdev in [49u32, 23, 35, 30] {
+                    let mods = server.seat.modifiers_tuple();
+                    server.ime.handle_key(evdev + 8, crate::seat::KeyboardAction::Press, mods);
+                    poll_tick(&mut display, &mut server, &mut editor, &listener, std::time::Duration::from_millis(220));
+                    server.ime.handle_key(evdev + 8, crate::seat::KeyboardAction::Release, mods);
+                    poll_tick(&mut display, &mut server, &mut editor, &listener, std::time::Duration::from_millis(120));
+                }
             }
-            // 5) 等 popup 角色出现 + 非空帧（15s）
+            eprintln!("=== [f5popup] 打字期间 16ms 轮询 visible 交付次数: {visible_polls}");
+            // display hold 修复门槛：真 fcitx5 竞态形态下至少 3 次带像素的
+            // 可见交付（每键 1 帧 + 候选刷新，生产观测同会话 19 帧）。
+            assert!(
+                visible_polls >= 3,
+                "真 fcitx5 打字期间按 16ms 轮询必须至少 3 次拿到 visible=true 完整像素帧（display hold 门槛），实际 {visible_polls}"
+            );
+
+            // 5) 等 popup 角色出现 + 非空帧（15s；第 4 步已见帧则跳过）。
             let t0 = Instant::now();
-            let mut snap_opt = None;
-            while t0.elapsed() < std::time::Duration::from_secs(15) {
+            while snap_opt.is_none() && t0.elapsed() < std::time::Duration::from_secs(15) {
                 pump(&mut display, &mut server, &mut editor, &listener);
                 popup_seen = server.ime.popup_surface().is_some();
                 if popup_seen {
