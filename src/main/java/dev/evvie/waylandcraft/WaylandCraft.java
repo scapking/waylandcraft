@@ -415,7 +415,20 @@ public class WaylandCraft implements ClientModInitializer {
 		// 对所有已映射窗口幂等地尝试给物品（服务端 giveItemIfMissing 检查背包已有则不重复给）。
 		// 不用 getNewToplevels()（一次性消费）：若服务端 10 tick 冷却或时序错过，
 		// 新窗口的物品会永久漏发；改为每 tick 全量检查，窗口出现后总能补上。
-		itemManager.giveItemsIfMissing(bridge.getMappedToplevels());
+		// ⑩ 服务端无 mod 时物品体系整体不存在（give 被静默丢弃）：改走本地直显——
+		// 不再依赖"手持物品"路径，为新 toplevel 直接建 display 并以初始姿态摆放，
+		// 窗口照样可见/可点/可拖（拖拽走 PointerGrabMap 世界射线，本就纯客户端）。
+		if(serverHasMod) {
+			itemManager.giveItemsIfMissing(bridge.getMappedToplevels());
+		}
+		else {
+			for(WLCToplevel t : bridge.getMappedToplevels()) {
+				if(hasDisplayFor(t)) continue;
+				WindowDisplay d = getOrCreateDisplay(t);
+				d.anchorDistance = 2.0;
+				d.doGrabMove(camera.position(), new Vec3(camera.forwardVector()), new Vec3(camera.upVector()), camera.yRot());
+			}
+		}
 		
 		boolean inWMScreen = Minecraft.getInstance().screen instanceof WindowManagerScreen;
 		
@@ -613,7 +626,41 @@ public class WaylandCraft implements ClientModInitializer {
 	
 	public void onClientTick(Minecraft minecraft) {
 		if(minecraft.player == null) return;
+		updateServerModCapability();
 		checkKeybinds(minecraft);
+	}
+	
+	// ===== ⑩ 服务端能力检测 =====
+	// 窗口物品的"存在性"（物品注册、give、背包持有、失效清理）全部锚定在服务端
+	// ServerItemManager + ServerPlayerMixin + 静态注册表；vanilla 服务端对未知
+	// payload 静默丢弃、对未知物品 ID 直接拒绝，客户端收不到任何错误。
+	// 唯一可靠的探测是 Fabric 的通道注册可见性：服务端装了 mod 才会注册
+	// ServerboundGiveItemsPayload 的接收通道，canSend 才为 true。
+	// 探测结果驱动运行模式：true=标准模式（物品体系），false=本地直显模式。
+	public volatile boolean serverHasMod = true;
+	private int serverModCheckCountdown = 0;
+	
+	private void updateServerModCapability() {
+		if(Minecraft.getInstance().level == null) return;
+		if(serverModCheckCountdown-- > 0) return;
+		serverModCheckCountdown = 20; // 每秒复测一次：容忍配置期注册延迟/换服时序
+		
+		boolean has = net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(
+				dev.evvie.waylandcraft.network.ServerboundGiveItemsPayload.TYPE);
+		if(has == serverHasMod) return;
+		
+		serverHasMod = has;
+		WaylandCraftCommon.LOGGER.info("[servermod] server-side WaylandCraft {}", has ? "PRESENT - item system active" : "MISSING - local direct-display mode");
+		if(!has) {
+			Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("§eWaylandCraft 本地模式：服务端未安装 mod。窗口以本地直显方式运行（可见/可拖/键盘鼠标交互正常）；物品持久化与多人共享需服务端安装 waylandcraft-server.jar"), false);
+		}
+	}
+	
+	/** 命令/共享入口的能力守卫：vanilla 服务端下给出明确错误而非静默失败 */
+	public boolean requireServerMod(String feature) {
+		if(serverHasMod) return true;
+		Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("§c✘ " + feature + "需要服务端安装 WaylandCraft mod（waylandcraft-server.jar）；当前为本地模式，该功能静默不可用"), false);
+		return false;
 	}
 		
 	private void checkKeybinds(Minecraft minecraft) {
@@ -658,7 +705,8 @@ public class WaylandCraft implements ClientModInitializer {
 			return;
 		}
 		minecraft.getChatListener().handleSystemMessage(Component.literal("Wayland compositor running on " + waylandSocket), false);
-		itemManager.giveItemsIfMissing(bridge.getMappedToplevels());
+		updateServerModCapability();
+		if(serverHasMod) itemManager.giveItemsIfMissing(bridge.getMappedToplevels());
 	}
 	
 	private void onClientDisconnect(ClientPacketListener listener, Minecraft minecraft) {

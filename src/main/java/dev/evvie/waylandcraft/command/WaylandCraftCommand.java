@@ -804,6 +804,13 @@ public class WaylandCraftCommand {
 			return 0;
 		}
 
+		// ⑩ 本地直显模式（服务端无 mod）：物品体系不存在，但窗口本来就已在世界中
+		// 直接显示（WaylandCraft.updateWorld auto-place），give 无意义且会假成功。
+		if(!wlc.serverHasMod) {
+			source.sendFeedback(Component.literal("§e○ 本地模式：窗口已直接显示在世界中（服务端无 mod，物品持久化不可用）: §f" + getWindowDisplayName(toplevel) + "§r"));
+			return 1;
+		}
+
 		wlc.itemManager.giveItem(toplevel);
 		source.sendFeedback(Component.literal("§a✔ Gave window item: §f" + getWindowDisplayName(toplevel) + "§r"));
 		return 1;

@@ -20,11 +20,19 @@ public class WindowItemManager implements WindowItemInteractionProvider, ClientT
 	// Toplevel handles last sent to the server for synchronization
 	private long[] syncedToplevels = new long[0];
 	
+	// ⑩ vanilla 服务端下这些 payload 会被静默丢弃：直接不发，
+	// 避免每 tick 每窗口往连接里灌无意义流量（窗口显示走 WaylandCraft 本地直显路径）。
+	private boolean serverCanTrackItems() {
+		return WaylandCraft.instance == null || WaylandCraft.instance.serverHasMod;
+	}
+
 	public void giveItem(WLCToplevel toplevel) {
+		if(!serverCanTrackItems()) return;
 		ClientPlayNetworking.send(new ServerboundGiveItemsPayload(new long[] {toplevel.getHandle()}, false));
 	}
 	
 	public void giveItemsIfMissing(WLCToplevel... toplevels) {
+		if(!serverCanTrackItems()) return;
 		if(toplevels.length < 1) return;
 		
 		long[] handles = new long[toplevels.length];
@@ -43,6 +51,7 @@ public class WindowItemManager implements WindowItemInteractionProvider, ClientT
 	}
 	
 	public void syncToplevels() {
+		if(!serverCanTrackItems()) return;
 		long[] handles = Arrays.stream(WaylandCraft.instance.bridge.getToplevels()).mapToLong((t) -> t.getHandle()).toArray();
 		if(Arrays.equals(handles, syncedToplevels)) return;
 		

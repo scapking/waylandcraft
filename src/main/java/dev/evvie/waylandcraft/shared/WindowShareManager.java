@@ -128,7 +128,9 @@ public class WindowShareManager {
 			LOGGER.warn("Cannot start sharing on server side");
 			return false;
 		}
-		
+		// ⑩ 共享注册/帧中继 100% 依赖服务端 mod，vanilla 服务端下会静默失效——明确拒绝
+		if(!clientMod.requireServerMod("多人共享")) return false;
+
 		if(shareStates.containsKey(windowHandle)) {
 			LOGGER.warn("Window 0x{} is already being shared", Long.toHexString(windowHandle));
 			return false;
@@ -188,6 +190,8 @@ public class WindowShareManager {
 			LOGGER.warn("Cannot start sharing on server side");
 			return false;
 		}
+		// ⑩ 同上：共享必须有服务端中继
+		if(!clientMod.requireServerMod("多人共享")) return false;
 
 		if(shareStates.containsKey(xid)) {
 			LOGGER.warn("X11 window 0x{} is already being shared", Long.toHexString(xid));
