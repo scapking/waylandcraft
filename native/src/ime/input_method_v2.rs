@@ -12,8 +12,11 @@
 //! 协议要点：
 //! - IME 侧的 serial = 该 input_method 对象**已收到的 done 事件数**
 //!   （done 事件本身无 serial 参数）。`commit(serial)` 与计数不符时，
-//!   合成器照常处理但不改变对象状态——即整批丢弃，本层据此拒绝转发。
-//!   计数器 per-instance：IME 重连即从 0 开始。
+//!   协议要求「照常处理，但不改变对象当前状态」——**文本照常转发**，
+//!   仅撤销本批的状态确认语义；「不符即整批丢弃」是对协议的错读，
+//!   sync7 实机 51/51 汉字全丢即源于此（详见 `relay::ime_commit` 注释）。
+//!   本层的 `Im2Instance::done_count` 是该计数的**唯一事实源**（per-instance
+//!   代际：对象顶替/销毁即归零）；relay 的镜像仅供诊断。
 //! - preedit/delete/commit_string 的到达顺序必须原样保持（应用顺序由
 //!   客户端按协议固定次序执行）。
 //! - grab 对象没有 enter 事件；取 grab 时必须先发 keymap 再发当前修饰键。
@@ -61,12 +64,20 @@ pub struct InputMethodV2State {
 }
 
 impl InputMethodV2State {
-    /// 向实例发一个 done 并推进 per-instance 计数。
+    /// 向实例发一个 done 并推进 per-instance 计数（commit serial 校验的
+    /// 唯一事实源；对象代际变化时随 instance 一起重建归零）。
     pub(crate) fn send_done(&mut self) {
         if let Some(inst) = &mut self.instance {
             inst.obj.done();
             inst.done_count += 1;
         }
+    }
+
+    /// 当前 zwp_input_method_v2 对象实际已发 done 数。
+    /// 无实例（未 bind / 已断开 / 换代窗口）返回 0——与协议「该对象已发
+    /// done 数」一致，relay 的 ime_commit 以此为准做 serial 校验。
+    pub(crate) fn done_count(&self) -> u32 {
+        self.instance.as_ref().map(|i| i.done_count).unwrap_or(0)
     }
 
     /// 把 AppState 的文本相关字段推送到 im2（不含 activate/deactivate/done）。
@@ -197,7 +208,8 @@ impl Dispatch<ZwpInputMethodV2, ()> for WLCState {
                     .relay
                     .ime_op(ImeOp::DeleteSurrounding(before_length, after_length));
             }
-            // 应用点：serial 校验失败 = 整批丢弃（协议强制），不产生任何 app 可见变化。
+            // 应用点：serial 对照本层 done_count（唯一事实源）校验；不匹配
+            // 时照常交付文本、仅不做状态确认（协议强制），绝不丢字。
             zwp_input_method_v2::Request::Commit { serial } => {
                 state.ime.ime_commit_from_wire(serial);
             }

@@ -132,6 +132,10 @@ pub struct ImeState {
     /// im2 客户端对象是否在位（bind 过 get_input_method 且未销毁）。
     im2_bound: bool,
 
+    /// 诊断计数：im2 `commit(serial)` 与 wire done 计数不符、但按协议照常
+    /// 交付文本的批次数（sync7 起 serial 不符不再丢字）。status/回归测试用。
+    serial_mismatch_commits: u32,
+
     /// 嵌套 IME daemon 生命周期 + 路由决策（imeNested auto|on|off）。
     pub(crate) nested: NestedIme,
 }
@@ -150,6 +154,11 @@ impl ImeState {
     /// 是否有激活的文本输入会话（relay 是唯一事实源，ti3 enable 驱动）。
     pub fn app_active(&self) -> bool {
         self.relay.app_active()
+    }
+
+    /// serial 不符但照常交付文本的批次数（诊断/status 用）。
+    pub fn serial_mismatch_count(&self) -> u32 {
+        self.serial_mismatch_commits
     }
 
     /// v0.13.4：当前是否有 ti3 / keyboard 焦点（status.rs 用）。
@@ -345,8 +354,12 @@ impl ImeState {
             }
         }
         // 始终复位内部状态——clear_focus = 强制 IME 不活跃。
+        // sync7 修复：这里曾直接丢弃返回值——ti3 层无聚焦但 relay 会话仍
+        // active 时，Deactivate 命令（含 wire done）被扔掉的形态正是当年
+        // 影子计数「记了数但 wire 没发」的漂移来源之一。必须照常执行。
         self.has_focus = false;
-        self.relay.focus_lost();
+        let cmds = self.relay.focus_lost();
+        self.execute_ime_commands(cmds);
     }
 
     /// 激活的 ti3 实例被销毁（text_input_v3.rs Dispatch 调用）：
@@ -371,6 +384,9 @@ impl ImeState {
             old.obj.unavailable();
         }
         self.im2.instance = Some(input_method_v2::Im2Instance { obj: im, done_count: 0 });
+        // 对象换代：wire 计数从 0 起步（sync7 漂移根因之二——旧实现里 relay
+        // 影子计数跨代际保留，新对象收到的 commit serial 从此永远对不上）。
+        self.relay.mirror_done_count(self.im2.done_count());
         let was = std::mem::replace(&mut self.im2_bound, true);
         crate::bridge::ime_log_write(
             "[waylandcraft][ime][im2] 输入法客户端 bind（嵌套 daemon 已连上）",
@@ -514,17 +530,47 @@ impl ImeState {
 
     // ── im2 commit(serial) 落地（input_method_v2.rs 的 Dispatch 调用）──
 
-    /// IME 端点经 im2 wire 发来 commit(serial)：serial 校验 → 原子落地。
+    /// IME 端点经 im2 wire 发来 commit(serial)：对照 wire 层当前
+    /// zwp_input_method_v2 对象的实际已发 done 数（单一事实源，
+    /// `InputMethodV2State::done_count`，新代际从 0 起步）校验后落地。
+    ///
+    /// sync7 修复（实机 51/51 汉字全丢根因）：
+    /// - 旧逻辑用 relay 的乐观影子计数做严格相等判定，计数一旦漂移
+    ///   （命令被丢弃未执行 / 对象换代 wire 归零 / 实例未 bind）后续
+    ///   所有 commit 整批 DROPPED——且「serial 不符即丢文本」本身违反
+    ///   协议（input-method-unstable-v2：mismatch 时 "proceed as normal,
+    ///   except it should not change the current state"）。
+    /// - 现在：有内容批次**一律下发**（preedit/delete/commit + ti3 done）；
+    ///   serial 不符仅跳过状态确认语义（对本层近似无操作），并出双计数
+    ///   WARN（ime_log + ⑥ error ring 相邻去重），绝不静默丢字。
     pub(crate) fn ime_commit_from_wire(&mut self, serial: u32) {
-        let fr = self.relay.ime_commit(serial);
-        if fr.applied {
-            self.state.transition(ImeStateMachine::Committing);
-            self.emit_ti_batch(fr.commands);
-        } else {
+        let done_sent = self.im2.done_count();
+        let fr = self.relay.ime_commit(serial, done_sent);
+        if !fr.flushed {
+            // 无内容裸 commit：fcitx5 updatePreeditDelegate 面板为空时
+            // 也照发 commit(serial)（waylandimserverv2.cpp），属正常心跳，
+            // 与 sync7 时代混在 DROPPED 文案里的真丢字是两回事。
             crate::bridge::ime_log_write(&format!(
-                "[waylandcraft][ime][relay] im2 commit(serial={serial}) DROPPED（serial 与 done 计数不符或无内容）"
+                "[waylandcraft][ime][relay] im2 commit(serial={serial}) 无内容（wire done={done_sent}），忽略"
             ));
+            return;
         }
+        if !fr.applied {
+            // serial 与 wire 计数不符：协议要求照常处理文本，
+            // 只是不改变该 im2 对象 current state（本层无额外状态依赖它）。
+            self.serial_mismatch_commits += 1;
+            crate::bridge::ime_log_write(&format!(
+                "[waylandcraft][ime][relay] WARN im2 commit(serial={serial}) ≠ wire done 计数({done_sent})：文本照常交付，本批不做状态确认"
+            ));
+            crate::status::note_error(
+                "warn",
+                &format!(
+                    "[ime][serial] im2 commit serial={serial} wire_done={done_sent} 不符：文本已照常交付，未确认对象当前状态"
+                ),
+            );
+        }
+        self.state.transition(ImeStateMachine::Committing);
+        self.emit_ti_batch(fr.commands);
     }
 
     /// 把一批 TiCommand 发给当前激活的 text_input 实例，并按协议补发
@@ -582,19 +628,28 @@ impl ImeState {
                     inst.obj.activate();
                 }
                 self.im2.push_state_events(&st);
-                self.im2.send_done();
+                self.send_im2_done();
             }
             ImeCommand::Deactivate => {
                 if let Some(inst) = &self.im2.instance {
                     inst.obj.deactivate();
                 }
-                self.im2.send_done();
+                self.send_im2_done();
             }
             ImeCommand::PushState(st) => {
                 self.im2.push_state_events(&st);
-                self.im2.send_done();
+                self.send_im2_done();
             }
         }
+    }
+
+    /// wire 层发 done（计数唯一事实源在 `InputMethodV2State.done_count`），
+    /// 随后把实况同步进 relay 的只读诊断镜像。无实例时 send_done 无操作，
+    /// 镜像同样保持 wire 实况——relay 侧不再有乐观自增，漂移无从产生。
+    fn send_im2_done(&mut self) {
+        self.im2.send_done();
+        let done = self.im2.done_count();
+        self.relay.mirror_done_count(done);
     }
 
     // ── 内部 IME 事件流（协议无关）──

@@ -17,8 +17,14 @@
 //!
 //! **zwp_input_method_v2**
 //! - `commit(serial)`：serial 必须 = 该 input_method 对象已发出的 done 事件数；
-//!   不匹配时「照常处理但不改变对象当前状态」——即整批丢弃 IME 的变更。
-//! - `done` 事件本身不带 serial 参数。
+//!   不匹配时「照常处理但不改变对象当前状态」（协议原文：proceed as normal,
+//!   except it should not change the current state）——**文本批次照常应用**，
+//!   仅不做状态确认。sync7 实机故障正是把它错读成整批丢弃，serial 计数一旦
+//!   漂移全部汉字上屏归零（修复说明见 [`Relay::ime_commit`]）。
+//! - `done` 事件本身不带 serial 参数；计数由 wire 层
+//!   （`input_method_v2.rs::InputMethodV2State`）按对象代际维护，是 commit
+//!   serial 校验的唯一事实源；本模块的 `ime_done_count` 只是它的只读镜像
+//!   （诊断用），不参与任何判定。
 //! - 应用顺序：替换 preedit → 删除 surrounding → 插入 commit → 重算 surrounding → 新 preedit。
 //!   因此 preedit/delete/commit_string 的**顺序不可乱**，必须原样转发。
 //!
@@ -113,14 +119,20 @@ pub enum ImeOp {
     CommitString(String),
 }
 
-/// [`Relay::ime_flush`] 的结果。
+/// [`Relay::ime_flush`] / [`Relay::ime_commit`] 的结果。
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct FlushResult {
     /// 应向 active 的 text-input 实例依序发出的事件。
+    /// `flushed=true` 时**必须原样下发**——serial 不符不丢文本（协议）。
     pub commands: Vec<TiCommand>,
-    /// true = 批次被接受并应用（wire 层需补发 `done(<commit 计数>)`）；
-    /// false = serial 校验失败或无内容，批次被丢弃（不得向 app 发 done）。
+    /// true = 批次有内容且 serial 与 wire 层 done 计数一致（状态确认批）。
+    /// false 有两种含义，用 [`FlushResult::flushed`] 区分：
+    /// - flushed=true + applied=false：文本照常下发，仅「对象当前状态」
+    ///   语义不做确认（协议原文的 mismatch 处理路径）。
+    /// - flushed=false：无内容/无激活会话，无事发生。
     pub applied: bool,
+    /// true = 本次把 pending 缓冲刷出并产出了 commands（与 serial 是否匹配无关）。
+    pub flushed: bool,
 }
 
 /// 中继状态机。
@@ -128,8 +140,9 @@ pub struct FlushResult {
 /// 一个合成器 seat 对应一个 Relay。它跟踪：
 /// - app 侧激活状态（ti3 enable 且聚焦）
 /// - IME 端点在线状态（im2 instance 存在 / 穿透就绪）
-/// - 已向 IME 端点发出的 done 计数（= 协议要求 IME 回填的 serial 基准）
-/// - IME 待应用操作缓冲（原子性：只有 flush 成功才落到 app）
+/// - wire 层已发 done 计数的**只读镜像**（诊断/status 用；协议判定的
+///   唯一事实源是 wire 层对象代际计数，见 `input_method_v2.rs`）
+/// - IME 待应用操作缓冲（原子性：flush 时整批产出，serial 不符不丢文本）
 #[derive(Debug, Default)]
 pub struct Relay {
     app_active: bool,
@@ -152,9 +165,19 @@ impl Relay {
         self.ime_present
     }
 
-    /// 已向 IME 端点发出的 done 计数（诊断/status 上报用，不参与协议判定）。
+    /// wire 层当前 im2 对象已发 done 计数的只读镜像（诊断/status 上报用，
+    /// 不参与协议判定）。生产运行时序上由 [`Relay::mirror_done_count`] 与
+    /// wire 层保持同步；纯 relay 单测里只有显式 sync 才变化。
     pub fn ime_done_count(&self) -> u32 {
         self.ime_done_count
+    }
+
+    /// wire 层把「当前 zwp_input_method_v2 对象实际已发 done 数」同步进
+    /// 只读镜像（每次 send_done 之后、对象代际创建/销毁时归零）。
+    /// 本方法**只更新诊断镜像**——serial 校验永远对照 `ime_commit` 显式
+    /// 传入的 wire 计数（单一事实源），与本字段无关。
+    pub fn mirror_done_count(&mut self, wire_done: u32) {
+        self.ime_done_count = wire_done;
     }
 
     /// 缓冲中尚未落地的 IME 操作数（诊断用：非零 = 有在途组合）。
@@ -171,14 +194,12 @@ impl Relay {
         self.ime_present = present;
         let mut cmds = Vec::new();
         if present {
-            // 新端点从零计数开始。
+            // 新对象代际：done 计数从 0 开始（wire 层随后逐次 sync 镜像）。
             self.ime_done_count = 0;
             if self.app_active && self.last_state.is_meaningful() {
                 cmds.push(ImeCommand::Activate(self.last_state.clone()));
-                self.ime_done_count += 1; // Activate 携带状态，wire 层会发一次 done
             } else if self.app_active {
                 cmds.push(ImeCommand::Activate(AppState::default()));
-                self.ime_done_count += 1;
             }
         } else {
             self.pending_ops.clear();
@@ -220,8 +241,8 @@ impl Relay {
         ));
         if enabled {
             if self.ime_present {
+                // done 由 wire 层实际发出后经 mirror_done_count 同步计数。
                 cmds.push(ImeCommand::Activate(self.last_state.clone()));
-                self.ime_done_count += 1;
             }
         } else {
             // v0.9.44 修法：只在真失焦时清缓冲（focus_lost 路径）。
@@ -232,7 +253,6 @@ impl Relay {
             }
             if self.ime_present {
                 cmds.push(ImeCommand::Deactivate);
-                self.ime_done_count += 1; // Deactivate 后 wire 层发 done
             }
         }
         // 抑制日志
@@ -253,9 +273,10 @@ impl Relay {
         let meaningful_change = state != self.last_state;
         self.last_state = state.clone();
         if self.app_active && self.ime_present && meaningful_change {
-            // PushState 落地时 wire 层会发一次 im2 done（状态更新必须由 done 应用），
-            // 计数随命令产生即推进，保证 IME 回填的 serial 与之匹配。
-            self.ime_done_count += 1;
+            // PushState 落地时 wire 层会发一次 im2 done（状态更新必须由 done 应用）；
+            // 计数由 wire 层发出后经 mirror_done_count 同步——不在命令产生时乐观
+            // 推进（sync7 漂移根因之一：命令被调用方丢弃/实例换代时，乐观计数
+            // 永远追不上 wire 实况）。
             vec![ImeCommand::PushState(state)]
         } else {
             Vec::new()
@@ -278,17 +299,24 @@ impl Relay {
 
     /// IME 端点请求应用缓冲（im2 `commit(serial)` 路径）。
     ///
-    /// serial 必须 = 已向该端点发出的 done 计数；不匹配则整批丢弃
-    /// （协议："proceed as normal, except it should not change the current
-    /// state"）。返回 [`FlushResult`]，`applied=true` 时 wire 层负责在
-    /// commands 之后补发 ti3 `done(<per-instance commit 计数>)`。
-    pub fn ime_commit(&mut self, serial: u32) -> FlushResult {
-        if serial != self.ime_done_count {
-            // 过期/超前 serial：丢弃本批缓冲，不产生任何 app 可见变化。
-            self.pending_ops.clear();
-            return FlushResult::default();
+    /// `done_sent` = wire 层当前 zwp_input_method_v2 对象实际已发 done 数
+    /// （单一事实源，由 `input_method_v2.rs` 维护；新代际对象为 0 起步）。
+    /// 协议（input-method-unstable-v2 `<request name="commit">`）：serial 与
+    /// 该计数不符时「照常处理，但不改变对象当前状态」——**文本批次必须照常
+    /// 产出**，`applied=false` 仅表示本批未获状态确认。sync7 实机故障正是
+    /// 把它错读成整批丢弃（shadow 乐观计数一漂移，之后所有汉字全灭）；
+    /// 该 DROPPED 分支已按协议废除。
+    ///
+    /// 返回 [`FlushResult`]：`flushed` 标记本批是否有内容落地；`applied=true`
+    /// 表示内容落地**且** serial 与 wire 计数匹配，wire 层两种情况都要把
+    /// commands 推给 app 并补发 ti3 `done(<per-instance commit 计数>)`。
+    pub fn ime_commit(&mut self, serial: u32, done_sent: u32) -> FlushResult {
+        let mut fr = self.finish_flush();
+        if fr.flushed && serial != done_sent {
+            // 文本照常交付（永不丢），仅撤销「状态确认」语义。
+            fr.applied = false;
         }
-        self.finish_flush()
+        fr
     }
 
     /// 无条件应用缓冲（宿主穿透路径：serial 防线由宿主合成器把守，
@@ -320,6 +348,7 @@ impl Relay {
         FlushResult {
             commands,
             applied: true,
+            flushed: true,
         }
     }
 }
@@ -361,36 +390,46 @@ mod tests {
         assert!(fr.commands.is_empty());
     }
 
-    /// serial 正确递增链：Activate(+1)、Deactivate(+1)、PushState 不加
-    /// （PushState 不发 done？—— 不对：im2 PushState 后必须发 done！见下个测试）。
+    /// serial 递增链：Activate、Deactivate、PushState 各对应一次 wire done。
+    /// 计数经 mirror_done_count 从 wire 层同步（不再在命令产生时乐观自增——
+    /// 这是 sync7 漂移根因；ime_done_count 是只读镜像，判定基准是显式参数）。
     #[test]
     fn serial_accounting_activate_deactivate() {
         let mut r = Relay::new();
         r.set_ime_present(true);
-        r.set_app_enabled(true, "test"); // Activate → done#1
+        let cmds = r.set_app_enabled(true, "test"); // Activate → done#1
+        assert_eq!(cmds.len(), 1);
+        r.mirror_done_count(1); // 模拟 wire 层实发后同步
         assert_eq!(r.ime_done_count, 1);
         r.set_app_enabled(false, "test"); // Deactivate → done#2
+        r.mirror_done_count(2);
         assert_eq!(r.ime_done_count, 2);
         r.set_app_enabled(true, "test"); // Activate → done#3
+        r.mirror_done_count(3);
         assert_eq!(r.ime_done_count, 3);
 
-        // IME 以旧 serial 提交 → 丢弃（缓冲被清空）
+        // IME 以旧 serial 提交：协议「照常处理但不改变对象当前状态」——
+        // 文本照常产出（永不丢），applied=false 仅表示本批未获状态确认。
         r.ime_op(ImeOp::CommitString("你好".into()));
-        let fr = r.ime_commit(1);
+        let fr = r.ime_commit(1, 3);
+        assert!(fr.flushed, "serial 不符也必须 flush 文本（sync7 回归）");
+        assert_eq!(fr.commands, vec![TiCommand::CommitString("你好".into())]);
         assert!(!fr.applied);
-        // IME 重发并以正确 serial 提交 → 应用
+        // IME 重发并以正确 serial 提交 → 状态确认批
         r.ime_op(ImeOp::CommitString("你好".into()));
-        let fr = r.ime_commit(3);
+        let fr = r.ime_commit(3, 3);
         assert!(fr.applied);
         assert_eq!(fr.commands, vec![TiCommand::CommitString("你好".into())]);
     }
 
-    /// PushState 属于带 done 的状态更新，必须推进计数。
+    /// PushState 属于带 done 的状态更新，wire 发出后计数推进。
     #[test]
     fn push_state_advances_serial() {
         let mut r = Relay::new();
         r.set_app_enabled(true, "test");
-        r.set_ime_present(true); // Activate → 1
+        let cmds = r.set_ime_present(true); // Activate → 1
+        assert_eq!(cmds.len(), 1);
+        r.mirror_done_count(1);
         assert_eq!(r.ime_done_count, 1);
 
         let st = AppState {
@@ -401,6 +440,7 @@ mod tests {
         };
         let cmds = r.push_app_state(st.clone());
         assert_eq!(cmds.len(), 1, "有意义的状态变化要推送");
+        r.mirror_done_count(2); // PushState 落地 wire done#2
         assert_eq!(r.ime_done_count, 2);
 
         // 无变化的推送不应产生命令/推进计数
@@ -419,13 +459,15 @@ mod tests {
         // 协议语义：IME 的 commit(serial) 回填「已收到的 done 计数」；组合期间
         // 合成器不推送新状态 → 不发新 done → 每步回填同一 serial（Activate 后=1）。
         // 这正是真实 fcitx5 的行为。
+        // wire 基准：Activate 已实发 done#1（mirror 同步 + done_sent 显式传入）。
+        r.mirror_done_count(1);
         for s in ["n", "ni", "nih", "niha", "nihao"] {
             r.ime_op(ImeOp::Preedit(
                 s.to_string(),
                 s.len() as i32,
                 s.len() as i32,
             ));
-            let fr = r.ime_commit(1);
+            let fr = r.ime_commit(1, 1);
             assert!(fr.applied, "step {s} should apply");
             // FlushResult 只含操作命令；done 由 wire 层按协议补发。
             assert_eq!(fr.commands.len(), 1, "step {s}");
@@ -442,7 +484,7 @@ mod tests {
         // 选定候选「你好」：preedit 清空 + commit string 同批（仍回填 serial=1）
         r.ime_op(ImeOp::Preedit(String::new(), 0, 0));
         r.ime_op(ImeOp::CommitString("你好".into()));
-        let fr = r.ime_commit(1);
+        let fr = r.ime_commit(1, 1);
         assert!(fr.applied);
         assert_eq!(
             fr.commands,
@@ -462,7 +504,7 @@ mod tests {
 
         r.ime_op(ImeOp::DeleteSurrounding(3, 0));
         r.ime_op(ImeOp::CommitString("你".into()));
-        let fr = r.ime_commit(1);
+        let fr = r.ime_commit(1, 1);
         assert!(fr.applied);
         assert_eq!(
             fr.commands,
@@ -493,14 +535,82 @@ mod tests {
     fn ime_restart_resets_serial() {
         let mut r = Relay::new();
         r.set_app_enabled(true, "test");
-        r.set_ime_present(true); // done#1
+        let cmds = r.set_ime_present(true); // Activate → done#1
+        assert_eq!(cmds.len(), 1);
+        r.mirror_done_count(1);
         assert_eq!(r.ime_done_count, 1);
 
         r.set_ime_present(false);
-        r.set_ime_present(true); // 重新 Activate → done#1（新对象）
+        let cmds = r.set_ime_present(true); // 重新 Activate（新对象代际）
+        assert_eq!(cmds.len(), 1);
+        r.mirror_done_count(1); // 新代际 wire 层从头再数
         assert_eq!(r.ime_done_count, 1);
 
         r.ime_op(ImeOp::CommitString("好".into()));
-        assert!(r.ime_commit(1).applied);
+        assert!(r.ime_commit(1, 1).applied);
+    }
+
+    /// sync7 生产事故回归（单测形态）：im2 已产生 Activate 命令但 wire 层
+    /// done 实发数为 0（未 bind 完成/对象换代窗口——旧代码里 relay 的乐观
+    /// 影子计数已 +1，之后每个 commit 都 DROPPED）。修复后 serial 校验只
+    /// 对照显式传入的 wire 计数，且**永不丢文本**：fcitx5 以小 serial 提交
+    /// 「你哈登」，文本批次必须原样产出（旧逻辑此处 commands 为空）。
+    #[test]
+    fn ime_commit_wire_zero_low_serial_still_delivers() {
+        let mut r = Relay::new();
+        r.set_app_enabled(true, "test");
+        let cmds = r.set_ime_present(true); // Activate 产出，但 wire 未发 done
+        assert_eq!(cmds.len(), 1);
+        r.mirror_done_count(0); // wire 实况：新对象 0 done
+
+        r.ime_op(ImeOp::Preedit(String::new(), 0, 0));
+        r.ime_op(ImeOp::CommitString("你哈登".into()));
+        let fr = r.ime_commit(8, 0); // fcitx5 回填 serial=8（实机日志首例）
+        assert!(fr.flushed, "serial 不符也必须 flush 文本（协议 proceed as normal）");
+        assert_eq!(
+            fr.commands,
+            vec![
+                TiCommand::Preedit(String::new(), 0, 0),
+                TiCommand::CommitString("你哈登".into()),
+            ],
+            "组合批次必须完整交到 wire 层推给 app，旧行为是整批丢弃"
+        );
+        assert!(!fr.applied, "serial 不符 → 不做对象当前状态确认");
+    }
+
+    /// sync7 回归（判定与镜像解耦）：协议判定只看显式 done_sent 参数——
+    /// 即使只读镜像被同步成偏离值（模拟历史漂移形态），匹配 wire 实况的
+    /// commit 仍被确认应用。
+    #[test]
+    fn ime_commit_validates_explicit_wire_count_not_mirror() {
+        let mut r = Relay::new();
+        r.set_ime_present(true);
+        r.set_app_enabled(true, "test"); // Activate（假设 wire 已实发 done#1）
+        r.mirror_done_count(42); // 故意污染诊断镜像（旧影子计数漂移形态）
+        r.ime_op(ImeOp::CommitString("测".into()));
+        let fr = r.ime_commit(1, 1); // serial 与 wire 实况一致，与镜像无关
+        assert!(fr.flushed);
+        assert!(fr.applied, "serial 判定基准必须是显式 wire 计数");
+        assert_eq!(fr.commands, vec![TiCommand::CommitString("测".into())]);
+    }
+
+    /// sync7 回归（日志语义分离）：面板清空时 fcitx5 会发裸 commit(serial)
+    /// （waylandimserverv2.cpp::updatePreeditDelegate——preedit 为空时不发
+    /// set_preedit_string 也照发 commit）。这类无内容批次 flushed=false，
+    /// 与「serial 不符的文本批」在 wire 层可区分，不再共用 DROPPED 文案。
+    #[test]
+    fn ime_commit_empty_batch_distinguishable_from_mismatch() {
+        let mut r = Relay::new();
+        r.set_ime_present(true);
+        r.set_app_enabled(true, "test");
+        r.mirror_done_count(1);
+        // 无内容：不是丢文本。
+        let empty = r.ime_commit(1, 1);
+        assert!(!empty.flushed && !empty.applied && empty.commands.is_empty());
+        // 有内容但 serial 超前：文本仍交付（flushed=true, applied=false）。
+        r.ime_op(ImeOp::CommitString("哈".into()));
+        let late = r.ime_commit(7, 1);
+        assert!(late.flushed && !late.applied);
+        assert_eq!(late.commands, vec![TiCommand::CommitString("哈".into())]);
     }
 }
