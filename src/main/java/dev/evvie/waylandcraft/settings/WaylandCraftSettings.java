@@ -19,7 +19,9 @@ public class WaylandCraftSettings {
 	 */
 	
 	int pixelsPerBlock = 500;
-	boolean windowAntialiasing = false;
+	/* 上游实测 RGSS 抗锯齿收益大且基本无副作用，默认开启 [upstream 7bf3242]。
+	 * fork 保留 /wl settings 开关（Iris 光影回退路径下本就不生效），不删除设置项本身。 */
+	boolean windowAntialiasing = true;
 	boolean focusOnHover = false;
 	
 	/* ---- 控制距离 / 游戏优化 / 布局 ---- */

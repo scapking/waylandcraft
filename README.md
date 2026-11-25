@@ -286,7 +286,7 @@ Share windows from the X11 desktop (via `xwayland-satellite`) directly, without 
 | Key | Default | Description |
 |-----|---------|-------------|
 | `pixelsPerBlock` | `500` | Pixel density of a window per block |
-| `windowAntialiasing` | `false` | RGSS antialiasing (no shaders only) |
+| `windowAntialiasing` | `true` | RGSS antialiasing (no shaders only) |
 | `focusOnHover` | `false` | Auto-focus window on hover |
 | `hideCursor` | `false` | Hide the virtual mouse cursor while controlling a window |
 | `layoutEnabled` | `true` | Auto-layout enabled by default (v0.2.37 behavior; auto-inits at player position) |
