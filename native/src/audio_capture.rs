@@ -10,9 +10,13 @@
 // 或直连失败时 → 沿用旧方案：连系统默认 Audio/Sink 的 monitor（整机捕获），
 // 并在 audio.log / 状态 JSON / status.rs 标注 mode=monitor-fallback 及原因。
 //
-// 断流自愈：per-app 直连的节点会随应用重开流（暂停/恢复/重连设备）消失，
-// 表现为 process 回调持续 ~2s 无字节。watchdog 线程重新枚举 + 重连同一 pid
-// 的最新节点；连续失败降级 monitor-fallback；重试有节流 + 指数退避。
+// 断流自愈：per-app 直连的节点会随应用重开流/退出而消失。watchdog 定期重枚举
+// + 校验目标节点存在性与 id（应用重开流 id 会变 → 重连最新节点），并辅以
+// "process 回调 ~2s 无字节" 的断流信号；连续失败降级 monitor-fallback；
+// 全部重试有节流 + 指数退避。
+// 注意（本机 PipeWire 1.4 实测）：目标节点消失后 daemon 会把孤儿 capture
+// stream 重新路由到默认 sink monitor 并继续全速投递（静音）数据——只看字节流
+// 会误判"捕获正常"，所以存在性重验是主判据，0 字节只是辅助信号。
 //
 // 已知局限：单进程多窗口应用（如 Firefox 多标签）的声音按进程合并 ——
 // PipeWire 层面无法细分到窗口，这是粒度极限。
@@ -57,6 +61,14 @@ impl CaptureMode {
 const STALL_MS: u64 = 2000;
 /// 相邻两次断流检查（含重新枚举 PipeWire 拓扑）的最小间隔（节流）
 const CHECK_THROTTLE_MS: u64 = 1500;
+/// per-app 模式下"目标节点存在性"定期重验周期（数据正常时也用，见 watchdog 注释）
+const REVALIDATE_MS: u64 = 2000;
+/// 断流但目标节点仍在（应用只是静音）时的退避上限，避免长时间静音下高频枚举
+const MAX_BACKOFF_MS: u64 = 15_000;
+/// monitor-fallback 下尝试升级回 per-app 的周期（应用可能稍后才出声）
+const PROMOTION_MS: u64 = 5_000;
+/// per-app 连续失败达到该次数 → 降级 monitor-fallback
+const MAX_RECONNECT_FAILURES: u32 = 3;
 
 /// 捕获状态：累积 PCM 缓冲 + 全链路诊断字段
 pub struct AudioCaptureState {
@@ -168,6 +180,12 @@ struct PwTopology {
     pub nodes: HashMap<u32, (String, u32, String, String)>,
 }
 
+/// 该节点的 props 值得我们 bind 成 Node proxy 去取全量 info（含 app pid）。
+/// 只 bind 音频相关 node，省得给 Video/Midi/Port 建 proxy。
+fn node_worth_binding(media_class: &str) -> bool {
+    media_class.contains("Audio") || media_class.contains("Stream")
+}
+
 /// 通过 registry 枚举一次 PipeWire 拓扑（起线程跑 mainloop，主线程等 collect_ms 后 quit）
 fn enumerate_topology(collect_ms: u64) -> Result<PwTopology, String> {
     pw::init();
@@ -178,50 +196,96 @@ fn enumerate_topology(collect_ms: u64) -> Result<PwTopology, String> {
 
     let topology = Arc::new(Mutex::new(PwTopology::default()));
 
-    let topo_ref = topology.clone();
     // ⑤ 关键修复：Registry 的 Drop 会 pw_proxy_destroy——旧写法把
     // get_registry() 的临时 Registry 在链式表达式结束时立即销毁，
     // 监听器挂在一个已销毁的 proxy 上，global 事件永远 0 个
     // （= 音频"找不到默认 sink"的真根因，与 PipeWire 是否运行无关）。
     // 必须用具名变量持有到 mainloop 结束。
-    let registry = core
-        .get_registry()
-        .map_err(|e| format!("registry: {}", e))?;
+    //
+    // ⑦ per-app 关键修复：PipeWire ≥1.0 的 registry global 事件对 node
+    // 只导出**过滤后的属性集**（实测 1.4.2：object.serial / factory.id /
+    // client.id / client.api / application.name / node.name / media.class），
+    // **不含 application.process.id**——只读 global props 时 pid 恒 0，
+    // per-app 匹配永远失败。真正的 pid 在绑定后的 Node proxy info props 里
+    // （pw-dump 就是绑定后读 info）。不能用 client.id→sec.pid 代替：
+    // PulseAudio 应用（paplay/浏览器等）的 node 由 pipewire-pulse 进程
+    // 创建，其 client pid 是 daemon 的。做法：global 回调里把音频相关
+    // node bind 成 Node proxy（pw-mon 同款 Rc<Registry>+upgrade 模式），
+    // info 回调把 application.process.id 合并进拓扑。
+    // proxy+listener 必须保活到 mainloop 结束（同 ⑤ 教训）。
+    let registry = std::rc::Rc::new(
+        core.get_registry().map_err(|e| format!("registry: {}", e))?,
+    );
+    let registry_weak = std::rc::Rc::downgrade(&registry);
+    type BoundProxies = std::rc::Rc<
+        std::cell::RefCell<Vec<(Box<dyn pw::proxy::ProxyT>, Box<dyn pw::proxy::Listener>)>>,
+    >;
+    let bound: BoundProxies = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+
+    let topo_ref = topology.clone();
+    let bound_ref = bound.clone();
     let _listener = registry
         .add_listener_local()
         .global(move |global| {
-            let mut t = topo_ref.lock().unwrap();
-            match global.type_ {
+            let (media_class, name, proc_name, pid_from_global) = match global.type_ {
                 pw::types::ObjectType::Node => {
-                    if let Some(media_class) = global.props.and_then(|p| p.get("media.class")) {
-                        // 注意：PipeWire 的属性 key 是 "application.process.id" /
-                        // "application.process.binary"（见 pipewire 源码 keys.h / context.c：
-                        // PW_KEY_APP_PROCESS_ID = "application.process.id"）。
-                        // 曾误用 "app.process.id"/"app.process.name" → PID 恒为 0，
-                        // 匹配永远失败 → 这就是 v0.7 起音频一直无声的最深根因。
-                        let app_pid = global
-                            .props
-                            .and_then(|p| p.get("application.process.id"))
-                            .and_then(|s| s.parse::<u32>().ok())
-                            .unwrap_or(0);
-                        let name = global
-                            .props
-                            .and_then(|p| p.get("node.name"))
-                            .unwrap_or("")
-                            .to_string();
-                        let proc_name = global
-                            .props
-                            .and_then(|p| p.get("application.process.binary"))
-                            .or_else(|| global.props.and_then(|p| p.get("application.name")))
-                            .unwrap_or("")
-                            .to_string();
-                        t.nodes.insert(
-                            global.id,
-                            (media_class.to_string(), app_pid, name, proc_name),
-                        );
+                    match global.props.and_then(|p| p.get("media.class")) {
+                        Some(mc) => {
+                            let app_pid = global
+                                .props
+                                .and_then(|p| p.get("application.process.id"))
+                                .and_then(|s| s.parse::<u32>().ok())
+                                .unwrap_or(0);
+                            let name = global
+                                .props
+                                .and_then(|p| p.get("node.name"))
+                                .unwrap_or("")
+                                .to_string();
+                            let proc_name = global
+                                .props
+                                .and_then(|p| p.get("application.process.binary"))
+                                .or_else(|| global.props.and_then(|p| p.get("application.name")))
+                                .unwrap_or("")
+                                .to_string();
+                            (mc.to_string(), name, proc_name, app_pid)
+                        }
+                        None => return,
                     }
                 }
-                _ => {}
+                _ => return,
+            };
+            let node_id = global.id;
+            {
+                let mut t = topo_ref.lock().unwrap();
+                t.nodes.insert(
+                    node_id,
+                    (media_class.clone(), pid_from_global, name, proc_name),
+                );
+            }
+            // global props 没给 pid → bind Node proxy 从 info 事件补
+            // （某些客户端/版本可能在 global props 就带 pid，那就不用 bind）
+            if pid_from_global == 0 && node_worth_binding(&media_class) {
+                let Some(reg) = registry_weak.upgrade() else { return };
+                if let Ok(node) = reg.bind::<pw::node::Node, _>(global) {
+                    let topo_pid = topo_ref.clone();
+                    let nl = node
+                        .add_listener_local()
+                        .info(move |info| {
+                            if let Some(props) = info.props() {
+                                if let Some(v) = props.get("application.process.id") {
+                                    if let Ok(pid) = v.parse::<u32>() {
+                                        if let Some(entry) =
+                                            topo_pid.lock().unwrap().nodes.get_mut(&node_id)
+                                        {
+                                            entry.1 = pid;
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                        .register();
+                    bound_ref.borrow_mut().push((Box::new(node), Box::new(nl)));
+                }
             }
         })
         .register();
@@ -499,9 +563,11 @@ fn connect_capture(
         )
         .map_err(|e| format!("connect: {}", e))?;
 
-    // 等 stream 的 node global 出现在 registry 上，拿 node_id 用于诊断
+    // 等 daemon 处理 connect。node_id 要等 mainloop 分发到 info 事件后才
+    // 有效（connect 刚返回时恒为 ID_NONE——旧实现状态里 stream_node 一直
+    // 是 -1 的原因），mainloop 线程启动后再补读一次。
     std::thread::sleep(Duration::from_millis(400));
-    let stream_node = stream.node_id();
+    let mut stream_node = stream.node_id();
     audio_log!(
         "[audio] connect_capture: our capture node={}（AUTOCONNECT → target {}）",
         stream_node,
@@ -544,6 +610,18 @@ fn connect_capture(
             mainloop_run(ml_ptr);
         })
         .map_err(|e| format!("spawn: {}", e))?;
+
+    // mainloop 已运行 → 补读自己的 node id（诊断字段）
+    if stream_node == u32::MAX {
+        std::thread::sleep(Duration::from_millis(300));
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(st) = s._stream.as_ref() {
+            let id = st.node_id();
+            if id != u32::MAX {
+                s.stream_node = id;
+            }
+        }
+    }
 
     Ok(())
 }
@@ -592,7 +670,7 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
 
     // 列出该 pid 的全部节点 + 全部播放流节点，便于对照 pw-dump 排查
     if pid > 0 {
-        for (id, (mc, npid, name, _)) in topo.nodes.iter().filter(|(_, (_, p, _, _))| *p == pid) {
+        for (id, (mc, _npid, name, _)) in topo.nodes.iter().filter(|(_, (_, p, _, _))| *p == pid) {
             audio_log!("[audio] pid节点: id={} class={} name={}", id, mc, name);
         }
     }
@@ -644,6 +722,9 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
         let mut guard = AUDIO_CAPTURE.lock().map_err(|e| format!("lock: {}", e))?;
         *guard = Some(state.clone());
     }
+
+    // watchdog：断流自愈（重枚举+重连同一 pid / 降级 / 节流）
+    spawn_watchdog(state);
 
     audio_log!(
         "[audio] stage 4/4: OK — 捕获会话已启动（mode={}），等待 process 回调产出 PCM",
@@ -778,6 +859,271 @@ pub fn audio_capture_brief() -> CaptureBrief {
     }
 }
 
+/// 启动断流自愈 watchdog（独立线程，靠 active=false 退出）。
+fn spawn_watchdog(state: Arc<Mutex<AudioCaptureState>>) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("wc-audio-watchdog".to_string())
+        .spawn(move || watchdog_loop(state))
+    {
+        audio_log!("[audio] watchdog 启动失败（无断流自愈）: {}", e);
+    }
+}
+
+/// watchdog 每轮需要的会话快照（持锁取一次，重连决策在无锁区做）。
+struct WatchdogSnapshot {
+    mode: CaptureMode,
+    pid: u32,
+    target_node: u32,
+    stalled: bool,
+    promote_due: bool,
+}
+
+fn watchdog_loop(state: Arc<Mutex<AudioCaptureState>>) {
+    audio_log!(
+        "[audio] watchdog started (stall={}ms, throttle={}ms, promotion={}ms)",
+        STALL_MS,
+        CHECK_THROTTLE_MS,
+        PROMOTION_MS
+    );
+    loop {
+        std::thread::sleep(Duration::from_millis(500));
+
+        // ── 持锁读快照 + 节流判定 ──────────────────────────────
+        let snap = {
+            let mut s = match state.lock() {
+                Ok(s) => s,
+                Err(e) => e.into_inner(),
+            };
+            if !s.active {
+                audio_log!("[audio] watchdog: session inactive, exiting");
+                return;
+            }
+            let now = Instant::now();
+            let stalled = now.duration_since(s.last_data_at) >= Duration::from_millis(STALL_MS);
+            let promote_due = s.mode == CaptureMode::MonitorFallback
+                && !s.promotion_disabled
+                && s.pid > 0
+                && now.duration_since(s.last_promotion_at) >= Duration::from_millis(PROMOTION_MS);
+
+            // 轮次触发条件：
+            // - per-app：定期重验"目标节点是否还在 / id 是否变了"。**不能只靠
+            //   "0 字节"判断流**——实测 PipeWire 1.4：应用节点消失后 daemon 会
+            //   把孤儿 capture stream 重新路由（连到默认 sink monitor），process
+            //   回调继续全速投递静音数据，字节流完全正常但内容已经不是该应用。
+            //   因此无论有无数据都按周期枚举核对；持续无数据（应用真静音）时
+            //   指数退避降低枚举频率。
+            // - monitor-fallback：仅"断流（sink 变了）"或"到点尝试升级"才跑。
+            let due = match s.mode {
+                CaptureMode::PerApp => now >= s.next_check_at,
+                CaptureMode::MonitorFallback => {
+                    now >= s.next_check_at && (stalled || promote_due)
+                }
+            };
+            if !due {
+                continue;
+            }
+
+            if stalled {
+                // 退避：无数据持续时逐步拉长检查间隔，避免高频枚举
+                s.check_backoff = (s.check_backoff * 2).min(Duration::from_millis(MAX_BACKOFF_MS));
+                s.next_check_at = now + s.check_backoff;
+            } else {
+                s.check_backoff = Duration::from_millis(CHECK_THROTTLE_MS);
+                s.next_check_at = now
+                    + Duration::from_millis(if s.mode == CaptureMode::PerApp {
+                        REVALIDATE_MS
+                    } else {
+                        CHECK_THROTTLE_MS
+                    });
+            }
+            if promote_due {
+                s.last_promotion_at = now;
+            }
+
+            audio_log!(
+                "[audio] watchdog: round mode={} stalled={} promote_due={} events={} bytes={}",
+                s.mode.as_str(), stalled, promote_due, s.capture_events, s.total_bytes
+            );
+            WatchdogSnapshot {
+                mode: s.mode,
+                pid: s.pid,
+                target_node: s.target_node,
+                stalled,
+                promote_due,
+            }
+        };
+
+        // ── 无锁区：重新枚举 + 决策 ────────────────────────────
+        let topo = match enumerate_topology(500) {
+            Ok(t) => t,
+            Err(e) => {
+                audio_log!("[audio] watchdog: 重枚举失败: {}", e);
+                let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                s.last_error = Some(format!("watchdog enum: {}", e));
+                continue;
+            }
+        };
+
+        match snap.mode {
+            CaptureMode::PerApp => watchdog_perapp(&state, &topo, snap),
+            CaptureMode::MonitorFallback => watchdog_monitor(&state, &topo, snap),
+        }
+    }
+}
+
+/// per-app 重验（每轮都做，见 watchdog_loop 注释）：
+/// 应用重开流（节点 id 变了）→ 重连最新节点；节点消失 → 计入失败，
+/// 连续达阈值降级 monitor；节点还在且 id 一致 → 链路有效（无数据只是静音）。
+fn watchdog_perapp(state: &Arc<Mutex<AudioCaptureState>>, topo: &PwTopology, snap: WatchdogSnapshot) {
+    match find_app_stream_node(topo, snap.pid) {
+        Some((node_id, node_name, _)) if node_id != snap.target_node => {
+            audio_log!(
+                "[audio] watchdog: per-app 节点更新 {} → {}（应用重开流），重连",
+                snap.target_node, node_id
+            );
+            match connect_capture(state, CaptureMode::PerApp, node_id, &node_name, None) {
+                Ok(()) => {
+                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.reconnect_failures = 0;
+                    s.total_reconnects += 1;
+                    audio_log!("[audio] watchdog: per-app 重连成功 node={}", node_id);
+                }
+                Err(e) => note_reconnect_failure(state, format!("per-app reconnect: {}", e)),
+            }
+        }
+        Some((_, _, _)) => {
+            // 节点还在、id 没变 → 直连链路指向的就是它。持续无数据只可能是
+            // 应用静音（不是断链：daemon 若已把我们挪走，节点消失轮会先命中）。
+            // 不清零失败计数没有意义——目标有效即清零；静音只播报一次。
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.reconnect_failures = 0;
+            if snap.stalled && !s.silence_logged {
+                s.silence_logged = true;
+                audio_log!(
+                    "[audio] watchdog: per-app 节点 {} 存活但无数据（应用静音？）— 保持链路",
+                    snap.target_node
+                );
+            }
+        }
+        None => {
+            // 应用节点消失（进程退了/流关了）→ 计入失败，达阈值降级
+            audio_log!("[audio] watchdog: pid {} 播放流节点已消失", snap.pid);
+            note_reconnect_failure(state, "app stream node gone".to_string());
+        }
+    }
+}
+
+/// monitor-fallback：定时探测该 pid 是否已出现应用流（应用开始出声）→ 升级
+/// 回 per-app；否则 monitor 也断流时重连 sink（sink 一般不消失，少见）。
+fn watchdog_monitor(state: &Arc<Mutex<AudioCaptureState>>, topo: &PwTopology, snap: WatchdogSnapshot) {
+    // 升级探测：应用现在有播放流节点了 → 切回 per-app
+    if snap.promote_due {
+        if let Some((node_id, node_name, _)) = find_app_stream_node(topo, snap.pid) {
+            audio_log!(
+                "[audio] watchdog: 应用出现播放流 node={}，从 monitor 升级到 per-app",
+                node_id
+            );
+            match connect_capture(state, CaptureMode::PerApp, node_id, &node_name, None) {
+                Ok(()) => {
+                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.total_reconnects += 1;
+                    s.reconnect_failures = 0;
+                    s.fallback_reason = None;
+                }
+                Err(e) => {
+                    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                    s.last_error = Some(format!("promotion: {}", e));
+                }
+            }
+            return;
+        }
+    }
+
+    // monitor 也持续无数据 → 重枚举后重连 sink（sink 消失/换默认设备的情况）
+    if snap.stalled {
+        match find_default_sink(topo) {
+            Ok((sink_node, sink_name)) if sink_node != snap.target_node => {
+                audio_log!(
+                    "[audio] watchdog: monitor sink 变化 {} → {}，重连",
+                    snap.target_node, sink_node
+                );
+                if let Err(e) = connect_capture(
+                    state,
+                    CaptureMode::MonitorFallback,
+                    sink_node,
+                    &sink_name,
+                    snap_reason(state),
+                ) {
+                    note_reconnect_failure(state, format!("monitor reconnect: {}", e));
+                }
+            }
+            Ok(_) => {
+                let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+                if !s.silence_logged {
+                    s.silence_logged = true;
+                    audio_log!("[audio] watchdog: monitor sink 存活但无数据（整机静音）");
+                }
+            }
+            Err(e) => note_reconnect_failure(state, format!("monitor enum sink: {}", e)),
+        }
+    }
+}
+
+/// per-app 重连失败计数；达 MAX_RECONNECT_FAILURES 降级 monitor-fallback。
+fn note_reconnect_failure(state: &Arc<Mutex<AudioCaptureState>>, err: String) {
+    let (failures, should_fallback, topo_pid) = {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.last_error = Some(err.clone());
+        s.reconnect_failures += 1;
+        (
+            s.reconnect_failures,
+            s.reconnect_failures >= MAX_RECONNECT_FAILURES,
+            s.pid,
+        )
+    };
+    audio_log!(
+        "[audio] watchdog: 失败 {}/{} — {}",
+        failures,
+        MAX_RECONNECT_FAILURES,
+        err
+    );
+    if !should_fallback {
+        return;
+    }
+    // 降级：连当前 sink（用新枚举，避免用过期的失败目标）
+    let topo = match enumerate_topology(400) {
+        Ok(t) => t,
+        Err(e) => {
+            audio_log!("[audio] watchdog: 降级前枚举失败: {}", e);
+            return;
+        }
+    };
+    let reason = format!("per-app 连续失败 {} 次（最后: {}），降级整机", failures, err);
+    match connect_monitor_fallback(state, &topo, reason) {
+        Ok(()) => {
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            // 降级后短期不再自动升级回来（应用可能反复重开导致抖动），
+            // 但保留 promotion 探测——设 promotion_disabled=false 让 watchdog
+            // 继续按 PROMOTION_MS 尝试切回 per-app（一旦真稳定出声就升级）。
+            s.promotion_disabled = false;
+            s.reconnect_failures = 0;
+            audio_log!("[audio] watchdog: 已降级 monitor-fallback (pid={})", topo_pid);
+        }
+        Err(e) => {
+            let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+            s.last_error = Some(format!("fallback failed: {}", e));
+            // 连 sink 都没有 → 放弃后续升级，避免死循环枚举
+            s.promotion_disabled = true;
+            audio_log!("[audio] watchdog: 降级也失败: {} — 暂停自动升级", e);
+        }
+    }
+}
+
+/// 读取当前 fallback_reason（monitor 重连时保留原降级原因）。
+fn snap_reason(state: &Arc<Mutex<AudioCaptureState>>) -> Option<String> {
+    state.lock().unwrap_or_else(|e| e.into_inner()).fallback_reason.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,6 +1196,225 @@ mod tests {
 #[cfg(test)]
 mod repro_tests {
     use super::*;
+
+    /// 生成 10s 440Hz 正弦 wav（48k stereo S16LE）到临时目录。
+    fn write_test_wav(path: &std::path::Path) -> std::io::Result<()> {
+        const RATE: u32 = 48000;
+        const CH: u16 = 2;
+        const SECS: u32 = 10;
+        let n_frames = RATE * SECS;
+        let data_len = n_frames as usize * CH as usize * 2;
+        let mut pcm = Vec::with_capacity(data_len);
+        for i in 0..n_frames as usize {
+            let v = (12000.0 * (2.0 * std::f64::consts::PI * 440.0 * i as f64 / RATE as f64).sin()) as i16;
+            pcm.extend_from_slice(&v.to_le_bytes());
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        let file_len = 36 + data_len as u32;
+        let mut out: Vec<u8> = Vec::with_capacity(44 + data_len);
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&file_len.to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        out.extend_from_slice(&16u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&CH.to_le_bytes());
+        out.extend_from_slice(&RATE.to_le_bytes());
+        out.extend_from_slice(&(RATE * CH as u32 * 2).to_le_bytes()); // byte rate
+        out.extend_from_slice(&(CH * 2).to_le_bytes()); // block align
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data_len as u32).to_le_bytes());
+        out.extend_from_slice(&pcm);
+        std::fs::write(path, out)
+    }
+
+    /// 端到端 live 验证（本机 PipeWire）：
+    /// paplay 起一条真实播放流 → start_audio_capture(该 pid) →
+    /// 断言 mode=per-app 且 process 回调产出 PCM 字节；再验证未知 pid
+    /// 走 monitor-fallback。paplay 不存在时跳过（不误报）。
+    ///
+    /// 注意：验证的是"捕获管道拿到该应用流的字节"，不代表任何人听到了声音。
+    #[test]
+    #[ignore = "需要运行中的 PipeWire 守护 + paplay"]
+    fn per_app_capture_live_e2e() {
+        if std::process::Command::new("paplay").arg("--version").output().is_err() {
+            eprintln!("SKIP: paplay 不存在，无法制造真实播放流");
+            return;
+        }
+        let wav = std::env::temp_dir().join("waylandcraft-audio-test-tone.wav");
+        write_test_wav(&wav).expect("write wav");
+
+        // -r 循环播放，避免测试窗口内流自然结束
+        let mut child = std::process::Command::new("paplay")
+            .arg("-r")
+            .arg(&wav)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn paplay");
+        let pid = child.id();
+        eprintln!("paplay pid={pid}");
+
+        // 等 PipeWire 出现该 pid 的 Stream/Input 节点（最多 5s）
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut found = None;
+        while std::time::Instant::now() < deadline {
+            let topo = enumerate_topology(300).expect("enum");
+            if let Some(n) = find_app_stream_node(&topo, pid) {
+                found = Some(n);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        let (node_id, node_name, class) = found.expect("paplay 的 Stream/Input 节点未出现");
+        eprintln!("app node: id={node_id} class={class} name={node_name}");
+
+        // per-app 捕获
+        start_audio_capture(pid).expect("start per-app capture");
+        let status0 = get_audio_capture_status();
+        eprintln!("status@start: {status0}");
+        assert!(status0.contains(r#""mode":"per-app""#), "应为 per-app: {status0}");
+        let want_target = format!("\"target_node\":{},", node_id);
+        assert!(status0.contains(&want_target), "target 应为应用节点: {status0}");
+
+        // 等 process 回调产数据（最多 4s）
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        let mut got = 0usize;
+        while std::time::Instant::now() < deadline {
+            if let Some(p) = poll_audio_capture() {
+                got += p.len().saturating_sub(8);
+                if got > 4096 {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        let status1 = get_audio_capture_status();
+        eprintln!("status@data: {status1}");
+        stop_audio_capture();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&wav);
+
+        assert!(got > 0, "per-app 捕获 process 回调无数据（status: {status1}）");
+        assert!(status1.contains(r#""mode":"per-app""#), "捕获中 mode 应稳定为 per-app: {status1}");
+
+        // 未知 pid → monitor-fallback（本环境有 sink）
+        let bogus = u32::MAX;
+        start_audio_capture(bogus).expect("start fallback capture");
+        let status2 = get_audio_capture_status();
+        eprintln!("status@fallback: {status2}");
+        stop_audio_capture();
+        assert!(
+            status2.contains(r#""mode":"monitor-fallback""#) && status2.contains("fallback_reason"),
+            "未知 pid 应降级 monitor-fallback 并带 reason: {status2}"
+        );
+    }
+
+    /// watchdog 生命周期 live 验证（本机 PipeWire，全程 ~40s）：
+    /// 1. per-app 捕获有数据；
+    /// 2. 杀掉应用 → 节点消失 → 连续失败后自动降级 monitor-fallback（带 reason）；
+    /// 3. 会话启动时应用还没有节点（sh sleep→exec paplay，pid 不变）→
+    ///    启动即 monitor-fallback，节点出现后 watchdog 自动升级回 per-app。
+    #[test]
+    #[ignore = "需要运行中的 PipeWire 守护 + paplay；全程约 40s"]
+    fn watchdog_fallback_promotion_live() {
+        if std::process::Command::new("paplay").arg("--version").output().is_err() {
+            eprintln!("SKIP: paplay 不存在");
+            return;
+        }
+        let wav = std::env::temp_dir().join("waylandcraft-audio-test-tone.wav");
+        write_test_wav(&wav).expect("write wav");
+
+        // ── 1. per-app 有数据 ─────────────────────────────────
+        let mut child = std::process::Command::new("paplay")
+            .arg("-r")
+            .arg(&wav)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn paplay");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            if find_app_stream_node(&enumerate_topology(300).unwrap(), pid).is_some() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "paplay 节点未出现");
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        start_audio_capture(pid).expect("start");
+        let st = get_audio_capture_status();
+        assert!(st.contains(r#""mode":"per-app""#), "初始应 per-app: {st}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(4);
+        loop {
+            if poll_audio_capture().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "per-app 无数据: {}",
+                get_audio_capture_status()
+            );
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        eprintln!("[test] stage1 per-app streaming OK");
+
+        // ── 2. 应用消失 → 自动降级 monitor-fallback ───────────
+        let _ = child.kill();
+        let _ = child.wait();
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut degraded = String::new();
+        while std::time::Instant::now() < deadline {
+            let st = get_audio_capture_status();
+            eprintln!("[test] stage2 poll: {st}");
+            if st.contains(r#""mode":"monitor-fallback""#) {
+                degraded = st;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1000));
+        }
+        assert!(
+            !degraded.is_empty() && degraded.contains("fallback_reason"),
+            "应用消失后应降级 monitor-fallback（带 reason）: {degraded}"
+        );
+        eprintln!("[test] stage2 degraded OK: {degraded}");
+
+        // ── 3. 节点后到 → watchdog 自动升级回 per-app ─────────
+        stop_audio_capture();
+        // sh 先 sleep 再起 paplay（exec 不换 pid）：捕获会话启动时该 pid
+        // 必然还没有播放流节点 → 先 monitor-fallback，节点出现后升级。
+        let mut child2 = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("sleep 2; exec paplay -r \"$1\"")
+            .arg("wc-delayed")
+            .arg(&wav)
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn delayed paplay");
+        let pid2 = child2.id();
+        assert!(
+            find_app_stream_node(&enumerate_topology(300).unwrap(), pid2).is_none(),
+            "前置条件失败：sleep 期间不该已有 pid2 节点"
+        );
+        start_audio_capture(pid2).expect("start2");
+        let st2 = get_audio_capture_status();
+        eprintln!("[test] stage3 start status: {st2}");
+        let deadline = std::time::Instant::now() + Duration::from_secs(25);
+        let mut promoted = String::new();
+        while std::time::Instant::now() < deadline {
+            let st = get_audio_capture_status();
+            if st.contains(r#""mode":"per-app""#) && st.contains(&format!("\"pid\":{},", pid2)) {
+                promoted = st;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        stop_audio_capture();
+        let _ = child2.kill();
+        let _ = child2.wait();
+        let _ = std::fs::remove_file(&wav);
+        assert!(!promoted.is_empty(), "节点出现后应自动升级回 per-app: {promoted}");
+        eprintln!("[test] stage3 promoted OK: {promoted}");
+    }
 
     /// 环境复现：在与 Minecraft 相同的桌面会话环境跑真实拓扑枚举，
     /// 打印全部节点（重点：所有 Stream/Input 播放流节点，验证 per-app
