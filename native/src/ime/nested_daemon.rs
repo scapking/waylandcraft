@@ -43,12 +43,16 @@
 //!   本模块不碰）。失败/降级经 `status::note_error` 进 ⑥ error ring，
 //!   全部决策行经 ime_log_write 带 ⑥ 时间戳写 ime.log。
 //!
-//! ## 已知边界（实测项，见模块底部 TODO）
+//! ## 已知边界（实测结论，2026-11-25）
 //!
-//! - 隔离 HOME 下 fcitx5 默认 profile 只有 keyboard-us；中文引擎（pinyin）
-//!   需用户在隔离 profile 里启用（`fcitx5-configtool` 指向该 HOME，或把
-//!   现有 profile 拷入）。逻辑与 wire 层已用模拟 client 全测，端到端行为
-//!   由真机 fcitx5 实测确认。
+//! - 隔离 HOME 的 profile/config 由 [`seed_fcitx5_home`] 在 spawn 前
+//!   自动种默认（keyboard-us+pinyin 组、ActiveByDefault=True）；用户
+//!   已有文件一律不覆盖。拼音→候选→commit 已在 ime/tests_real.rs 用
+//!   真 fcitx5 + 本合成器端到端跑通（#[ignore]）。
+//! - `--disable=dbus` 实测不影响 pinyin（libpinyin 直链，不走
+//!   AddonPinyinHelper dbus 服务）；副作用是嵌套实例不注册
+//!   org.fcitx.Fcitx5，configtool 无法对话管理——需要时用
+//!   tests_real::real_fcitx5_private_dbus 的私有总线形态。
 //! - ibus-daemon 无 im2 客户端实现（实测其 waylandim 是 fcitx5 独有），
 //!   预计表现为"进程在但 im2 永不 bind → Starting 超时 → Failed 回退"，
 //!   如实上报，不做假成功。
@@ -107,11 +111,114 @@ impl DaemonKind {
 // ── 常量（daemon 参数与节流；改这里前读模块头注释的隔离纪律）──
 
 /// fcitx5：前台 + 禁 dbus addon。
-/// TODO(实测): `--disable=dbus` 是否牺牲 waylandim 需要的 dbus 侧能力
-/// （如 dbus-based module loading）由真机实测定；若引擎加载失败，等价
-/// 方案是保留 dbus addon 但删 DBUS_SESSION_BUS_ADDRESS 环境（连不上总线，
-/// addon 自己降级）——两条路都不触碰宿主实例。
+/// 实测结论（2026-11-25，ime/tests_real.rs 三组对照，fcitx5 5.1.12）：
+/// - pinyin / pinyinhelper addon 在 `--disable=dbus` 下正常加载并出
+///   preedit/commit（libpinyin 直链，不需要 org.fcitx.Fcitx.AddonPinyinHelper
+///   dbus 服务；`seed` 实验组全绿）。sync6 实机"每键未消费"的根因不在
+///   dbus，而在隔离 HOME 缺少 `[Behavior] ActiveByDefault=True` 种子
+///   （见 [`seed_fcitx5_home`]），与 `--disable=dbus` 无关。
+/// - 保留 `--disable=dbus` 的理由：连私有总线也不如彻底不连隔离强
+///   （宿主 `org.fcitx.Fcitx5` 名字冲突面归零，且少管一个 dbus-daemon
+///   进程）。`real_fcitx5_private_dbus` 对照实验证明保留 dbus addon +
+///   私有 session 总线行为一致——若将来需要 fcitx5-configtool 对话式
+///   管理嵌套实例，切到该形态即可（构造方式见测试）。
 pub const FCITX5_ARGS: &[&str] = &["-D", "--disable=dbus"];
+
+/// fcitx5 全局配置种子（修复根因的核心）。
+///
+/// 取证链（fcitx5 5.1.12 源码 + ime/tests_real.rs 复现实验）：
+/// - `Instance::inputMethod(ic)`：InputContext **未激活**时用组内
+///   第一个 IM——典型 profile `[keyboard-us, pinyin]` 即直通引擎
+///   keyboard-us，于是每个键都"未消费"、字母全 VK 直通、汉字永不出。
+/// - `InputState::active_ = GlobalConfig::activeByDefault()`，而
+///   `[Behavior] ActiveByDefault` 在 globalconfig.cpp 中**没有默认值
+///   参数**（bool 默认 false），正常桌面靠用户 Ctrl+Space 激活掩盖了
+///   这一点；隔离 HOME 全新实例没有这份文件 → 全部未激活。
+/// - GlobalConfig 加载自 `$XDG_CONFIG_HOME/fcitx5/config`
+///   （instance.cpp `reloadConfig`：`StandardPath::Type::PkgConfig`
+///   + "config"，INI 格式）。
+///
+/// 因此 spawn 前必须保证（缺则写、有则**绝不改动**——尊重用户自定义）：
+/// 1. `config/fcitx5/profile`：默认组 [keyboard-us, pinyin]，
+///    DefaultIM=pinyin（没装 fcitx5-pinyin 时该条目被 fcitx5 自动忽略，
+///    优雅降级为纯英文）；
+/// 2. `config/fcitx5/config`：`[Behavior] ActiveByDefault=True`，
+///    让每个新 InputContext 以激活态启动 → `inputMethod(ic)` =
+///    `group.defaultInputMethod()` = pinyin。
+///
+/// 返回诊断行（调用方写 ime.log）；写失败不阻断 spawn（用户自带的
+/// 配置可能放在别处），但会如实报告。
+pub fn seed_fcitx5_home(home: &Path) -> Vec<String> {
+    let mut notes = Vec::new();
+    let dir = home.join("config").join("fcitx5");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        notes.push(format!("种子目录 {} 创建失败: {e}", dir.display()));
+        return notes;
+    }
+    // 1) profile（输入法组）：仅缺失时写默认。
+    let profile = dir.join("profile");
+    if profile.exists() {
+        notes.push(format!("profile 已存在（{profile:?}），不覆盖"));
+    } else if let Err(e) = std::fs::write(&profile, FCITX5_SEED_PROFILE) {
+        notes.push(format!("profile 种子写入失败: {e}"));
+    } else {
+        notes.push(format!("已种默认 profile（keyboard-us+pinyin, DefaultIM=pinyin）: {}", profile.display()));
+    }
+    // 2) config（全局行为）：仅缺失时写；已存在但缺关键项时提示用户。
+    let config = dir.join("config");
+    if config.exists() {
+        let seeded_ok = std::fs::read_to_string(&config)
+            .map(|s| s.to_ascii_lowercase().replace(' ', "").contains("activebydefault=true"))
+            .unwrap_or(false);
+        notes.push(if seeded_ok {
+            format!("config 已存在且 ActiveByDefault=True（{config:?}），不动")
+        } else {
+            // 用户显式配置优先，不覆盖；如实警告这正是拼音不消费的原因。
+            format!(
+                "警告: {} 已存在但无 ActiveByDefault=True——嵌套实例会以 keyboard-us \
+                 直通启动（拼音永不消费）；需要拼音请在 [Behavior] 加 ActiveByDefault=True",
+                config.display()
+            )
+        });
+    } else if let Err(e) = std::fs::write(&config, FCITX5_SEED_CONFIG) {
+        notes.push(format!("config 种子写入失败: {e}"));
+    } else {
+        notes.push(format!(
+            "已种 [Behavior] ActiveByDefault=True（根因修复，此前拼音 IC 未激活）: {}",
+            config.display()
+        ));
+    }
+    notes
+}
+
+/// 默认 profile 种子（与实机 ime-nested/config/fcitx5/profile 同构；
+/// 组名用 ASCII 避免无中文 locale 环境的编码面）。
+pub const FCITX5_SEED_PROFILE: &str = r#"[Groups/0]
+# Group Name
+Name=default
+# Layout
+Default Layout=us
+# Default Input Method
+DefaultIM=pinyin
+
+[Groups/0/Items/0]
+# Name
+Name=keyboard-us
+# Layout
+Layout=
+
+[Groups/0/Items/1]
+# Name
+Name=pinyin
+# Layout
+Layout=
+
+[GroupOrder]
+0=default
+"#;
+
+/// 全局行为种子文件内容（[Behavior] ActiveByDefault=True）。
+pub const FCITX5_SEED_CONFIG: &str = "[Behavior]\nActiveByDefault=True\n";
 /// 探活超时：spawn 后等多久没等到 im2 bind 算一次失败。
 pub const BIND_TIMEOUT: Duration = Duration::from_secs(10);
 /// 失败重试退避（与 ⑧ host_bridge 5s 节流同形）。
@@ -242,6 +349,11 @@ impl NestedIme {
         if self.socket.as_deref() != Some(socket) {
             self.socket = Some(socket.to_os_string());
         }
+    }
+
+    /// 隔离 HOME（spawn 前种子写入用）。
+    pub fn home_path(&self) -> Option<&Path> {
+        self.home.as_deref()
     }
 
     /// 每帧裁决（由 `ImeState::nested_tick` 调用）。`im2_bound` 来自
@@ -567,11 +679,26 @@ pub fn spawn_daemon(plan: &SpawnPlan) -> Result<(), String> {
     for k in &plan.env_unset {
         cmd.env_remove(k);
     }
-    let out = std::fs::OpenOptions::new()
+    let mut out = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&plan.log_file)
         .map_err(|e| format!("打开 {} 失败: {e}", plan.log_file.display()))?;
+    // 会话横幅：daemon 日志按 spawn 分段（追加模式跨重启累积，无分隔
+    // 时 addon 报错很难归因到哪一次启动）。
+    {
+        use std::io::Write;
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(
+            out,
+            "===== waylandcraft nested spawn epoch={epoch} program={} args={:?} =====",
+            plan.program, plan.args
+        );
+        let _ = out.flush();
+    }
     let err = out
         .try_clone()
         .map_err(|e| format!("clone log fd 失败: {e}"))?;
@@ -617,12 +744,14 @@ pub fn kill_pid(pid: u32) -> bool {
     unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 }
 }
 
-// TODO(端到端实测清单——逻辑与 wire 层已由 tests.rs 模拟 client 全测):
-// 1. 隔离 HOME 首次 profile 只含 keyboard-us；需用户把宿主 fcitx5 profile
-//    （含 pinyin）拷入 <home>/config/fcitx5/ 或在隔离 HOME 下跑 configtool。
-// 2. fcitx5 在 --disable=dbus 下 pinyin 引擎加载/候选行为（备选方案见
-//    FCITX5_ARGS 注释）。
-// 3. 嵌套应用（firefox）ti3 + 嵌套 fcitx5 im2 + VK 直通全链路真机验证。
+// TODO(端到端实测清单——2026-11-25 更新):
+// 1. [已修] 隔离 HOME profile/config：spawn 前 seed_fcitx5_home 自动种
+//    默认（不覆盖已有）。真机"每键未消费"根因是 ActiveByDefault 缺省
+//    false（IC 未激活 → keyboard-us 直通），见该函数文档的取证链。
+// 2. [已验证] --disable=dbus 下 pinyin 正常出 preedit/commit
+//    （tests_real::real_fcitx5_seed_config_active_by_default，真 fcitx5
+//    + 本合成器 wire 全链路）；私有总线对照行为一致（real_fcitx5_private_dbus）。
+// 3. 待用户实测：游戏内（Minecraft 聊天框）ti3 + 嵌套 fcitx5 + VK 直通。
 // 4. ibus-daemon 路预计不 bind im2 → Failed 回退；若发行版 ibus 带 im2
 //    前端再调整。
 
@@ -812,6 +941,47 @@ mod tests {
         // 手动 start 解除锁。
         n.request_start(now + Duration::from_secs(2));
         assert!(n.decide(now + Duration::from_secs(2), false, |_, _| false).is_some());
+    }
+
+    #[test]
+    fn seed_writes_defaults_only_when_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "wlc-nested-seed-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 全新目录 → 两个种子文件都写出来。
+        let notes = seed_fcitx5_home(&dir);
+        assert!(notes.iter().any(|n| n.contains("已种默认 profile")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("ActiveByDefault=True（根因修复")), "{notes:?}");
+        let profile = dir.join("config/fcitx5/profile");
+        let config = dir.join("config/fcitx5/config");
+        assert!(std::fs::read_to_string(&profile).unwrap().contains("DefaultIM=pinyin"));
+        assert!(std::fs::read_to_string(&config).unwrap().contains("ActiveByDefault=True"));
+
+        // 已有用户文件 → 绝不覆盖；缺关键项如实警告。
+        std::fs::write(&profile, "[User] custom").unwrap();
+        std::fs::write(&config, "[Behavior]\nActiveByDefault=False\n").unwrap();
+        let notes = seed_fcitx5_home(&dir);
+        assert_eq!(std::fs::read_to_string(&profile).unwrap(), "[User] custom");
+        assert!(std::fs::read_to_string(&config).unwrap().contains("False"));
+        assert!(
+            notes.iter().any(|n| n.contains("警告") && n.contains("ActiveByDefault")),
+            "用户显式关闭激活要如实警告: {notes:?}"
+        );
+
+        // 用户自己种对了 → 静默通过（无警告）。
+        std::fs::write(&config, "[Behavior]\nActiveByDefault = true\n").unwrap();
+        let notes = seed_fcitx5_home(&dir);
+        assert!(!notes.iter().any(|n| n.contains("警告")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("不动")));
+
+        // 再次运行幂等：文件原样。
+        let notes = seed_fcitx5_home(&dir);
+        assert!(notes.iter().any(|n| n.contains("profile 已存在")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

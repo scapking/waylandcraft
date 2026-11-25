@@ -172,6 +172,19 @@ impl ImeState {
         let im2_bound = self.im2_bound;
         if let Some(req) = self.nested.decide(now, im2_bound, nested_daemon::proc_comm_matches) {
             let kind = req.kind;
+            // fcitx5 spawn 前种默认配置（profile/config 缺失才写，已有
+            // 文件绝不覆盖）。根因：无 [Behavior] ActiveByDefault=True 时
+            // 隔离实例每个输入上下文都以 keyboard-us 直通启动——拼音
+            // 引擎根本没挂上（取证链见 nested_daemon::seed_fcitx5_home）。
+            if kind == nested_daemon::DaemonKind::Fcitx5 {
+                if let Some(home) = self.nested.home_path() {
+                    for note in nested_daemon::seed_fcitx5_home(home) {
+                        crate::bridge::ime_log_write(&format!(
+                            "[waylandcraft][ime][nested] 种子: {note}"
+                        ));
+                    }
+                }
+            }
             let result = nested_daemon::spawn_daemon(&req.plan);
             self.nested.note_spawn_result(kind, result, now);
         }
