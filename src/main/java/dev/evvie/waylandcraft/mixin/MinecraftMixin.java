@@ -25,6 +25,9 @@ public class MinecraftMixin {
 	@Inject(method = "runTick", at = @At("HEAD"))
 	public void cursorRectTick(boolean doTick, CallbackInfo info) {
 		dev.evvie.waylandcraft.ime.CursorRectReporter.tick();
+		// Phase 2：游戏内候选窗 overlay 帧轮询（与光标上报同 tick 点位；
+		// 客户端 tick 即渲染线程，纹理原地上传）。
+		dev.evvie.waylandcraft.ime.ImeCandidateOverlay.tick();
 	}
 	
 	@Inject(method = "renderFrame", at = @At(value = "INVOKE_STRING", target = "Lnet/minecraft/util/profiling/ProfilerFiller;push(Ljava/lang/String;)V", args = "ldc=present"))

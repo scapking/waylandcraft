@@ -1002,12 +1002,12 @@ public class WaylandCraftBridge {
 		return takeLookupTableNative(instance);
 	}
 
-	/** 候选窗用户操作 → 宿主输入法。
-	 * action: 0=选字(arg=当前页内下标) 1=上一页 2=下一页。
-	 * fcitx5 走 SelectCandidate/PrevPage/NextPage 专用方法；ibus portal
-	 * 无候选方法（忽略，候选操作走按键通路）。 */
-	public void candidateNav(int action, int arg) {
-		candidateNavNative(instance, action, arg);
+	/** 轮询嵌套 fcitx5 候选窗帧（zwp_input_popup_surface_v2 像素，Phase 1/2）。
+	 * 编码（小端）：[w i32][h i32][seq u32][visible u8][argb w*h*4]；
+	 * **null = 无新状态**（零拷贝，native 侧 epoch 判定）。解码入口见
+	 * {@code ImeCandidateOverlay.decode}。 */
+	public byte[] imePopupFrame() {
+		return imePopupFrameNative(instance);
 	}
 
 	/** 上报焦点文本框光标的屏幕坐标（桌面候选窗锚点，防漂移）。
@@ -1324,6 +1324,9 @@ public class WaylandCraftBridge {
 	
 	// Take candidate-window snapshot (JSON; empty string = no update)
 	private static native String takeLookupTableNative(long instance);
+
+	// Poll nested fcitx5 popup surface pixels (Phase 1/2; null = no state change)
+	private static native byte[] imePopupFrameNative(long instance);
 	
 	// Report focused text-field cursor screen rect (desktop candidate-window anchor)
 	private static native void updateCursorRectNative(long instance, int x, int y, int w, int h);
