@@ -257,8 +257,22 @@ impl ImeState {
         // 即 ti3 enable/disable）承载，Activate/Deactivate 已 popup_touch
         // 推进 epoch；「用户是否在输入框打字」由 Java 侧 hasBox（EditBox
         // focused）门把守，native 不该重复且错误地用窗口信号再 gate 一次。
-        let visible = self.popup.has_content(now) && self.popup_ime_active();
+        let im2active = self.popup_ime_active();
+        let visible = self.popup.has_content(now) && im2active;
         let snap = self.popup.snapshot(visible);
+        // 内容在场时的完整门快照（sync12 复盘盲区：status 只在空闲瞬间采样，
+        // 抓不到"有帧时哪道门挡了"）。200ms 节流，一条日志直接指认。
+        if snap.visible || (snap.width > 0 && snap.argb.is_some()) {
+            self.popup.log_content_gate(
+                self.popup.has_frame(),
+                !self.popup.has_frame(),
+                im2active,
+                snap.visible,
+                snap.seq,
+                snap.width,
+                snap.height,
+            );
+        }
         self.popup.mark_delivered(snap.visible);
         // 观测网（sync8 静默故障复盘）：交付侧记账——"native 采到了帧"
         // 与"Java 拿到了可见帧"必须可用数字切分，不再靠日志行序人肉对齐。

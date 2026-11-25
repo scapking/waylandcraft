@@ -73,6 +73,7 @@ public final class ImeCandidateOverlay {
 	private static long pollExceptions;   // imePopupFrame 抛异常次数（曾完全静默）
 	private static long uploadFails;      // 纹理上传失败次数
 	private static long reshowCount;      // 焦点恢复补显次数
+	private static long incomingVisible;  // 解码后收到 f.visible()=true 的次数（入站可见帧，sync12 复盘盲区）
 	private static long extractHits;      // ScreenRenderMixin 回调命中次数（注入证明）
 	private static long lastWarnMs;       // WARN 节流 5s
 	private static long lastTupleMs;      // 五元组 INFO 节流 1s
@@ -121,6 +122,13 @@ public final class ImeCandidateOverlay {
 			// 收到字节流但解码拒绝 = 跨语言编码合同断了（两侧测试理应已红；
 			// 真到这里说明 jar/so 版本错配）——必须留痕。
 			warnThrottled("native 字节流解码失败 len=" + raw.length, null);
+		}
+		// 观测网（sync12 复盘盲区）：旧五元组的 visible 读的是 current（显示后
+		// 结果），无法证明"是否收到过可见帧"。incomingVisible 直接数解码后
+		// f.visible()==true 的次数——>0 而 showing 恒 false = 断在 hasBox/显示
+		// 判定；==0 而 native gate 快照显示 visible=true = 断在编码/JNI 传输。
+		if(f != null && f.visible()) {
+			incomingVisible++;
 		}
 		applyTransition(f, box != null, mc);
 		logStateTransition(raw != null, box != null);
@@ -397,8 +405,8 @@ public final class ImeCandidateOverlay {
 		lastTupleMs = now;
 		lastLoggedTuple = tuple;
 		WaylandCraftCommon.LOGGER.info(
-				"[ime][overlay] 状态五元组 {} | polls={} frames={} exceptions={} uploadFails={} reshow={} extracts={} workState={}",
-				tuple, polls, framesDelivered, pollExceptions, uploadFails, reshowCount, extractHits, workState);
+				"[ime][overlay] 状态五元组 {} | polls={} frames={} incomingVisible={} exceptions={} uploadFails={} reshow={} extracts={} workState={}",
+				tuple, polls, framesDelivered, incomingVisible, pollExceptions, uploadFails, reshowCount, extractHits, workState);
 	}
 
 	private static int clampInt(int v, int lo, int hi) {

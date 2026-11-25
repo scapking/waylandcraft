@@ -141,6 +141,11 @@ pub struct InputPopupState {
     /// 不得伪造续显（sync9 的竞态吞帧只发生在"采到→回收 < 轮询间隔"
     /// 的从未交付形态；既有隐藏用例 popup_null_attach 依赖本区分）。
     frame_pending_deliver: bool,
+    /// 内容在场时刻的完整门快照日志节流点（sync12 实测复盘：status 的
+    /// gate 行只在查询瞬间采样，采不到"有内容时哪道门挡了"——本字段配合
+    /// take_popup_snapshot 在 has_content 为真的每次交付打一条 200ms 节流
+    /// 的 gate 行，一条日志直接指认失败的门）。
+    last_gate_log: Option<std::time::Instant>,
 }
 
 impl InputPopupState {
@@ -377,6 +382,25 @@ impl InputPopupState {
         if visible {
             self.last_visible_delivery = Some(self.now());
         }
+    }
+
+    /// 观测网（sync12 复盘新增）：内容在场时交付的完整门快照，200ms 节流。
+    /// 一条日志直接回答"有候选帧时到底哪道门没过"——status 的瞬间采样
+    /// 永远落在无内容的空闲态，正是这个盲区让 sync10-12 三轮都在猜。
+    pub(crate) fn log_content_gate(&mut self, live: bool, held: bool, im2active: bool,
+            visible: bool, seq: u32, w: i32, h: i32) {
+        let now = self.now();
+        if self.last_gate_log.is_some_and(|t| now.duration_since(t).as_millis() < 200) {
+            return;
+        }
+        self.last_gate_log = Some(now);
+        crate::bridge::ime_log_write(&format!(
+            "[waylandcraft][ime][popup][gate] 内容在场交付: src={} im2active={} → visible={} seq={w_seq} {w}x{h}",
+            if live { "live" } else { "held" },
+            im2active,
+            visible,
+            w_seq = seq,
+        ));
     }
 
     /// 观测网：hold 剩余 ms（status brief 消费；无 hold 在场为 None）。
