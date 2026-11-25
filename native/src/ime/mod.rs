@@ -253,7 +253,7 @@ impl ImeState {
             && self.has_focus
             && kb_active;
         let snap = self.popup.snapshot(visible);
-        self.popup.mark_delivered();
+        self.popup.mark_delivered(snap.visible);
         // 观测网（sync8 静默故障复盘）：交付侧记账——"native 采到了帧"
         // 与"Java 拿到了可见帧"必须可用数字切分，不再靠日志行序人肉对齐。
         self.popup.record_delivery(snap.visible);

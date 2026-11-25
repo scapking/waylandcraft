@@ -354,9 +354,19 @@ impl InputPopupState {
         }
     }
 
-    pub(crate) fn mark_delivered(&mut self) {
+    /// 配对 [`Self::snapshot`] 推进 delivered（changed 闸复位）。
+    ///
+    /// **只有真正 visible 的交付才清 `frame_pending_deliver`**（sync10 生产
+    /// 故障根因）：帧到达的那次轮询若恰好有个可见性门为 false（kb_active/
+    /// focus 在 fcitx5 同回合换面时抖动），快照以 visible=false 交付——此时
+    /// 帧从未被 Java 真正看见，必须保持 pending，使随后的 attach(NULL)/角色
+    /// 解除仍走 display hold 接管，而非被误判成"已交付的真实隐藏"立即清掉。
+    /// invisible 交付照常推进 epoch（避免空转重复交付同一不可见态）。
+    pub(crate) fn mark_delivered(&mut self, visible: bool) {
         self.delivered = self.epoch;
-        self.frame_pending_deliver = false;
+        if visible {
+            self.frame_pending_deliver = false;
+        }
     }
 
     /// 观测网：take_popup_snapshot 每返回一个 Some(snap) 调用一次，记账
@@ -738,13 +748,13 @@ mod tests {
         let snap = st.snapshot(true);
         assert_eq!((snap.width, snap.height), (10, 20));
         assert_eq!(snap.argb.as_ref().unwrap().len(), 800);
-        st.mark_delivered();
+        st.mark_delivered(true);
         assert!(!st.changed());
         // touch（可见性原料变化）→ 再次可轮询
         st.touch();
         assert!(st.changed());
         // attach(NULL) → 帧清、epoch 推进、seq 不变（无新内容）
-        st.mark_delivered();
+        st.mark_delivered(true);
         st.note_frame_removed();
         assert!(st.changed());
         assert_eq!(st.seq, 1);
@@ -752,7 +762,7 @@ mod tests {
         assert!(snap2.argb.is_none());
         assert!(!snap2.visible);
         assert_eq!(snap2.width, 0);
-        st.mark_delivered();
+        st.mark_delivered(false);
         assert!(!st.changed());
     }
 
@@ -856,12 +866,39 @@ mod tests {
         st.set_clock(t0);
         st.note_frame(2, 2, vec![3u8; 16]);
         st.snapshot(true);
-        st.mark_delivered(); // 本帧已随快照交付
+        st.mark_delivered(true); // 本帧已随可见快照交付
         st.note_frame_removed();
         assert!(!st.held_active(t0), "已交付帧不进入 hold");
         let snap = st.snapshot(true);
         assert!(!snap.visible);
         assert_eq!(snap.width, 0);
+    }
+
+    /// sync10 生产故障根因回归：帧到达的那次轮询恰好可见性门为 false →
+    /// 以 visible=false 交付。**这次 invisible 交付不得清 pending**，否则随后
+    /// attach(NULL) 被误判成"已交付的真实隐藏"立即清帧，hold 永不触发——
+    /// 正是用户三轮"采到帧但候选窗从不显示"、hold 日志零条的根因。
+    #[test]
+    fn invisible_delivery_keeps_frame_rescuable_by_hold() {
+        let mut st = InputPopupState::default();
+        let t0 = std::time::Instant::now();
+        st.set_clock(t0);
+        st.note_frame(2, 2, vec![7u8; 16]);
+        // 门 false 的那次轮询：invisible 交付
+        let snap = st.snapshot(false);
+        assert!(!snap.visible);
+        st.mark_delivered(false);
+        assert!(
+            st.frame_pending_deliver,
+            "invisible 交付不得把帧标记为已交付（否则 hold 失效）"
+        );
+        // attach(NULL) → 必须 hold 接管，而非真实隐藏
+        st.note_frame_removed();
+        assert!(st.held_active(t0), "未真正可见交付的帧必须进入 hold");
+        // 下一次轮询门全真 → 交付 held 帧 visible=true 带完整像素
+        let snap2 = st.snapshot(true);
+        assert!(snap2.visible, "hold 必须让帧至少经历一次可见交付");
+        assert_eq!(snap2.argb.unwrap().len(), 16);
     }
 
     #[test]
