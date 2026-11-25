@@ -1010,6 +1010,29 @@ public class WaylandCraftBridge {
 		return imePopupFrameNative(instance);
 	}
 
+	/** 候选窗区域点击回传（Phase 3）。x/y = popup surface 局部像素；
+	 * button = evdev 码（BTN_LEFT=0x110）；native 侧向 popup surface 发
+	 * wl_pointer enter/motion/button（进帧序列），候选命中/上屏由 fcitx5
+	 * 自己的 InputPanel 完成（waylandpointer.cpp / inputwindow.cpp 取证）。 */
+	public void imePopupClick(int x, int y, int button, boolean pressed) {
+		imePopupClickNative(instance, x, y, button, pressed);
+	}
+
+	/** 候选窗区域滚轮回传（Phase 3）。x/y = popup 局部像素（axis 也需
+	 * 聚焦坐标）；dy = GLFW 语义（正=向上）。一个 notch → wl_pointer.axis
+	 * vertical 值 ±10.0（fcitx5 阈值 2560 fixed，waylandinputwindow.cpp ::axis）。 */
+	public void imePopupAxis(int x, int y, double dy) {
+		imePopupAxisNative(instance, x, y, dy);
+	}
+
+	/** 候选窗用户操作 → 宿主输入法。
+	 * action: 0=选字(arg=当前页内下标) 1=上一页 2=下一页。
+	 * fcitx5 走 SelectCandidate/PrevPage/NextPage 专用方法；ibus portal
+	 * 无候选方法（忽略，候选操作走按键通路）。 */
+	public void candidateNav(int action, int arg) {
+		candidateNavNative(instance, action, arg);
+	}
+
 	/** 上报焦点文本框光标的屏幕坐标（桌面候选窗锚点，防漂移）。
 	 * 候选窗由桌面输入法框架显示（fcitx5 kimpanel / ibus panel / GNOME 集成），
 	 * 本方法只负责把锚点报准：x/y = 光标左上角，w/h = 光标尺寸。
@@ -1327,6 +1350,12 @@ public class WaylandCraftBridge {
 
 	// Poll nested fcitx5 popup surface pixels (Phase 1/2; null = no state change)
 	private static native byte[] imePopupFrameNative(long instance);
+	// Forward a click on the in-game candidate overlay back to the popup surface (Phase 3).
+	// x/y are popup-surface-local pixels. button = evdev code, pressed = true/false.
+	private static native void imePopupClickNative(long instance, int x, int y, int button, boolean pressed);
+	// Forward vertical wheel over the overlay to the popup surface (Phase 3).
+	// x/y are popup-surface-local pixels, dy = notches (GLFW sign).
+	private static native void imePopupAxisNative(long instance, int x, int y, double dy);
 	
 	// Report focused text-field cursor screen rect (desktop candidate-window anchor)
 	private static native void updateCursorRectNative(long instance, int x, int y, int w, int h);

@@ -436,6 +436,17 @@ bind_java_type! {
             name = "imePopupFrameNative",
             fn = ime_popup_frame,
         },
+        // Phase 3 候选窗点选/滚轮回传（进帧序列见 seat popup pointer 通道）。
+        static extern fn ime_popup_click {
+            sig = (instance: jlong, x: jint, y: jint, button: jint, pressed: jboolean),
+            name = "imePopupClickNative",
+            fn = ime_popup_click,
+        },
+        static extern fn ime_popup_axis {
+            sig = (instance: jlong, x: jint, y: jint, dy: jdouble),
+            name = "imePopupAxisNative",
+            fn = ime_popup_axis,
+        },
         static extern fn update_cursor_rect {
             sig = (instance: jlong, x: jint, y: jint, w: jint, h: jint),
             name = "updateCursorRectNative",
@@ -2007,6 +2018,58 @@ fn ime_popup_frame<'local>(
         data.extend_from_slice(argb);
     }
     Ok(env.byte_array_from_slice(&data)?)
+}
+
+/// imePopupClick(instance, x, y, button, pressed) —— 候选窗 overlay 区域
+/// 点击回传（Phase 3）。x/y = popup surface 局部像素；button = evdev 码
+/// （BTN_LEFT=0x110）。native 走 seat popup pointer 通道发
+/// enter（必要时 leave 旧面）→ motion → button，每事件后补 frame。
+/// 候选命中与上屏由 fcitx5 InputPanel 自己完成（inputwindow.cpp 取证）。
+/// 无存活 popup 时极廉价返回。
+fn ime_popup_click<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    x: jint,
+    y: jint,
+    button: jint,
+    pressed: jboolean,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "imePopupClick")?;
+    let Some(surface) = instance.state.ime.popup_surface() else {
+        return Ok(());
+    };
+    instance.state.seat.popup_pointer_click(
+        &surface,
+        x.max(0) as f64,
+        y.max(0) as f64,
+        button as u32,
+        pressed, // jni 0.22 的 jboolean 即 Rust bool
+    );
+    Ok(())
+}
+
+/// imePopupAxis(instance, x, y, dy) —— 候选窗区域滚轮回传（Phase 3）。
+/// dy = notch 数（已按游戏窗口通路约定取负：正=向下翻页方向同 sendScroll）。
+fn ime_popup_axis<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    x: jint,
+    y: jint,
+    dy: jdouble,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "imePopupAxis")?;
+    let Some(surface) = instance.state.ime.popup_surface() else {
+        return Ok(());
+    };
+    instance.state.seat.popup_pointer_axis(
+        &surface,
+        x.max(0) as f64,
+        y.max(0) as f64,
+        dy,
+    );
+    Ok(())
 }
 
 /// C 方案：Java 端 CursorRectReporter 已不再需要（嵌套应用通过自己的 ti3

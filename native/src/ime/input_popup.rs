@@ -138,6 +138,12 @@ impl InputPopupState {
         self.owns(surface)
     }
 
+    /// 指定 popup 对象是否就是当前登记对象（destroyed 时决定要不要
+    /// 对 pointer 通道补 leave）。
+    pub(crate) fn role_matches(&self, role: ObjectId) -> bool {
+        self.role == Some(role)
+    }
+
     /// 该 surface 是否就是 popup surface（commit 认领判据，极廉价：
     /// 无 popup 时只做一次 Option::is_none）。
     pub(crate) fn owns(&self, surface: &WlSurface) -> bool {
@@ -362,7 +368,8 @@ pub(crate) unsafe fn convert_shm_to_argb(
     let mut out = vec![0u8; w * h * 4];
     for y in 0..h {
         for x in 0..w {
-            let src = pool.add(offset + y * stride + x * bpp);
+            // SAFETY: offset+stride/row 边界已在上文证明落于 len 内。
+            let src = unsafe { pool.add(offset + y * stride + x * bpp) };
             let argb: u32 = if bpp == 4 {
                 let raw = u32::from_le_bytes(unsafe { (src as *const [u8; 4]).read_unaligned() });
                 match info.format {

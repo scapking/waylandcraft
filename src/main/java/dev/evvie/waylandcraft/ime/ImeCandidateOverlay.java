@@ -139,6 +139,60 @@ public final class ImeCandidateOverlay {
 		return showing ? lastRect : null;
 	}
 
+	// ═══════════════════════════ Phase 3 输入回传 ═══════════════════════════
+
+	/**
+	 * 候选窗区域点击 → native wl_pointer 序列（enter/motion/button）。
+	 * mx/my = GUI 逻辑坐标；button = GLFW 码（0=左），内部转 evdev（+0x110）。
+	 * 返回 true = 事件已消费（overlay 在场且点在区域内——游戏/聊天不得处理）。
+	 */
+	public static boolean handleClick(double mx, double my, int button, boolean pressed) {
+		Rect r = hitRect();
+		if(r == null || !r.contains(mx, my)) return false;
+		int[] local = popupLocalCoords(mx, my, r);
+		try {
+			if(WaylandCraft.instance != null && WaylandCraft.instance.bridge != null) {
+				WaylandCraft.instance.bridge.imePopupClick(local[0], local[1], 0x110 + button, pressed);
+			}
+		} catch(UnsatisfiedLinkError | RuntimeException e) {
+			// 消费但不回传（旧库）：避免误点穿透到游戏。
+		}
+		return true;
+	}
+
+	/** 候选窗区域滚轮 → native wl_pointer axis（fcitx5 翻页）。dy = GLFW 语义。 */
+	public static boolean handleScroll(double mx, double my, double dy) {
+		Rect r = hitRect();
+		if(r == null || !r.contains(mx, my)) return false;
+		int[] local = popupLocalCoords(mx, my, r);
+		try {
+			if(WaylandCraft.instance != null && WaylandCraft.instance.bridge != null) {
+				// 取负对齐既有语义（WaylandCraft.onScroll 发窗口时同样 -scrollY：
+				// GLFW 正=向上翻 → wl axis 负=向上，见 fcitx5 wheel(up) 判据）。
+				WaylandCraft.instance.bridge.imePopupAxis(local[0], local[1], -dy);
+			}
+		} catch(UnsatisfiedLinkError | RuntimeException e) {
+			// 同上：消费即可。
+		}
+		return true;
+	}
+
+	/** 显示矩形坐标 → popup 像素空间局部坐标（等比映射 + 钳进帧内）。
+	 * 纯映射逻辑（不碰 bridge），单测直打。 */
+	public static int[] popupLocalCoords(double mx, double my, Rect r) {
+		Frame f = current;
+		int lx, ly;
+		if(f != null && f.width() > 0 && f.height() > 0) {
+			// 显示矩形按帧等比映射到 popup 像素空间（收缩态安全）。
+			lx = clampInt((int) Math.floor((mx - r.x()) * f.width() / (double) r.w()), 0, f.width() - 1);
+			ly = clampInt((int) Math.floor((my - r.y()) * f.height() / (double) r.h()), 0, f.height() - 1);
+		} else {
+			lx = clampInt((int) Math.floor(mx - r.x()), 0, Math.max(0, r.w() - 1));
+			ly = clampInt((int) Math.floor(my - r.y()), 0, Math.max(0, r.h() - 1));
+		}
+		return new int[] {lx, ly};
+	}
+
 	// ══════════════════════════════ 内部工具 ══════════════════════════════
 
 	/** 聚焦的 EditBox（聊天输入框等）。优先 MC 自身焦点跟踪，遍历兜底

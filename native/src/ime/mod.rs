@@ -190,6 +190,21 @@ impl ImeState {
         self.im2.instance.is_some() && self.relay.app_active()
     }
 
+    /// 当前存活的 popup 底层 surface（Phase 3 点击回传目标；已销毁 → None）。
+    pub(crate) fn popup_surface(&self) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
+        self.popup.surface().cloned()
+    }
+
+    /// 若销毁对象就是当前 popup 且其 surface 仍存活 → 返回它以补 pointer
+    /// leave（client 侧 pointer 焦点一致性，见 seat::popup_pointer_leave）。
+    pub(crate) fn popup_pointer_target(&self, popup_id: smithay::reexports::wayland_server::backend::ObjectId) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
+        if self.popup.role_matches(popup_id) {
+            self.popup.surface().cloned()
+        } else {
+            None
+        }
+    }
+
     /// Java 每帧轮询候选窗帧（Phase 1 JNI 出口）。
     ///
     /// 返回 `None` 表示"无新状态，零拷贝"（seq 未变且可见性原料未变）；

@@ -373,6 +373,20 @@ impl PopupFixture {
         self.server.ime = ime;
         self.drive();
     }
+
+    /// 服务端反查 IM 客户端某 surface 的 WlSurface（seat pointer 通道入参）。
+    fn server_surface_of_ime(
+        &self,
+        client_surface: &wl_surface::WlSurface,
+    ) -> smithay::reexports::wayland_server::protocol::wl_surface::WlSurface {
+        use wayland_client::Proxy;
+        let proto = client_surface.id().protocol_id();
+        self.ime_client
+            .object_from_protocol_id::<
+                smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+            >(&self.display.handle(), proto)
+            .unwrap()
+    }
 }
 
 // ── shm 缓冲工具（memfd + mmap，模拟 fcitx5 buffer.cpp 的池用法）──
@@ -691,4 +705,361 @@ fn popup_double_role_posts_protocol_error() {
     // client 端：死连接上的新请求 + flush 必须报错（协议错误致命）。
     f.ime.state.im.as_ref().unwrap().commit_string("post-mortem".into());
     assert!(f.ime.flush_err(), "协议错误后 client 连接必须已死");
+}
+
+// ═══════════════════════ Phase 3：pointer 点选回传 ═══════════════════════
+
+/// overlay 区域点击 → native 向 popup surface 发 enter→(motion)→button
+/// （+frame），进帧序列符合 wl_pointer 惯例；第二次不同坐标点击补 motion；
+/// release 只发 button 不改 focus。断言 IM 客户端 wl_pointer 收到正确事件。
+#[test]
+fn popup_pointer_click_sends_enter_motion_button() {
+    let mut f = setup_popup();
+    f.focus_and_enable();
+    let (surface, _popup, _px) = popup_with_frame(&mut f, 40, 12, 0);
+    // 交付首帧，让 overlay 侧"已显示"。
+    assert!(f.server.ime.take_popup_snapshot(true).expect("首帧").visible);
+
+    let srv = f.server_surface_of_ime(&surface);
+    // 按下（候选区某点）。
+    f.server.seat.popup_pointer_click(&srv, 5.0, 3.0, 0x110, true);
+    f.drive();
+    f.ime.dispatch();
+
+    let evs = &f.ime.state.ptr_events;
+    let enter = evs.iter().position(|e| e == "enter").expect("应有 enter");
+    let button = evs.iter().position(|e| e == "button").expect("应有 button");
+    // enter 携带坐标即已定位，首次按下可不发独立 motion；button 必在 enter 之后。
+    assert!(enter < button, "button 必须晚于 enter: {:?}", evs);
+    assert!(evs.iter().any(|e| e == "frame"), "每事件批次应补 frame");
+
+    // 换坐标再按（同 surface 已聚焦 → 应补 motion 后再 button）。
+    let n_before = f.ime.state.ptr_events.len();
+    f.server.seat.popup_pointer_click(&srv, 30.0, 9.0, 0x110, true);
+    f.drive();
+    f.ime.dispatch();
+    let new_evs = &f.ime.state.ptr_events[n_before..];
+    let motion = new_evs.iter().position(|e| e == "motion").expect("换坐标应补 motion");
+    let button2 = new_evs.iter().position(|e| e == "button").expect("应再次 button");
+    assert!(motion < button2, "motion 必须早于 button: {:?}", new_evs);
+
+    // 释放。
+    f.server.seat.popup_pointer_click(&srv, 30.0, 9.0, 0x110, false);
+    f.drive();
+    f.ime.dispatch();
+    assert!(f.ime.state.ptr_events.iter().any(|e| e == "button"));
+
+    // popup 销毁 → 对聚焦过的 pointer 补 leave。
+    _popup.destroy();
+    f.drive();
+    f.ime.dispatch();
+    assert!(
+        f.ime.state.ptr_events.iter().any(|e| e == "leave"),
+        "popup 销毁应对 pointer 补 leave: {:?}",
+        f.ime.state.ptr_events
+    );
+}
+
+/// overlay 区域滚轮 → enter/motion + axis 批（vertical，含 source/value120）。
+#[test]
+fn popup_pointer_axis_sends_wheel() {
+    let mut f = setup_popup();
+    f.focus_and_enable();
+    let (surface, _popup, _px) = popup_with_frame(&mut f, 40, 12, 0);
+    assert!(f.server.ime.take_popup_snapshot(true).expect("首帧").visible);
+    let srv = f.server_surface_of_ime(&surface);
+
+    f.server.seat.popup_pointer_axis(&srv, 20.0, 6.0, 1.0);
+    f.drive();
+    f.ime.dispatch();
+
+    let evs = &f.ime.state.ptr_events;
+    assert!(evs.iter().any(|e| e == "enter"), "滚轮前应 ensure 聚焦: {:?}", evs);
+    assert!(evs.iter().any(|e| e == "axis"), "应收到 axis 事件: {:?}", evs);
+    // pointer v8：应带 axis_source + axis_value120。
+    assert!(evs.iter().any(|e| e == "axis_source"), "{:?}", evs);
+    assert!(evs.iter().any(|e| e == "axis_value120"), "{:?}", evs);
+}
+
+// ═══════════════ 真 fcitx5 端到端（#[ignore]，本机跑，取证日志落盘）═══════════════
+
+/// 隔离 profile/config：与 tests_real 同一取证结论（ActiveByDefault 种子），
+/// 独立复制以免跨文件耦合（tests_real.rs 由并行 agent 维护，不动它）。
+const R_SEED_PROFILE: &str = r#"[Groups/0]
+# Group Name
+Name=default
+# Layout
+Default Layout=us
+# Default Input Method
+DefaultIM=pinyin
+
+[Groups/0/Items/0]
+# Name
+Name=keyboard-us
+# Layout
+Layout=
+
+[Groups/0/Items/1]
+# Name
+Name=pinyin
+# Layout
+Layout=
+
+[GroupOrder]
+0=default
+"#;
+const R_SEED_CONFIG: &str = "[Behavior]\nActiveByDefault=True\n";
+
+/// 真 fcitx5 popup 端到端（验收链 2）：隔离 HOME 起真 fcitx5 → editor
+/// 聚焦 enable → 打 "niha" → **候选窗 popup surface 必须出现且采集到
+/// 非空帧**（尺寸合理、字节数=w*h*4、含非零像素=引擎真画了字形）→ 点击
+/// 候选区中心回传 → commit 出现；若 QML/主题布局导致中心未命中候选，
+/// 退而断言 button 事件到达 client（WAYLAND_DEBUG 取证）+ SPACE 兜底
+/// commit（规格允许的如实降级）。
+#[test]
+#[ignore = "真 fcitx5 端到端（本机跑）：popup 非空帧 + 点击回传 + commit"]
+fn real_fcitx5_popup_frame_capture_and_click() {
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let base = PathBuf::from(format!("/tmp/wlc-f5popup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let home = base.join("home");
+    let runtime = base.join("runtime");
+    let conf = home.join("config/fcitx5");
+    for d in [&home, &conf, &runtime, &home.join("data"), &home.join("cache")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(conf.join("profile"), R_SEED_PROFILE).unwrap();
+    std::fs::write(conf.join("config"), R_SEED_CONFIG).unwrap();
+
+    let (mut display, mut server) = server_setup();
+    let socket_name = "wayland-f5popup";
+    let listener = UnixListener::bind(runtime.join(socket_name)).expect("bind");
+    listener.set_nonblocking(true).unwrap();
+
+    let (es, ec) = UnixStream::pair().unwrap();
+    let editor_client = display
+        .handle()
+        .insert_client(es, Arc::new(ServerClientData))
+        .unwrap();
+    let mut editor: TestClient<EditorState> = editor_connect(ec, &mut display, &mut server);
+
+    let log_path = base.join("fcitx5.log");
+    let mut cmd = Command::new("fcitx5");
+    cmd.args(["-D", "--disable=dbus"])
+        .arg("--verbose")
+        .arg("default=3,waylandim=5")
+        .env("WAYLAND_DISPLAY", socket_name)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("WAYLAND_DEBUG", "client")
+        .env("LANG", "C.UTF-8")
+        .env_remove("DISPLAY")
+        .env_remove("XAUTHORITY")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap();
+    let log_err = log.try_clone().unwrap();
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+    let mut fcitx = cmd.spawn().expect("spawn fcitx5");
+
+    // ── 泵（同 tests_real::Harness 纪律：WLCClient + 手动交替）──
+    let pump = |display: &mut Display<WLCState>,
+                server: &mut WLCState,
+                editor: &mut TestClient<EditorState>,
+                listener: &UnixListener| {
+        editor.flush();
+        while let Ok((stream, _)) = listener.accept() {
+            let _ = display
+                .handle()
+                .insert_client(stream, Arc::new(crate::WLCClient::new()));
+        }
+        let _ = display.dispatch_clients(server);
+        let _ = display.flush_clients();
+        editor.dispatch_pending();
+    };
+    let burst = |dur: std::time::Duration,
+                 display: &mut Display<WLCState>,
+                 server: &mut WLCState,
+                 editor: &mut TestClient<EditorState>,
+                 listener: &UnixListener| {
+        let t0 = Instant::now();
+        while t0.elapsed() < dur {
+            pump(display, server, editor, listener);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    };
+
+    // 1) 等 im2 bind（冷启动词典 ~6s，给 90s 上限）
+    let t0 = Instant::now();
+    while t0.elapsed() < std::time::Duration::from_secs(90) {
+        pump(&mut display, &mut server, &mut editor, &listener);
+        if server.ime.im2.instance.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let bound = server.ime.im2.instance.is_some();
+
+    let mut popup_seen = false;
+    let mut frame = (0i32, 0i32, 0usize, 0usize); // w,h,argb_len,非零字节数
+    let mut click_committed = false;
+    let mut button_reached_client = false;
+    let mut ti3: Vec<String> = Vec::new();
+
+    if bound {
+        // 2) editor 聚焦 + enable → activate；3) 等 grab
+        {
+            use wayland_client::Proxy;
+            let proto = editor.state.surface.as_ref().unwrap().id().protocol_id();
+            let surface = editor_client
+                .object_from_protocol_id::<
+                    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+                >(&display.handle(), proto)
+                .unwrap();
+            let mut ime = std::mem::take(&mut server.ime);
+            ime.set_focus(&surface, &mut server);
+            server.ime = ime;
+            server.seat.keyboard_focus(surface);
+        }
+        let ti = editor.state.ti.as_ref().unwrap().clone();
+        ti.enable();
+        ti.commit();
+        burst(std::time::Duration::from_millis(400), &mut display, &mut server, &mut editor, &listener);
+        let t0 = Instant::now();
+        while t0.elapsed() < std::time::Duration::from_secs(15) {
+            pump(&mut display, &mut server, &mut editor, &listener);
+            if server.ime.im2.grab.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let grabbed = server.ime.im2.grab.is_some();
+
+        if grabbed {
+            // 4) 打 "niha"（不空格：候选窗应挂在 preedit 展示期间）
+            for evdev in [49u32, 23, 35, 30] {
+                let mods = server.seat.modifiers_tuple();
+                server.ime.handle_key(evdev + 8, crate::seat::KeyboardAction::Press, mods);
+                burst(std::time::Duration::from_millis(220), &mut display, &mut server, &mut editor, &listener);
+                server.ime.handle_key(evdev + 8, crate::seat::KeyboardAction::Release, mods);
+                burst(std::time::Duration::from_millis(120), &mut display, &mut server, &mut editor, &listener);
+            }
+            // 5) 等 popup 角色出现 + 非空帧（15s）
+            let t0 = Instant::now();
+            let mut snap_opt = None;
+            while t0.elapsed() < std::time::Duration::from_secs(15) {
+                pump(&mut display, &mut server, &mut editor, &listener);
+                popup_seen = server.ime.popup_surface().is_some();
+                if popup_seen {
+                    if let Some(s) = server.ime.take_popup_snapshot(true) {
+                        if s.visible {
+                            snap_opt = Some(s);
+                            break;
+                        }
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if let Some(s) = &snap_opt {
+                let nonz = s.argb.as_ref().map(|a| a.iter().filter(|b| **b != 0).count()).unwrap_or(0);
+                frame = (s.width, s.height, s.argb.as_ref().map(|a| a.len()).unwrap_or(0), nonz);
+                // 6) 点击候选区中心（回传 popup surface）
+                if let Some(surf) = server.ime.popup_surface() {
+                    let cx = (s.width.max(2) / 2) as f64;
+                    let cy = (s.height.max(2) / 2) as f64;
+                    server.seat.popup_pointer_click(&surf, cx, cy, 0x110, true);
+                    burst(std::time::Duration::from_millis(150), &mut display, &mut server, &mut editor, &listener);
+                    server.seat.popup_pointer_click(&surf, cx, cy, 0x110, false);
+                    burst(std::time::Duration::from_millis(150), &mut display, &mut server, &mut editor, &listener);
+                    // 7) 等点击驱动 commit（8s）
+                    let t1 = Instant::now();
+                    while t1.elapsed() < std::time::Duration::from_secs(8) {
+                        pump(&mut display, &mut server, &mut editor, &listener);
+                        if editor
+                            .state
+                            .ti_events
+                            .iter()
+                            .any(|e| e.starts_with("commit(") && e.chars().skip(7).any(|c| !c.is_ascii()))
+                        {
+                            click_committed = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                }
+            }
+            // 8) button 到达 client？（WAYLAND_DEBUG=client 取证 button( 行）
+            if let Ok(logs) = std::fs::read_to_string(&log_path) {
+                button_reached_client = logs.contains("wl_pointer")
+                    && logs.lines().any(|l| l.contains("button(") && l.contains("272"));
+            }
+            // 9) 点击未直接出 commit → SPACE 兜底选首选词
+            if !click_committed {
+                let mods = server.seat.modifiers_tuple();
+                server.ime.handle_key(57 + 8, crate::seat::KeyboardAction::Press, mods);
+                burst(std::time::Duration::from_millis(150), &mut display, &mut server, &mut editor, &listener);
+                server.ime.handle_key(57 + 8, crate::seat::KeyboardAction::Release, mods);
+                let t1 = Instant::now();
+                while t1.elapsed() < std::time::Duration::from_secs(10) {
+                    pump(&mut display, &mut server, &mut editor, &listener);
+                    if editor
+                        .state
+                        .ti_events
+                        .iter()
+                        .any(|e| e.starts_with("commit(") && e.chars().skip(7).any(|c| !c.is_ascii()))
+                    {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        burst(std::time::Duration::from_millis(300), &mut display, &mut server, &mut editor, &listener);
+        ti3 = editor.state.ti_events.clone();
+    }
+
+    let _ = fcitx.kill();
+    let _ = fcitx.wait();
+    let _ = std::fs::remove_file(runtime.join(socket_name));
+
+    let commits: Vec<String> = ti3
+        .iter()
+        .filter(|e| e.starts_with("commit(") && e.chars().skip(7).any(|c| !c.is_ascii()))
+        .cloned()
+        .collect();
+    eprintln!("=== [f5popup] bound={bound} popup_surface={popup_seen} frame={frame:?} (w,h,argb_bytes,非零字节)");
+    eprintln!("=== [f5popup] click_committed={click_committed} button_reached_client={button_reached_client} commits={commits:?}");
+    eprintln!("=== [f5popup] ti3 events: {ti3:?}");
+    eprintln!("=== [f5popup] 日志取证目录: {}（保留）", base.display());
+
+    assert!(bound, "真 fcitx5 应 bind im2");
+    assert!(popup_seen, "niha 组合期间应出现 input_popup 角色（classicui 候选窗）");
+    let (w, h, alen, nonz) = frame;
+    assert!(w >= 16 && h >= 8, "popup 帧尺寸应合理，实际 {w}x{h}");
+    assert_eq!(alen, (w as usize) * (h as usize) * 4, "帧字节数必须 = w*h*4");
+    assert!(nonz > alen / 100, "帧应含实际绘制内容（非空白），非零字节 {nonz}/{alen}");
+    assert!(
+        !commits.is_empty(),
+        "最终必须有汉字 commit（click_committed={click_committed} button_reached_client={button_reached_client}）；ti3: {ti3:?}"
+    );
+    if !click_committed {
+        assert!(
+            button_reached_client,
+            "点击未直接出 commit 时，必须能证明 button 事件到达 fcitx5 client（WAYLAND_DEBUG 日志无 wl_pointer.button）"
+        );
+    }
 }

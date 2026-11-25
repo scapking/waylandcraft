@@ -388,6 +388,139 @@ impl WLCSeatState {
         });
     }
 
+    // ── IME 候选窗 pointer 通道（Phase 3）──
+    //
+    // 语义：把游戏内 overlay 区域的鼠标事件回传给嵌套 fcitx5 的 popup
+    // surface。复用 `data.focus`——一个 wl_pointer 同时只能有一个 surface
+    // 焦点（协议硬约束），enter 前对该 pointer 的旧焦点 surface（同 client
+    // 的 fcitx5 窗口，如配置窗）补 leave；之后 pointer_focus 在焦点切回
+    // 游戏窗口时同样会 leave popup。事件只发给 popup 所属 client 的
+    // pointer 资源（for_all_pointers 会波及全部 client，这里必须按 client
+    // 过滤）。进帧序列 enter(+frame) → motion(+frame) → button/axis(+frame)
+    // 按 wl_pointer 惯例（fcitx5 waylandpointer.cpp 直接监听各事件，
+    // 不强依赖 frame，但发出 frame 更合规）。
+
+    /// 只对 surface 所属 client 的 pointer 执行回调（候选窗通道专用，
+    /// 绝不波及其他 client 的 pointer 资源）。
+    fn for_client_pointers<F>(&self, surface: &WlSurface, mut f: F)
+    where
+        F: FnMut(&WlPointer, &mut WLCPointerData),
+    {
+        for pointer in &self.pointers {
+            if pointer.client().is_none() || surface.client().is_none()
+                || pointer.client() != surface.client()
+            {
+                continue;
+            }
+            with_pointer_data(pointer, |data| f(pointer, data));
+        }
+    }
+
+    /// 确保 pointer 已聚焦 popup surface（必要时 leave 旧面 + enter + frame），
+    /// 坐标变化时补 motion + frame。返回 true = 至少一个 pointer 已就位。
+    fn popup_pointer_ensure(&self, surface: &WlSurface, x: f64, y: f64) -> bool {
+        let enter_serial = new_serial();
+        let time = get_time();
+        let pos = to_fixed2(x, y);
+        let mut any = false;
+        self.for_client_pointers(surface, |pointer, data| {
+            let on_popup = data
+                .focus
+                .as_ref()
+                .is_some_and(|s| s.id() == surface.id());
+            if !on_popup {
+                if let Some(old) = data.focus.take() {
+                    if old.is_alive() && old.id() != surface.id() {
+                        pointer.leave(new_serial(), &old);
+                        self.pointer_frame(pointer);
+                    }
+                }
+                pointer.enter(enter_serial, surface, x, y);
+                self.pointer_frame(pointer);
+                data.focus = Some(surface.clone());
+                data.last_enter = Some(enter_serial);
+                data.last_motion = Some(pos);
+            } else if data.last_motion != Some(pos) {
+                pointer.motion(time, x, y);
+                self.pointer_frame(pointer);
+                data.last_motion = Some(pos);
+            }
+            any = true;
+        });
+        any
+    }
+
+    /// overlay 区域点击 → enter/motion + button + frame（press/release 由
+    /// 调用方分两次调用，与游戏窗口通路一致）。
+    pub fn popup_pointer_click(
+        &self,
+        surface: &WlSurface,
+        x: f64,
+        y: f64,
+        button: u32,
+        pressed: bool,
+    ) {
+        if !self.popup_pointer_ensure(surface, x, y) {
+            return;
+        }
+        let serial = new_serial();
+        let time = get_time();
+        let state = if pressed {
+            ButtonState::Pressed
+        } else {
+            ButtonState::Released
+        };
+        self.for_client_pointers(surface, |pointer, _data| {
+            pointer.button(serial, time, button, state);
+            self.pointer_frame(pointer);
+        });
+    }
+
+    /// overlay 区域滚轮 → enter/motion + axis 批 + frame（vertical）。value
+    /// 语义与 `pointer_axis` 一致：1 notch = 1.0，legacy axis 发 value*10.0
+    /// （fcitx5 阈值 2560 fixed/格，见 waylandinputwindow.cpp ::axis）。
+    pub fn popup_pointer_axis(&self, surface: &WlSurface, x: f64, y: f64, value: f64) {
+        let val120 = (value * 120.0).floor() as i32;
+        if val120 == 0 {
+            return;
+        }
+        if !self.popup_pointer_ensure(surface, x, y) {
+            return;
+        }
+        let time = get_time();
+        self.for_client_pointers(surface, |pointer, data| {
+            if data.focus.is_none() {
+                return;
+            }
+            let version = pointer.version();
+            if version >= wl_pointer::EVT_AXIS_SOURCE_SINCE {
+                pointer.axis_source(AxisSource::Wheel);
+            }
+            if version >= wl_pointer::EVT_AXIS_VALUE120_SINCE {
+                pointer.axis_value120(Axis::VerticalScroll, val120);
+            } else if version >= wl_pointer::EVT_AXIS_DISCRETE_SINCE {
+                pointer.axis_discrete(Axis::VerticalScroll, value.floor() as i32);
+            }
+            pointer.axis(time, Axis::VerticalScroll, value * 10.0);
+            self.pointer_frame(pointer);
+        });
+    }
+
+    /// 候选窗销毁/断连：对聚焦过它的 pointer 补 leave + frame（客户端
+    /// pointer 焦点一致性；surface 已死时发送自动无操作）。
+    pub fn popup_pointer_leave(&self, surface: &WlSurface) {
+        let serial = new_serial();
+        self.for_all_pointers(|pointer, data| {
+            if data.focus.as_ref().is_some_and(|s| s.id() == surface.id()) {
+                pointer.leave(serial, surface);
+                self.pointer_frame(pointer);
+                data.focus = None;
+                data.last_enter = None;
+                data.last_motion = None;
+            }
+        });
+    }
+
     pub fn keyboard_update_xkb(&mut self, key: u32, pressed: bool) {
         // 键码体系（三套，别混）：
         //   Java scancode（correctScancode 后）= X11 keycode = evdev + 8
