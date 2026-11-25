@@ -1761,6 +1761,16 @@ mod tests {
         let t = topo(&[(10, "Stream/Input/Audio", 2000, "other"), (12, "Audio/Sink", 0, "s")]);
         assert!(find_app_stream_node(&t, 1000).is_none());
     }
+
+    /// 回归护栏：共享状态不得再容纳 pw 对象（崩溃根因的编译期检查——
+    /// AudioCaptureState 被多线程访问，任何非 Send/Sync 字段都会让本断言
+    /// 编译失败；历史上 `_stream/_mainloop/_listener` + unsafe impl Send
+    /// 正是崩溃载体）。
+    #[test]
+    fn shared_state_is_send_sync_by_construction() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AudioCaptureState>();
+    }
 }
 
 #[cfg(test)]
@@ -1989,6 +1999,162 @@ mod repro_tests {
         let _ = std::fs::remove_file(&wav);
         assert!(!promoted.is_empty(), "节点出现后应自动升级回 per-app: {promoted}");
         eprintln!("[test] stage3 promoted OK: {promoted}");
+    }
+
+    /// 事故回归压力测试（本机 PipeWire；64 主循环 + 16 并发 churn，
+    /// 全程约 3-6 分钟）：复现用户实测崩溃场景——
+    ///   多窗口共享期间：Java 侧（= 测试线程）快速 start/stop 切换窗口，
+    ///   同时 owner 线程 watchdog 正在重验/重连/降级/升级，
+    ///   同时目标应用节点（paplay）在会话中途消失/换流。
+    /// 旧线程模型在此场景下"运行一段时间后 SIGSEGV@libspa-support"
+    /// （hs_err_pid8053）；新模型要求全部跑完、进程存活、状态机始终合法。
+    ///
+    /// 跑法：
+    ///   cargo test -- --ignored --test-threads=1 audio_threading_stress_live
+    #[test]
+    #[ignore = "事故回归压力测试：需要 PipeWire + paplay；全程约 3-6 分钟"]
+    fn audio_threading_stress_live() {
+        if std::process::Command::new("paplay").arg("--version").output().is_err() {
+            eprintln!("SKIP: paplay 不存在");
+            return;
+        }
+        let wav = std::env::temp_dir().join("waylandcraft-audio-stress-tone.wav");
+        write_test_wav(&wav).expect("write wav");
+
+        const CYCLES: usize = 64;
+        let mut started_ok = 0usize;
+        let mut started_err = 0usize;
+
+        // ── 并发 churn 线程：模拟另一窗口开关，专门打旧实现
+        //    "stop 线程 drop stream vs watchdog 重连" 的交错窗口。
+        let churn_wav = wav.clone();
+        let churn = std::thread::Builder::new()
+            .name("stress-churn".to_string())
+            .spawn(move || {
+                let mut n = 0usize;
+                while n < 16 {
+                    // 每轮带一个真实 paplay，让 churn 也会命中 per-app 路径
+                    let mut child = std::process::Command::new("paplay")
+                        .arg("-r")
+                        .arg(&churn_wav)
+                        .stdin(std::process::Stdio::null())
+                        .spawn()
+                        .expect("spawn paplay (churn)");
+                    let pid = child.id();
+                    std::thread::sleep(Duration::from_millis(400));
+                    if start_audio_capture(pid).is_ok() {
+                        let _ = poll_audio_capture();
+                        std::thread::sleep(Duration::from_millis(40));
+                        n += 1;
+                    }
+                    stop_audio_capture();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                n
+            })
+            .expect("spawn churn");
+
+        for i in 0..CYCLES {
+            // 每轮起一条真实播放流
+            let mut child = std::process::Command::new("paplay")
+                .arg("-r")
+                .arg(&wav)
+                .stdin(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn paplay");
+            let pid = child.id();
+
+            // 等节点出现（最多 2s；允许"节点没出现"的竞态轮）
+            let node_deadline = std::time::Instant::now() + Duration::from_millis(2000);
+            while std::time::Instant::now() < node_deadline {
+                let topo = enumerate_topology(250).expect("enum");
+                if find_app_stream_node(&topo, pid).is_some() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+
+            match start_audio_capture(pid) {
+                Ok(()) => started_ok += 1,
+                Err(e) => {
+                    started_err += 1;
+                    eprintln!("[stress] cycle {i}: start Err（允许：daemon 忙/节点竞态）: {e}");
+                }
+            }
+
+            for _ in 0..3 {
+                let _ = poll_audio_capture();
+                std::thread::sleep(Duration::from_millis(80));
+            }
+
+            match i % 4 {
+                0 => {
+                    // 杀 app → watchdog 重验轮启动（失败计数/可能降级）→ 中途 stop
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    std::thread::sleep(Duration::from_millis(1400));
+                    stop_audio_capture();
+                }
+                1 => {
+                    // 干净停止 → 再杀 app
+                    stop_audio_capture();
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    std::thread::sleep(Duration::from_millis(60));
+                }
+                2 => {
+                    // 不 stop 直接换新会话（start 内部先 stop）——模拟切窗口
+                    let mut child2 = std::process::Command::new("paplay")
+                        .arg("-r")
+                        .arg(&wav)
+                        .stdin(std::process::Stdio::null())
+                        .spawn()
+                        .expect("spawn paplay 2");
+                    let pid2 = child2.id();
+                    std::thread::sleep(Duration::from_millis(600));
+                    let _ = start_audio_capture(pid2);
+                    let st = get_audio_capture_status();
+                    assert!(st.contains("stage"), "status JSON 异常: {st}");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = child2.kill();
+                    let _ = child2.wait();
+                    stop_audio_capture();
+                }
+                _ => {
+                    // 会话存活期间让 watchdog 完整跑一轮重连（节点消失→
+                    // 出现新节点 → per-app 重连与并发 stop 交错）：
+                    // kill 后在同 pid 语义不可能；用"旧流停止→应用流消失→
+                    // watchdog 失败计数→降级"路径，再在降级轮之后立即 stop。
+                    std::thread::sleep(Duration::from_millis(2600));
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    std::thread::sleep(Duration::from_millis(400));
+                    stop_audio_capture();
+                }
+            }
+
+            if i % 16 == 15 {
+                let st = get_audio_capture_status();
+                assert!(st.contains("stage"), "status JSON 异常: {st}");
+                eprintln!("[stress] cycle {i} done: ok={started_ok} err={started_err} {st}");
+            }
+        }
+
+        let churn_done = churn.join().expect("churn 线程 panic（=捕获层线程模型缺陷）");
+        assert_eq!(churn_done, 16, "churn 完成数异常");
+
+        // 收尾：确保无残留会话 + 状态机回到 idle
+        stop_audio_capture();
+        let final_st = get_audio_capture_status();
+        assert!(final_st.contains(r#""stage":"idle""#), "stop 后应为 idle: {final_st}");
+        eprintln!(
+            "[stress] ALL {} cycles + {} churn done, ok={} err={}",
+            CYCLES, churn_done, started_ok, started_err
+        );
+        let _ = std::fs::remove_file(&wav);
     }
 
     /// 环境复现：在与 Minecraft 相同的桌面会话环境跑真实拓扑枚举，
