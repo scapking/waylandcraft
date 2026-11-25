@@ -107,7 +107,14 @@ struct Variant {
     /// true = 起私有 session bus 并导出 DBUS_SESSION_BUS_ADDRESS；
     /// false = 删除该变量（连不上任何总线）。
     private_dbus: bool,
+    /// true = 在 SPACE（选词）键事件**之后**再排入一次应用状态变更 done——
+    /// 复现 sync7 实机 serial 竞态形态（fcitx5 回填的 serial 落后服务端
+    /// wire 已发计数一拍）。见 `Harness::type_evdev_with_state_race`。
+    drift_before_commit: bool,
 }
+
+/// sync7 回归：drift 注入的状态文本序号（保证每次 push 都是 meaningful 变化）。
+static DRIFT_NONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// 一次真 fcitx5 端到端运行的可断言结果。
 struct RunResult {
@@ -115,6 +122,10 @@ struct RunResult {
     key_events: Vec<(u32, u8)>,
     im2_seen_bind: bool,
     im2_seen_grab: bool,
+    /// 修复后语义：commit serial 与 wire done 计数不符、但文本仍照常交付的
+    /// 批次数（ImeState::serial_mismatch_count）。drift 用例断言其 ≥1，
+    /// 证明「丢字路径」确实被触发过而不是绕过了。
+    serial_mismatch_seen: u32,
     log_dir: PathBuf,
 }
 
@@ -213,6 +224,7 @@ fn run(variant: &Variant) -> RunResult {
         key_events: Vec::new(),
         im2_seen_bind: false,
         im2_seen_grab: false,
+        serial_mismatch_seen: 0,
         log_dir: base.clone(),
     };
 
@@ -240,8 +252,15 @@ fn run(variant: &Variant) -> RunResult {
                 harness.wait_for(|s| s.ime.im2.grab.is_some(), Duration::from_secs(15));
             if result.im2_seen_grab {
                 // 4) 喂键：nihao + space（libpinyin 首选词「你好」）。
-                for k in [N, I, H, A, O, SPACE] {
+                for k in [N, I, H, A, O] {
                     harness.type_evdev(k, Duration::from_millis(180));
+                }
+                if variant.drift_before_commit {
+                    // sync7 故障形态注入：SPACE 键事件先到 fcitx5，随后才排入
+                    // 一次状态 done——选词 commit 回填的 serial 落后 wire 计数。
+                    harness.type_evdev_with_state_race(SPACE, Duration::from_millis(250));
+                } else {
+                    harness.type_evdev(SPACE, Duration::from_millis(180));
                 }
                 // 5) 等 commit 落到编辑器 ti3（最多 10s）。
                 let t0 = Instant::now();
@@ -267,6 +286,7 @@ fn run(variant: &Variant) -> RunResult {
     result.ti_events = harness.editor.state.ti_events.clone();
     result.key_events = harness.editor.state.key_events.clone();
     drop(harness);
+    result.serial_mismatch_seen = server.ime.serial_mismatch_count();
     let _ = fcitx.kill();
     let _ = fcitx.wait();
     if let Some(mut d) = dbus_child {
@@ -346,6 +366,50 @@ impl Harness<'_> {
         self.server.ime.handle_key(xkb, KeyboardAction::Release, mods);
         self.pump_burst(pause);
     }
+
+    /// sync7 实机故障形态注入（真 fcitx5 serial 竞态的确定化）。
+    /// 取证注记（首版实现失败，WAYLAND_DEBUG 线路日志 /tmp/wlc-f5e2e-drift/
+    /// fcitx5.log）：fcitx5 在收到 key 事件的 dispatch 内 ~0.4ms 就把
+    /// `commit(serial_)` 写上了 socket（keyCallback → commitStringDelegate
+    /// → `ic_->commit(serial_)`，见 waylandimserverv2.h:105-106）；但若
+    /// 注入依赖「同一轮 dispatch_clients 里编辑器先被处理」，客户端处理
+    /// 顺序并无该保证——commit 可能先被读取，wire 计数尚未 +1，serial
+    /// 恰好匹配，mismatch 复现不了。确定化做法改为利用「commit 在途
+    /// 未读」窗口，不依赖事件循环内部顺序：
+    /// 1. SPACE press 发出并 flush（fcitx5 是独立进程，自己醒来处理）；
+    /// 2. 睡 30ms：fcitx5 选词并把陈旧 serial 的 commit 上路，服务端故意
+    ///    不读；
+    /// 3. 服务端推进 wire 状态：直接下发一次 PushState（execute_ime_commands
+    ///    → send_done，计数 +1 并 flush）——那条在途 commit 从此落后计数
+    ///    一拍，正是实机日志「commit(serial=8…65) DROPPED」的形态；
+    /// 4. 再 pump：服务端读入陈旧 serial 的 commit → 走 mismatch 分支，
+    ///    汉字文本必须照常上屏（回归断言见调用方用例）。
+    fn type_evdev_with_state_race(&mut self, evdev: u32, pause: Duration) {
+        use std::sync::atomic::Ordering;
+        let mods = self.server.seat.modifiers_tuple();
+        let xkb = evdev + 8;
+        // 1) key 事件先落地。
+        self.server.ime.handle_key(xkb, KeyboardAction::Press, mods);
+        let _ = self.display.flush_clients();
+        // 2) 让陈旧 serial 的 commit 上路（实测 ~0.4ms，30ms 富余）。
+        std::thread::sleep(Duration::from_millis(30));
+        // 3) wire 计数此刻才 +1：done 排在 fcitx5 已发出的 commit 之后送达。
+        let nonce = DRIFT_NONCE.fetch_add(1, Ordering::Relaxed);
+        let st = super::AppState {
+            surrounding_text: format!("drift{nonce}"),
+            surrounding_cursor: 1,
+            surrounding_anchor: 1,
+            ..Default::default()
+        };
+        self.server
+            .ime
+            .execute_ime_commands(vec![super::ImeCommand::PushState(st)]);
+        let _ = self.display.flush_clients();
+        // 4) 服务端现在才读入在途 commit（serial 已落后 → mismatch 分支）。
+        self.pump_burst(pause);
+        self.server.ime.handle_key(xkb, KeyboardAction::Release, mods);
+        self.pump_burst(pause);
+    }
 }
 
 fn cjk_commits(events: &[String]) -> Vec<String> {
@@ -403,6 +467,7 @@ fn real_fcitx5_repro_no_seed_config() {
         fcitx_args: &["-D", "--disable=dbus"],
         seed_config: false,
         private_dbus: false,
+        drift_before_commit: false,
     });
     dump_diags(&r, "repro");
     assert!(r.im2_seen_bind, "fcitx5 应已 bind im2（框架层正常）");
@@ -431,6 +496,7 @@ fn real_fcitx5_seed_config_active_by_default() {
         fcitx_args: &["-D", "--disable=dbus"],
         seed_config: true,
         private_dbus: false,
+        drift_before_commit: false,
     });
     dump_diags(&r, "seed");
     assert!(r.im2_seen_bind, "fcitx5 应已 bind im2");
@@ -591,6 +657,7 @@ fn real_fcitx5_production_spawn_path() {
         key_events: Vec::new(),
         im2_seen_bind: bound,
         im2_seen_grab: grabbed,
+        serial_mismatch_seen: server.ime.serial_mismatch_count(),
         // 生产 spawn_daemon 的日志落点：plan.log_file = home/fcitx5.log。
         log_dir: home.clone(),
     };
@@ -619,6 +686,7 @@ fn real_fcitx5_private_dbus() {
         fcitx_args: &["-D"],
         seed_config: true,
         private_dbus: true,
+        drift_before_commit: false,
     });
     dump_diags(&r, "privdbus");
     assert!(r.im2_seen_bind, "fcitx5 应已 bind im2");
@@ -626,6 +694,37 @@ fn real_fcitx5_private_dbus() {
     assert!(
         !cjk_commits(&r.ti_events).is_empty(),
         "私有总线形态也应出汉字 commit；ti3 事件: {:?}",
+        r.ti_events
+    );
+}
+
+/// sync7 生产事故回归（真 fcitx5）：在选词键（SPACE）事件之后注入一次
+/// 应用状态 done——fcitx5 在 key dispatch 回调里同步发出 commit，其回填
+/// serial 落后服务端 wire 计数一拍（实机日志「commit(serial=8…65)
+/// DROPPED」的确定化复现）。旧代码此批次被整批丢弃、汉字永不上屏；
+/// 修复后必须：mismatch 被真实触发（serial_mismatch_seen ≥ 1，排除用例
+/// 退化为普通提交）且真 fcitx5 汉字照常 commit 进编辑器 ti3。
+#[test]
+#[ignore = "真 fcitx5 端到端回归（本机跑）：serial 不符文本仍上屏"]
+fn real_fcitx5_serial_drift_still_commits() {
+    let r = run(&Variant {
+        tag: "drift",
+        fcitx_args: &["-D", "--disable=dbus"],
+        seed_config: true,
+        private_dbus: false,
+        drift_before_commit: true,
+    });
+    dump_diags(&r, "drift");
+    assert!(r.im2_seen_bind, "fcitx5 应已 bind im2");
+    assert!(r.im2_seen_grab, "fcitx5 应已 grab 键盘");
+    assert!(
+        r.serial_mismatch_seen >= 1,
+        "drift 注入应真实复现 serial 不符（否则用例退化为普通提交，证明不了修复）；seen={}",
+        r.serial_mismatch_seen
+    );
+    assert!(
+        !cjk_commits(&r.ti_events).is_empty(),
+        "serial 不符时真 fcitx5 汉字也必须上屏（sync7 旧逻辑此处全灭）；ti3: {:?}",
         r.ti_events
     );
 }

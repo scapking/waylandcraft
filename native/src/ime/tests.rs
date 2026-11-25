@@ -772,32 +772,47 @@ fn test_delete_surrounding_then_commit_order() {
     );
 }
 
-/// 过期 serial：IME 用错误 serial 提交 → 整批丢弃，编辑器零事件。
+/// 过期 serial（sync7 协议修正）：IME 用错误 serial 提交 → **文本照常
+/// 交付**（协议 input-method-unstable-v2 commit：mismatch 时 "proceed as
+/// normal, except it should not change the current state"），旧实现的
+/// 「整批丢弃」分支把 fcitx5 每个汉字都扔进黑洞（实机 51/51 DROPPED），
+/// 已按协议废除。serial 相符的重发同样是状态确认批。
 #[test]
-fn test_stale_serial_discards_batch() {
+fn test_stale_serial_still_delivers_text() {
     let mut f = setup();
     f.focus_and_enable();
     let im = f.ime.state.im.as_ref().unwrap().clone();
 
     f.editor.state.ti_events.clear();
     f.editor.state.dones.clear();
-    // 当前计数是 1（Activate 发过一次 done），用 99 显然过期。
-    im.commit_string("不应出现".to_string());
+    // 当前 wire 计数是 1（Activate 发过一次 done），99 显然不符。
+    im.commit_string("过期也要在".to_string());
     im.set_preedit_string("ghost".into(), 0, 5);
     im.commit(99);
     f.drive();
 
     assert!(
-        f.editor.state.ti_events.is_empty(),
-        "丢弃批次的任何事件都不允许到达 app"
+        f.editor.state.ti_events.contains(&"commit(\"过期也要在\")".to_string()),
+        "serial 不符的批次文本必须到达 app（永不丢字）；实际: {:?}",
+        f.editor.state.ti_events
     );
-    assert!(f.editor.state.dones.is_empty());
+    assert!(
+        f.editor.state.ti_events.contains(&"preedit(\"ghost\",0,5)".to_string()),
+        "同批 preedit 也必须照常交付"
+    );
+    assert_eq!(f.editor.state.dones.len(), 1, "文本落地后必须补发 ti3 done");
+    assert_eq!(f.server.ime.serial_mismatch_count(), 1, "mismatch 计数进 status 诊断");
 
-    // IME 以正确 serial 重发 → 正常应用（协议：照常处理后续请求）。
+    // IME 以正确 serial 重发 → 状态确认批，正常应用。
     im.commit_string("你好".to_string());
     im.commit(1);
     f.drive();
-    assert_eq!(f.editor.state.ti_events, vec!["commit(\"你好\")"]);
+    assert!(
+        f.editor.state.ti_events.contains(&"commit(\"你好\")".to_string()),
+        "serial 匹配的重发正常应用；实际: {:?}",
+        f.editor.state.ti_events
+    );
+    assert_eq!(f.server.ime.serial_mismatch_count(), 1, "匹配批不计 mismatch");
 }
 
 /// 焦点切换：A surface → 无焦点 → deactivate + leave；重新聚焦可恢复。
@@ -1232,4 +1247,122 @@ fn nested_stop_start_routes_im2_on_off() {
         .nested_command("start", std::time::Instant::now())
         .expect("start 有响应");
     assert!(reply.contains("启动"), "start 文案如实: {reply}");
+}
+
+// ═══════════════════════ sync7 serial 修复回归 ═══════════════════════
+
+/// 全事件序列（真实 fcitx5 走法逐拍对照）：bind → activate → 打键 preedit
+/// 演进 → 状态推送补 done → 候选选定 commit(serial) 上屏「你哈登」。
+/// 断言每一步 wire 事实：IME 端收到的事件流、编辑器收到的文本与 done。
+#[test]
+fn test_full_event_sequence_bind_activate_keys_commit() {
+    let mut f = setup(); // setup 已 get_input_method（bind）
+    f.ime.state.events.clear();
+    f.focus_and_enable(); // activate + done#1
+    assert_eq!(f.ime.state.events, vec!["activate", "done"]);
+
+    // 编辑器上报光标矩形 → 合成器 PushState + done#2（计数由 wire 层维护）。
+    let ti = f.editor.state.ti.clone().unwrap();
+    ti.set_cursor_rectangle(10, 20, 1, 18);
+    ti.commit();
+    f.drive();
+    assert_eq!(
+        f.ime.state.events.iter().filter(|e| e.as_str() == "done").count(),
+        2,
+        "wire 层已发 done 数应为 2；实际事件流: {:?}",
+        f.ime.state.events
+    );
+
+    // 组合期间不再推状态 → fcitx5 各步回填同一 serial=2。
+    let im = f.ime.state.im.as_ref().unwrap().clone();
+    for s in ["n", "ni", "nih", "niha", "nihao"] {
+        im.set_preedit_string(s.to_string(), s.len() as i32, s.len() as i32);
+        im.commit(2);
+        f.drive();
+    }
+    // 数字键选词上屏「你哈登」：清 preedit + commit_string + commit 同批。
+    f.editor.state.ti_events.clear();
+    im.set_preedit_string(String::new(), 0, 0);
+    im.commit_string("你哈登".to_string());
+    im.commit(2);
+    f.drive();
+    assert!(
+        f.editor.state.ti_events.contains(&"commit(\"你哈登\")".to_string()),
+        "全序列走完汉字必须上屏；实际: {:?}",
+        f.editor.state.ti_events
+    );
+    assert_eq!(f.server.ime.serial_mismatch_count(), 0, "全程 serial 与 wire 计数一致");
+}
+
+/// sync7 实机故障形态（wire 级复现）：选词 commit 已在途时，应用侧又推送了
+/// 一次状态 done——fcitx5 事件流里 key/commit 先于该 done，回填的 serial
+/// 落后 wire 实际已发数（实机日志 serial=8 起步逐个 DROPPED 的形态）。
+/// 修复后：文本照常上屏，仅记 mismatch 诊断，不丢字。
+#[test]
+fn test_serial_lag_behind_wire_done_still_delivers() {
+    let mut f = setup();
+    f.focus_and_enable(); // done#1（wire 计数=1）
+
+    // 编辑器状态变化 → PushState done#2 已发出（wire 计数=2）。
+    let ti = f.editor.state.ti.clone().unwrap();
+    ti.set_cursor_rectangle(30, 40, 1, 18);
+    ti.commit();
+    f.drive();
+    assert_eq!(f.server.ime.im2.done_count(), 2, "wire 事实源应为 2");
+
+    // 模拟 sync7 竞态：fcitx5 用尚未消费 done#2 的视角 serial=1 提交选词。
+    let im = f.ime.state.im.as_ref().unwrap().clone();
+    f.editor.state.ti_events.clear();
+    f.editor.state.dones.clear();
+    im.commit_string("你哈登".to_string());
+    im.set_preedit_string(String::new(), 0, 0);
+    im.commit(1); // 旧逻辑：1 != 2 → 整批 DROPPED，汉字全灭
+    f.drive();
+
+    assert!(
+        f.editor.state.ti_events.contains(&"commit(\"你哈登\")".to_string()),
+        "serial 落后一拍也必须上屏（sync7 回归核心）；实际: {:?}",
+        f.editor.state.ti_events
+    );
+    assert_eq!(f.editor.state.dones.len(), 1, "文本落地仍补发 ti3 done");
+    assert_eq!(f.server.ime.serial_mismatch_count(), 1);
+}
+
+/// 对象换代（daemon 重连顶替 input_method 实例）：wire 计数随新代际归零，
+/// 客户端若沿用旧对象的累计 serial → 不匹配也只影响状态确认，文本必须
+/// 照常到达 app。旧实现 relay 影子计数跨代保留，导致重连后永久全灭。
+#[test]
+fn test_im2_generation_replacement_still_delivers() {
+    let mut f = setup();
+    f.focus_and_enable(); // 代际 A：activate + done（计数=1）
+
+    // 顶替：销毁旧 input_method 对象，再建新的（fcitx5 进程级重连形态）。
+    let old = f.ime.state.im.take().unwrap();
+    old.destroy();
+    f.drive();
+    let qh = f.ime.qh();
+    let mgr = f.ime.state.manager.as_ref().unwrap().clone();
+    let seat = f.ime.state.seat.as_ref().unwrap().clone();
+    let new_im = mgr.get_input_method(&seat, &qh, ());
+    f.ime.state.im = Some(new_im.clone());
+    f.drive(); // note_im2_bound 代际 B：计数归 0 → 补 Activate + done（计数=1）
+
+    // 新对象若回填旧累计 serial=9（旧代码里 relay 计数跨代保留，此后每个
+    // commit 都不符且被丢弃）——现在校验按新代际实况，文本永不丢。
+    f.editor.state.ti_events.clear();
+    new_im.commit_string("重建后也要在".to_string());
+    new_im.commit(9);
+    f.drive();
+    assert!(
+        f.editor.state.ti_events
+            .contains(&"commit(\"重建后也要在\")".to_string()),
+        "换代后 serial 陈旧也必须上屏；实际: {:?}",
+        f.editor.state.ti_events
+    );
+    assert!(f.server.ime.serial_mismatch_count() >= 1);
+    assert_eq!(
+        f.server.ime.im2.done_count(),
+        1,
+        "新代际 done 计数从 0 起步（单一事实源归零）"
+    );
 }
