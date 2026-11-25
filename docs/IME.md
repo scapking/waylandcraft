@@ -356,15 +356,44 @@ raw 直通可用（sync4/5 修复），**中文始终打不出**。这是宿主�
   且禁 panel/config/emoji 子进程。实测（fcitx5 5.1.12，`ime/tests_real.rs`）
   pinyin 引擎**不依赖** dbus——libpinyin 直链，`--disable=dbus` 下
   preedit/候选/commit 全通。
-- **spawn 前种子配置**（`seed_fcitx5_home`，v0.14.1）：隔离 HOME 缺少
-  fcitx5 全局配置文件时，每个输入上下文都以"未激活"启动——
+- **spawn 前种子配置 v2（`seed_fcitx5_home_v2`）——全部已装引擎默认兼容**：
+  隔离 HOME 缺少 fcitx5 全局配置时，每个输入上下文都以"未激活"启动——
   fcitx5 `Instance::inputMethod(ic)` 在未激活时用**组内第一个 IM**
   （keyboard-us 直通引擎），这就是 sync6 实机"每键未消费、汉字永不出"
   的根因（`[Behavior] ActiveByDefault` 无显式默认值=false；取证链见
-  `nested_daemon` 模块注释与 `tests_real` 三组对照实验）。种子策略：
-  `config/fcitx5/profile`（keyboard-us+pinyin 组，DefaultIM=pinyin）与
-  `config/fcitx5/config`（`[Behavior] ActiveByDefault=True`）仅**缺失时**
-  写默认，已有用户文件绝不覆盖（缺关键项时在 ime.log 如实警告）。
+  `nested_daemon` 模块注释与 `tests_real` 三组对照实验）。v2 在此之上把
+  默认组扩成**用户在宿主上装的全部引擎**：
+  - 引擎发现：扫 `$XDG_DATA_HOME`/`$XDG_DATA_DIRS` 的
+    `fcitx5/inputmethod/*.conf`（默认值与 fcitx5 standardpath.cpp 一致）。
+    **引擎内部名=文件名 stem**（`inputmethodloader` 用
+    `fileName.substr(0,len-5)` 作 uniqueName；conf 里 `[InputMethod] Name=`
+    是显示名、语言键是 `LangCode=`），`Enable=False` 如实排除（如本机
+    cangjie 出厂即禁用）。宿主用户目录（`~/.local/share`）发现的引擎
+    会复制进隔离 `data/fcitx5/inputmethod`——嵌套实例的 XDG_DATA_HOME
+    指向隔离目录，不复制就只在 profile 挂名。
+  - profile 策略：宿主 `$XDG_CONFIG_HOME/fcitx5/profile` 存在且有效时
+    **镜像其组/条目**（组名 ASCII 化、去重、Layout 细节不拷）；否则
+    全量枚举默认组 `[keyboard-us, pinyin, …全部发现引擎升序]`，
+    DefaultIM=pinyin（存在时）否则 keyboard-us。
+  - 所有权标记 `# waylandcraft-seeded-v2`：带标记 → 启动时按最新发现
+    重写（升级路径，保留 fcitx5 记下的当前引擎）；无标记但恰为旧
+    v1/手种形态（{keyboard-us,pinyin} 集）→ 视为我们的旧种子升级；无标记
+    但条目集等于上次种子结果（fcitx5 退出保存会重写 profile 并丢标记）→
+    仍判 ours 重写；真正的用户自定义 → **绝不覆盖**，只在 ime.log 如实
+    列出缺少的已装引擎。
+  - `config/fcitx5/config`：`[Behavior] ActiveByDefault=True` +
+    **`[Hotkey/EnumerateForwardKeys] 0=Control+Shift+B`**。两个取证要点：
+    5.1.12 的 EnumerateForward/BackwardKeys **出厂默认为空**（"Ctrl+Shift+B
+    循环引擎"不是内置绑定，内置的只有 Ctrl+Space 触发+重复按枚举）；
+    且 fcitx5 的 KeyList 选项 INI 走 `vector<Key>` 子节点格式——必须写
+    嵌套节 `[Hotkey/EnumerateForwardKeys]` + `0=`，扁平
+    `EnumerateForwardKeys=Control+Shift+B` 会被解析为空列表（真机探针
+    验证）。config 的所有权判定与 profile 同构；用户文件不覆盖，缺
+    ActiveByDefault 如实警告。
+- **游戏内切换引擎**：`Ctrl+Shift+B` 逐个切到组内下一个引擎（循环，
+  回到 keyboard-us 档=停用）；`Ctrl+Space`（fcitx5 内置默认）激活/停用，
+  配合重复按可枚举。组合键经 im2 grab 送达引擎并被消费时**绝不 VK
+  直通**（wire 断言见 `nested_daemon::tests::ctrl_shift_b_chord_reaches_grab_with_modifiers`）。
 - **绝不 `--replace`/`-r`**——那会踢掉用户的宿主输入法实例；单测
   `spawn_plan_is_isolated_and_never_replaces` 把这条纪律写死在断言里。
 
@@ -398,23 +427,32 @@ raw 直通可用（sync4/5 修复），**中文始终打不出**。这是宿主�
 - settings 键 `imeNested`（auto|on|off，默认 auto），`/wl settings set
   imeNested auto|on|off`（别名 `nestedIme`）；responder 注册即触发启动期
   同步。
-- `/wl ime nested status` → mode/phase/kind/pid/im2/grab/vk 一行；
+- `/wl ime nested status` → mode/phase/kind/pid/im2/grab/vk 一行，种子执行
+  后追加 `; engines=N`（N=生效引擎数，不含 keyboard-us 直通档）；
   `start` 复位重试；`stop` 杀 pidfile 进程 + 进 Disabled 锁。
 - `status.log` 新增 `nested_ime` 子系统 + metrics `ime_route`
-  （im2-grab|im2|host_bridge|raw）。
+  （im2-grab|im2|host_bridge|raw）。ime.log 种子行输出发现引擎数量与
+  列表（截断）、镜像/枚举策略、所有权判定结果。
 
 ### 端到端实测清单（逻辑与 wire 层已用模拟 client 全测）
 
 1. **[已修]** 隔离 HOME 首次 profile/全局 config：spawn 前自动种默认
-   （`seed_fcitx5_home`），用户已有文件不覆盖。sync6 的"每键未消费"
-   根因即缺 `[Behavior] ActiveByDefault=True`（IC 未激活 → keyboard-us
-   直通），与 dbus/协议细节无关。
+   （v2 起为**全部已装引擎**，见上文"种子配置 v2"；用户自定义文件不
+   覆盖）。sync6 的"每键未消费"根因即缺 `[Behavior] ActiveByDefault=True`
+   （IC 未激活 → keyboard-us 直通），与 dbus/协议细节无关。
 2. **[已验证]** 真 fcitx5 端到端（`ime/tests_real.rs`，#[ignore]，
    本机跑通）：`real_fcitx5_production_spawn_path` 走完整生产链路
    nested_tick→种子→build_spawn_plan→spawn_daemon，nihao+空格 →
    preedit×5 + `commit("你哈登")` 经 im2→relay→ti3 回到编辑器；
    `real_fcitx5_seed_config_active_by_default` / `real_fcitx5_private_dbus`
    对照证明 ActiveByDefault 是唯一决定变量、私有总线形态行为一致。
-3. 待用户实测：游戏内（Minecraft 聊天框）打中文。
-4. ibus 路预计不 bind im2 → Starting 超时 → Failed 回退（如实上报，非 bug）。
+3. **[已验证]** 种子 v2 多引擎切换（`real_fcitx5_seed_v2_all_engines_switchable`，
+   本机跑通）：v2 种子 profile 带标记含 9 引擎、config 带嵌套节枚举热键
+   → 真 fcitx5 默认拼音 commit → 6 次 `Ctrl+Shift+B` 切到 wbpy（五笔拼音）
+   后同编码再次 commit → SIGTERM 退出保存 profile `DefaultIM=wbpy` 落盘
+   （切换真实发生的硬证）；wire 层另有
+   `nested_daemon::tests::ctrl_shift_b_chord_reaches_grab_with_modifiers`
+   证明和弦 press+release 与 Ctrl+Shift 修饰态按序到达引擎 grab。
+4. 待用户实测：游戏内（Minecraft 聊天框）打中文、切引擎。
+5. ibus 路预计不 bind im2 → Starting 超时 → Failed 回退（如实上报，非 bug）。
 
