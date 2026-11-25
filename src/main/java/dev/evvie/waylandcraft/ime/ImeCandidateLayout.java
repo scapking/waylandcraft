@@ -121,4 +121,87 @@ public final class ImeCandidateLayout {
 		return !wasShowing && f == null && hasFocusedBox
 				&& retained != null && retained.visible();
 	}
+
+	// ═══════════════ 世界形态（sync14）：窗口像素空间纯函数 ═══════════════
+	//
+	// 键盘捕获（CAPTURE/HARD_CAPTURE）下往游戏内应用窗口打字时 mc.screen==null，
+	// GUI 形态（focusedEditBox 锚定）无处显示——世界形态把候选窗贴到目标窗口
+	// quad 旁：所有坐标统一在**窗口平面局部像素空间**（origin=geometry 左上角，
+	// x 右 y 下，1 单位 = 1 窗口像素；渲染/命中经 WindowDisplay.localX/Y 换算到
+	// 世界单位）。纯函数零 MC 依赖，单测直打——与 GUI 形态的 positionOverlay/
+	// decideShowing 完全平行，GUI 侧行为零改动。
+
+	/**
+	 * 世界候选窗定位：锚 ti3 光标矩形（下方优先，放不下翻上方），
+	 * 无矩形（null 或 0x0 退化）回退锚窗口 quad 底部中央。
+	 *
+	 * 与 GUI 的 positionOverlay 不同点：世界空间没有屏幕边界，
+	 * 候选窗越出窗口范围只是浮进世界（仍可见可点选），故不做整体钳制，
+	 * 只在水平方向把起点收回窗口内（x ∈ [0, winW-popW]）保证贴窗观感。
+	 *
+	 * @param cursorRect ti3 光标矩形（平面局部像素），可 null
+	 * @param winW       窗口 geometry 宽（像素）
+	 * @param winH       窗口 geometry 高（像素）
+	 * @param popW/popH  候选帧像素尺寸
+	 * @param gap        光标矩形与候选窗的间距（像素）
+	 * @return 候选窗矩形（平面局部像素，w=popW h=popH 与帧 1:1）；参数无效 → null
+	 */
+	public static Rect positionWorldPopup(Rect cursorRect, int winW, int winH, int popW, int popH, int gap) {
+		if(popW <= 0 || popH <= 0 || winW <= 0 || winH <= 0) return null;
+		int x = 0;
+		int y;
+		if(cursorRect == null || (cursorRect.w() <= 0 && cursorRect.h() <= 0)) {
+			// 回退锚：窗口底部中央（应用没发 set_cursor_rectangle 时）。
+			x = (winW - popW) / 2;
+			y = winH + gap;
+		} else {
+			int ax = Math.max(0, Math.min(cursorRect.x(), Math.max(0, winW - 1)));
+			int ay = Math.max(0, Math.min(cursorRect.y(), Math.max(0, winH - 1)));
+			int below = ay + Math.max(cursorRect.h(), 1) + gap;
+			// 下方优先；越出窗口底边翻到光标矩形上方。
+			y = below + popH <= winH ? below : ay - gap - popH;
+			x = Math.max(0, Math.min(ax, Math.max(0, winW - popW)));
+		}
+		return new Rect(x, y, popW, popH);
+	}
+
+	/**
+	 * surface 局部像素 → 窗口平面局部像素。
+	 * 逆 {@code WindowDisplay.intersect} 的正变换
+	 * （localCoords = geometryLocal + (geometry.x, geometry.y)，再减 surface.xSubpos/ySubpos）。
+	 * HARD_CAPTURE 的虚拟光标（surface 局部）用它换算到候选矩形同一空间。
+	 */
+	public static double[] surfaceLocalToPlaneLocal(double sx, double sy,
+			double xSubpos, double ySubpos, int geometryX, int geometryY) {
+		return new double[] { sx + xSubpos - geometryX, sy + ySubpos - geometryY };
+	}
+
+	/**
+	 * 平面局部像素命中点 → popup 表面局部像素（ime_popup_click/axis 的回传坐标）。
+	 * 世界形态显示矩形与帧像素 1:1（不像 GUI 可能被钳压缩），映射即平移 +
+	 * 帧内防御钳制；命中点不在矩形内 → null。
+	 */
+	public static int[] worldHitToPopupLocal(Rect popup, double planeX, double planeY) {
+		if(popup == null || !popup.contains(planeX, planeY)) return null;
+		int lx = (int) Math.floor(planeX - popup.x());
+		int ly = (int) Math.floor(planeY - popup.y());
+		if(lx < 0) lx = 0; else if(lx >= popup.w()) lx = popup.w() - 1;
+		if(ly < 0) ly = 0; else if(ly >= popup.h()) ly = popup.h() - 1;
+		return new int[] {lx, ly};
+	}
+
+	/**
+	 * 世界形态显隐（decideShowing 的语境参数化，不改变其合同）：
+	 * GUI 的「聚焦输入框在场」↔ 世界的「目标窗口在场且聚焦」。
+	 * f.visible() 在 native 侧已含「IME 会话激活」门（take_popup_snapshot），
+	 * 窗口销毁/失焦（windowInPlace=false）即时隐藏。
+	 */
+	public static boolean decideShowingWorld(boolean wasShowing, Frame f, boolean windowInPlace) {
+		return decideShowing(wasShowing, f, windowInPlace);
+	}
+
+	/** 世界形态焦点恢复补显（shouldReshowCurrent 的同款语境映射）。 */
+	public static boolean shouldReshowCurrentWorld(boolean wasShowing, Frame f, boolean windowInPlace, Frame retained) {
+		return shouldReshowCurrent(wasShowing, f, windowInPlace, retained);
+	}
 }

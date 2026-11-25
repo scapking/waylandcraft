@@ -65,6 +65,14 @@ public final class ImeCandidateOverlay {
 	private static DynamicTexture texture;
 	private static int texW, texH;
 	private static boolean workState; // native「引擎工作态」（角标原料，纯读）
+	/**
+	 * 世界形态帧保留位（sync14）：与 GUI 的 current 生命周期同步推进
+	 * （visible 帧→顶替、invisible 交付→清空），但**不受 GUI 显隐影响**——
+	 * 键盘捕获场景 hasBox=false 时 applyTransition 不更新 current（既有 GUI
+	 * 合同，逐字节保留），世界通道需要最近一次 native visible 帧作原料。
+	 * 消费方：{@link ImeCandidateWorld}（只读 + ensureWorldTexture 共用纹理）。
+	 */
+	private static Frame worldFrame;
 
 	// ═══════════════════════════ 观测层计数 ═══════════════════════════
 
@@ -129,6 +137,12 @@ public final class ImeCandidateOverlay {
 		// 判定；==0 而 native gate 快照显示 visible=true = 断在编码/JNI 传输。
 		if(f != null && f.visible()) {
 			incomingVisible++;
+		}
+		// 世界形态原料（sync14）：与 incomingVisible 同点位记录"最近一次 native
+		// visible 帧"。invisible 交付 = 协议宣告隐藏（会话结束/attach(NULL) 已交付
+		// 帧/hold 到期）→ 清；f==null = 无新状态 → 维持。GUI 显隐逻辑不受影响。
+		if(f != null) {
+			worldFrame = f.visible() ? f : null;
 		}
 		applyTransition(f, box != null, mc);
 		logStateTransition(raw != null, box != null);
@@ -226,6 +240,32 @@ public final class ImeCandidateOverlay {
 	/** 命中矩形（Phase 3 拦截判定；null=不可交互）。 */
 	public static Rect hitRect() {
 		return showing ? lastRect : null;
+	}
+
+	// ════════════════ 世界形态原料出口（sync14，ImeCandidateWorld 消费）════════════════
+
+	/** 最近一次 native visible 帧（invisible 交付后为 null）。只读。 */
+	public static Frame peekWorldFrame() {
+		return worldFrame;
+	}
+
+	/**
+	 * 确保世界形态帧纹理就绪：纹理缺失/尺寸不符时用保留帧重传
+	 * （与 GUI 共用同一 DynamicTexture——两形态显示门天然互斥：
+	 * GUI 要求 focusedEditBox ⇒ screen!=null；世界要求 screen==null）。
+	 * 仅渲染线程调用（与 tick/uploadFrame 同线程）。
+	 * @return true = 纹理就绪且尺寸与帧一致
+	 */
+	public static boolean ensureWorldTexture(Frame f) {
+		if(f == null || !f.visible() || f.width() <= 0 || f.height() <= 0) return false;
+		if(texture != null && texW == f.width() && texH == f.height()) return true;
+		uploadFrame(f);
+		return texture != null && texW == f.width() && texH == f.height();
+	}
+
+	/** 候选窗纹理的 Identifier（世界 quad 与 GUI blit 共用同一条动态纹理）。 */
+	public static Identifier worldTextureId() {
+		return TEXTURE;
 	}
 
 	// ═══════════════════════════ Phase 3 输入回传 ═══════════════════════════
@@ -394,6 +434,8 @@ public final class ImeCandidateOverlay {
 	 * texture=false → GL 上传断链（uploadFails>0 佐证）。
 	 */
 	private static void logStateTransition(boolean frameDelivered, boolean hasBox) {
+		// sync14 观测扩展：worldVisible = 世界形态（键盘捕获 → 应用窗口旁候选 quad）
+		// 显示中。本行在 ImeCandidateWorld.tick 之前打，滞后一 tick（观测字段无害）。
 		String tuple = "(frame=" + frameDelivered
 				+ ", visible=" + (current != null && current.visible())
 				+ ", hasBox=" + hasBox
@@ -405,8 +447,9 @@ public final class ImeCandidateOverlay {
 		lastTupleMs = now;
 		lastLoggedTuple = tuple;
 		WaylandCraftCommon.LOGGER.info(
-				"[ime][overlay] 状态五元组 {} | polls={} frames={} incomingVisible={} exceptions={} uploadFails={} reshow={} extracts={} workState={}",
-				tuple, polls, framesDelivered, incomingVisible, pollExceptions, uploadFails, reshowCount, extractHits, workState);
+				"[ime][overlay] 状态五元组 {} | polls={} frames={} incomingVisible={} exceptions={} uploadFails={} reshow={} extracts={} workState={} worldVisible={}",
+				tuple, polls, framesDelivered, incomingVisible, pollExceptions, uploadFails, reshowCount, extractHits, workState,
+				ImeCandidateWorld.isWorldVisible());
 	}
 
 	private static int clampInt(int v, int lo, int hi) {

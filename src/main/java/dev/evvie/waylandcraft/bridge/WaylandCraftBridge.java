@@ -1018,6 +1018,15 @@ public class WaylandCraftBridge {
 		return imePopupWorkStateNative(instance);
 	}
 
+	/** 世界形态候选窗锚定原料（sync14）：最近一次 ti3 光标矩形
+	 * {@code [x, y, w, h]}（聚焦应用 surface 像素坐标，与候选窗帧同源）；
+	 * **null = 应用尚未上报 set_cursor_rectangle**——世界渲染回退锚窗口
+	 * quad 底部中央。独立只读通道，不消耗 popup epoch、与
+	 * {@code ime_popup_frame} 的 13 字节头编码合同正交。 */
+	public int[] imePopupAnchor() {
+		return imePopupAnchorNative(instance);
+	}
+
 	/** {@code /wl ime info}：nested/种子引擎/候选窗统计/工作态/路由 多行报告。 */
 	public String imeInfo() {
 		return imeInfoNative(instance);
@@ -1365,6 +1374,11 @@ public class WaylandCraftBridge {
 	private static native byte[] imePopupFrameNative(long instance);
 	// Chinese-engine work state (preedit stream live) — overlay badge input, pure read.
 	private static native boolean imePopupWorkStateNative(long instance);
+	// World-space candidate anchor (sync14): last ti3 cursor rect [x,y,w,h] in
+	// focused app-surface pixels; null = app never reported set_cursor_rectangle.
+	// Independent read-only channel — does not consume the popup epoch nor touch
+	// the 13-byte ime_popup_frame header encoding contract.
+	private static native int[] imePopupAnchorNative(long instance);
 	// /wl ime info: nested + seeded engines + popup stats + work state, multi-line.
 	private static native String imeInfoNative(long instance);
 	// Forward a click on the in-game candidate overlay back to the popup surface (Phase 3).
