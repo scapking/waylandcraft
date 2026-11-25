@@ -49,6 +49,7 @@
 
 mod ime_event;
 mod input_method_v2;
+mod nested_daemon;
 mod relay;
 mod text_input_v3;
 mod virtual_keyboard;
@@ -58,6 +59,7 @@ pub use ime_event::{
     LookupTable, PreeditUpdate, SurroundingText, UpEvent,
 };
 pub use input_method_v2::InputMethodV2State;
+pub use nested_daemon::{NestedIme, NestedMode, NestedPhase};
 pub use relay::{AppState, ImeCommand, ImeOp, Relay, TiCommand};
 pub use text_input_v3::TextInputV3State;
 use text_input_v3::Ti3CommitOutcome;
@@ -117,6 +119,9 @@ pub struct ImeState {
 
     /// im2 客户端对象是否在位（bind 过 get_input_method 且未销毁）。
     im2_bound: bool,
+
+    /// 嵌套 IME daemon 生命周期 + 路由决策（imeNested auto|on|off）。
+    pub(crate) nested: NestedIme,
 }
 
 impl ImeState {
@@ -145,11 +150,66 @@ impl ImeState {
         self.im2.grab.is_some()
     }
 
-    /// 嵌套 IM 主路径是否在线：im2 客户端 bind 且在位。
-    /// bridge.rs keyboard_input 用它决定「键送 im2 通道」还是「回退
-    /// host_bridge/raw」。grab 是否在场由 handle_key 内部再判。
+    /// 嵌套 IM 主路径是否在线（路由决策核心，⑥ 决策行见 nested_daemon）：
+    /// mode≠off、未被用户 stop 锁 Disabled、im2 客户端在位、relay 认为
+    /// IME 端点上线。bridge.rs keyboard_input 用它决定
+    /// 「键送 im2 通道（grab 在场）/ raw 直通（无 grab）」还是
+    /// 「回退 v0.13 host_bridge consumed 分流」。
     pub fn nested_route_live(&self) -> bool {
-        self.im2_bound && self.relay.ime_present()
+        self.nested.mode() != NestedMode::Off
+            && !matches!(self.nested.phase(), NestedPhase::Disabled)
+            && self.im2_bound
+            && self.relay.ime_present()
+    }
+
+    /// 每帧由 WaylandCraft::update() 调用：驱动 daemon 探活/退避/spawn 决策。
+    /// spawn 在主线程同步执行（双 fork 后立即返回，无阻塞等待）。
+    pub fn nested_tick(&mut self, now: std::time::Instant, socket: &std::ffi::OsStr) {
+        self.nested.set_socket(socket);
+        let im2_bound = self.im2_bound;
+        if let Some(req) = self.nested.decide(now, im2_bound, nested_daemon::proc_comm_matches) {
+            let kind = req.kind;
+            let result = nested_daemon::spawn_daemon(&req.plan);
+            self.nested.note_spawn_result(kind, result, now);
+        }
+    }
+
+    /// `/wl ime nested [status|start|stop]` 入口（JNI 桥调用）。
+    pub fn nested_command(&mut self, sub: &str, now: std::time::Instant) -> Option<String> {
+        match sub {
+            "status" => Some(self.nested_status_line()),
+            "start" => Some(self.nested.request_start(now)),
+            "stop" => Some(self.nested.request_stop()),
+            _ => None,
+        }
+    }
+
+    /// status 汇总行（status.rs 子系统 + /wl ime nested status 共用）。
+    pub fn nested_status_line(&self) -> String {
+        self.nested
+            .status_line(self.im2_bound, self.im2.grab.is_some(), self.vks.count())
+    }
+
+    /// settings 注入：mode 字符串（auto|on|off），非法返回 false 不改状态。
+    pub fn nested_set_mode(&mut self, raw: &str) -> bool {
+        self.nested.set_mode(raw)
+    }
+
+    /// settings 注入：隔离 HOME（<gameDir>/waylandcraft/ime-nested）。
+    pub fn nested_set_home(&mut self, path: &std::path::Path) {
+        self.nested.set_home(path);
+    }
+
+    /// daemon 相位的稳定短名（status.rs 用，避免 Display Debug 泄漏到协议面）。
+    pub fn nested_phase_name(&self) -> &'static str {
+        match self.nested.phase() {
+            NestedPhase::Disabled => "disabled",
+            NestedPhase::Unconfigured => "unconfigured",
+            NestedPhase::NoBinary => "no_binary",
+            NestedPhase::Starting => "starting",
+            NestedPhase::Active => "active",
+            NestedPhase::Failed(_) => "failed",
+        }
     }
 
     /// 创建 protocol globals。
@@ -533,6 +593,11 @@ impl ImeState {
         action: KeyboardAction,
         mods: (u32, u32, u32, u32),
     ) -> bool {
+        // 路由裁决：mode=off / 用户 stop 后即使残留 grab 对象（daemon 断连
+        // 清理要等一轮 dispatch）也绝不把键交给它。
+        if !self.nested_route_live() {
+            return false;
+        }
         let Some(grab) = &self.im2.grab else {
             return false;
         };
