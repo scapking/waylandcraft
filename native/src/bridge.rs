@@ -442,6 +442,14 @@ bind_java_type! {
             name = "imePopupWorkStateNative",
             fn = ime_popup_work_state,
         },
+        // 世界形态候选窗锚定（sync14）：最近一次 ti3 光标矩形 int[4]=[x,y,w,h]
+        // （聚焦应用 surface 像素坐标）；null = 应用尚未上报。独立只读通道，
+        // 不触碰 ime_popup_frame 的 13 字节头编码合同、不消耗 epoch。
+        static extern fn ime_popup_anchor {
+            sig = (instance: jlong) -> jint[],
+            name = "imePopupAnchorNative",
+            fn = ime_popup_anchor,
+        },
         // /wl ime info：nested/种子/候选窗统计/工作态 多行报告，纯读。
         static extern fn ime_info {
             sig = (instance: jlong) -> JString,
@@ -2053,6 +2061,29 @@ fn ime_popup_work_state<'local>(
 ) -> Result<jboolean, BridgeError> {
     let instance = jptr_to_instance!(instance, "imePopupWorkState")?;
     Ok(instance.state.ime.popup_work_state())
+}
+
+/// imePopupAnchor(instance) —— 世界形态候选窗锚定原料（sync14）。
+///
+/// 返回聚焦应用最近一次 ti3 `set_cursor_rectangle` 的矩形 `[x, y, w, h]`
+/// （该 surface 的像素坐标，与候选窗帧同源自 nested IME 会话）；应用尚未
+/// 上报时返回 **null**——Java 世界渲染据此回退锚窗口 quad 底部中央。
+/// 独立只读通道：不消耗 popup epoch、不改 `ime_popup_frame` 的 13 字节头
+/// 编码合同（该合同由 tests_popup 与 ImeCandidateLayoutTest 双侧 golden
+/// 锁死，本函数与之正交）。每 tick 轮询安全（一次 Option 拷贝）。
+fn ime_popup_anchor<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JPrimitiveArray<'local, jint>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imePopupAnchor")?;
+    let Some((x, y, w, h)) = instance.state.ime.popup_anchor() else {
+        return Ok(JPrimitiveArray::null());
+    };
+    let rect: [jint; 4] = [x, y, w, h];
+    let array = JIntArray::new(env, 4)?;
+    array.set_region(env, 0, &rect)?;
+    Ok(array)
 }
 
 /// imeInfo(instance) —— /wl ime info 多行报告：nested 状态、已种引擎、

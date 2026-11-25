@@ -214,6 +214,16 @@ impl ImeState {
         self.popup.surface().cloned()
     }
 
+    /// 最近一次已知的聚焦应用 ti3 光标矩形（x, y, w, h，**该 surface 像素坐标**）。
+    /// 世界形态候选窗的锚定原料（`ime_popup_anchor` JNI 只读出口）：
+    /// push_state_events 在应用每次 ti3 commit 时同步（st.cursor_rect 原样写入），
+    /// 应用未报光标时为 None——Java 侧回退锚窗口 quad 底部中央。
+    /// 纯读零副作用：不消耗 epoch、不碰采集轨道（`ime_popup_frame` 的
+    /// 13 字节头编码合同不受本通道影响）。
+    pub(crate) fn popup_anchor(&self) -> Option<(i32, i32, i32, i32)> {
+        self.im2.last_cursor_rect
+    }
+
     /// 若销毁对象就是当前 popup 且其 surface 仍存活 → 返回它以补 pointer
     /// leave（client 侧 pointer 焦点一致性，见 seat::popup_pointer_leave）。
     pub(crate) fn popup_pointer_target(&self, popup_id: smithay::reexports::wayland_server::backend::ObjectId) -> Option<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface> {
@@ -367,6 +377,16 @@ impl ImeState {
         out.push_str(&format!("会话: app_active={} focus={} grab={} serial_mismatch={}\n",
             self.relay.app_active(), self.has_focus, self.keyboard_grabbed(), self.serial_mismatch_commits));
         out.push_str(&format!("候选窗: {}\n", self.popup_status_brief(kb_active)));
+        // 世界形态锚定原料（sync14）：最近一次 ti3 光标矩形（聚焦应用 surface
+        // 像素坐标）。None/0x0 = 应用尚未上报光标位置 → Java 世界渲染回退锚
+        // 窗口 quad 底部中央（锚定模式判读见 Java 侧 /wl ime info 的 anchor= 行）。
+        out.push_str(&format!(
+            "光标矩形(ti3): {}\n",
+            match self.im2.last_cursor_rect {
+                Some((x, y, w, h)) => format!("({x},{y}) {w}x{h}"),
+                None => "None（应用未上报 set_cursor_rectangle）".to_string(),
+            }
+        ));
         out.push_str(&format!("引擎工作态(预编辑流在场): {} —— 协议不暴露引擎名，此为「中文引擎工作态」判定\n", self.popup_work_state()));
         out
     }
@@ -1189,6 +1209,33 @@ mod facade_tests {
         // 会话 enable 但 im2 端点不在 → 仍 false（popup_ime_active 门）。
         ime.relay.set_app_enabled(true, "test");
         assert!(!ime.popup_work_state());
+    }
+
+    #[test]
+    fn popup_anchor_reads_last_cursor_rect() {
+        // 世界形态锚定原料（sync14）：popup_anchor 是 im2.last_cursor_rect 的
+        // 只读镜像——默认 None（应用还没发 set_cursor_rectangle），置值后原样
+        // 透出；纯读不推进任何 epoch/计数（ime_popup_frame 编码合同零影响）。
+        let mut ime = ImeState::default();
+        assert_eq!(ime.popup_anchor(), None);
+        ime.im2.last_cursor_rect = Some((12, 30, 1, 18));
+        assert_eq!(ime.popup_anchor(), Some((12, 30, 1, 18)));
+        // 归零矩形原样透出（0x0 由 Java 侧判为无效并回退窗口底部锚）。
+        ime.im2.last_cursor_rect = Some((0, 0, 0, 0));
+        assert_eq!(ime.popup_anchor(), Some((0, 0, 0, 0)));
+        assert_eq!(ime.popup.epoch(), 0, "锚点纯读不得动采集轨道");
+        assert_eq!(ime.popup.deliveries(), 0);
+    }
+
+    #[test]
+    fn ime_info_reports_cursor_rect_line() {
+        // /wl ime info 锚定透明化：光标矩形行存在且反映当前值（sync14）。
+        let mut ime = ImeState::default();
+        let report = ime.ime_info(false);
+        assert!(report.contains("光标矩形(ti3): None"), "{report}");
+        ime.im2.last_cursor_rect = Some((5, 7, 2, 20));
+        let report = ime.ime_info(false);
+        assert!(report.contains("光标矩形(ti3): (5,7) 2x20"), "{report}");
     }
 
     #[test]
