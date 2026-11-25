@@ -28,7 +28,7 @@ double-buffered 状态机**，正确性由 serial 纪律、原子性、生命周
 | 2 | 宿主事件拆进三条独立缓冲（committed/preedit/delete）分别转发 | 一个 done 周期内必须按 删除→插入→preedit 固定次序应用 | `delete_surrounding + commit` 批次乱序 → 选区重组产出错误文本 |
 | 3a | `clear_focus()` 发 `deactivate+done` 却不给计数器 +1 | im-v2：`commit(serial)` 的 serial 必须等于该对象已收到的 done 总数 | 焦点切换一次后，所有后续组合的 serial 全部「过期」→ 整批静默丢弃 |
 | 3b | `ti3_serial` 是全局共享计数器 | serial 按「该 text_input 对象收到的 commit 请求数」per-instance 计数 | 多客户端交错提交时 serial 彻底混乱 |
-| 3c | im2 事件收到即转发，不等 `commit(serial)` 校验 | 不匹配时合成器必须整批丢弃、不改变状态 | 「丢弃」时污染早已到达 App，丢弃机制形同虚设 |
+| 3c | im2 事件收到即转发，不等 `commit(serial)` 校验 | 不匹配时合成器不得改变对象状态（**并非丢弃文本**——sync8 勘误：协议原文 "proceed as normal, except it should not change the current state"） | 「丢弃」时污染早已到达 App，丢弃机制形同虚设 |
 | 4 | 同时广播 ti_v1/im_v1 与 ti_v3/im_v2；KWin BLOCKED 用 15 秒轮询重建 | — | ibus 被 v1 吸走造成行为分叉；轮询救不了结构性问题 |
 
 ### 新代码为什么可以
@@ -91,9 +91,9 @@ WaylandCraft 同时扮演两个角色：
 
 | 模块 | 职责 | 禁止事项 |
 |---|---|---|
-| `ime/relay.rs` | **纯逻辑协议中继**：serial 记账、enable/disable 生命周期、IME 变更原子缓冲与丢弃判定。零 Wayland 类型依赖 | 不碰任何 wire 对象 |
+| `ime/relay.rs` | **纯逻辑协议中继**：enable/disable 生命周期、IME 变更原子缓冲与 serial 校验裁决（对照显式传入的 wire 计数；不符不丢文本）。零 Wayland 类型依赖 | 不碰任何 wire 对象；不维护权威 done 计数（只读镜像除外） |
 | `ime/text_input_v3.rs` | ti3 wire 层：manager/object Dispatch、double-buffer pending、per-instance commit 计数 | 不做语义裁决 |
-| `ime/input_method_v2.rs` | im2 wire 层：对象管理、键盘 grab 种子化、popup 矩形上报 | 不做语义裁决 |
+| `ime/input_method_v2.rs` | im2 wire 层：对象管理、键盘 grab 种子化、popup 矩形上报、**per-代际 done 计数（commit serial 校验的唯一事实源）** | 不做语义裁决 |
 | `ime/mod.rs` | 门面：全局对象注册、端点选择/切换、命令执行分发 | — |
 | `system_ime.rs` | 宿主穿透客户端：连接管理、enable 调和状态机、保序事件缓冲、反向同步执行 | 不含任何定时器/轮询 |
 | `seat.rs` | 键盘/指针焦点与原始键转发（键盘输入域，与文本输入严格分离） | — |
@@ -123,9 +123,10 @@ v1 是废弃路径（功能性子集），同时广播会诱导 ibus 退回 v1 �
 
 游戏内 IME（端点 A，如直接跑在游戏合成器上的 fcitx5）：
 ```
-App enable → Relay Activate → im2 activate+state+done
+App enable → Relay Activate → im2 activate+state+done（wire 计数 +1）
 IME preedit/commit_string/delete + commit(serial)
-  → Relay 校验 serial → 整批应用 → ti3 事件 + done(commit计数)
+  → Relay 对照 wire done 计数校验（单一事实源）→ 批次一律交付
+    （sync8：serial 不符不再丢文本）→ ti3 事件 + done(commit计数)
 ```
 
 宿主穿透（端点 B，默认主路径）：
@@ -178,18 +179,48 @@ seat 键盘焦点变化（bridge::keyboard_focus / keyboard_unfocus）
 | 合成器 → IME | `done()`（无参数） | 每次 activate/deactivate/状态推送后必发一次 |
 | App → 合成器 | `commit()`（无参数） | double-buffer 应用点 |
 
-- `commit(serial)` 与计数不符 → **整批丢弃**（协议："proceed as normal,
-  except it should not change the current state"），app 零感知。
-- IME 重连即从计数 0 开始（新对象新基准）。
+- `commit(serial)` 与计数不符 → **照常交付文本，仅不改变该 im2 对象的
+  current state**（协议原文 "proceed as normal, except it should not
+  change the current state"）。sync7 及以前把它错读成「整批丢弃」，
+  叠加双计数漂移后造成实机 51/51 汉字全部丢失——sync8 已修正。
+- **计数单一事实源**：IME 侧 done 计数只由 wire 层
+  （`input_method_v2.rs::Im2Instance::done_count`）维护——每次实际发出
+  done 才 +1，对象换代/销毁即归零；`Relay::ime_done_count` 只是经
+  `mirror_done_count` 同步的只读诊断镜像，不参与任何判定。IME 重连即从
+  计数 0 开始（新对象新基准）。
 - 穿透方向的 serial 校验由宿主合成器完成；到达 Relay 的批次视为已校验，
   通过无条件的 `ime_flush()` 应用。
+
+### sync8 修正：serial 漂移与「永不丢文本」（2026-11-25 实机取证）
+
+sync7 实机（`waylandcraft-ime.log` 16:29–16:48）：拼音、数字选词链路全通
+（fcitx5.log 有候选），但 relay 打出 51/51 条 `im2 commit(serial=N)
+DROPPED`，每个汉字都被丢弃——「伪可用」。两个叠加缺陷：
+
+1. **双计数器漂移**：`relay.ime_done_count` 在命令*排队*时乐观自增，
+   wire 层 `Im2Instance.done_count` 在 done *实发*时自增。三处「relay 记了
+   数但 wire 没发」路径（`clear_focus` 末尾丢弃 focus_lost 返回的命令、
+   `push_app_state` 返回值被 `let _ =` 吞掉、im2 对象顶替换代时 wire 归零
+   而 relay 保留旧值）使两者永久错位，此后所有 commit 全灭。
+2. **不符即丢文本违反协议**：serial 校验基准被错读。协议要求 mismatch 时
+   文本照常处理、仅不改变对象 current state——relay 层近似无操作。
+
+修复形态：done 计数单一事实源 = wire 层 per-代际计数（`ime_commit` 显式
+传入校验；relay 侧只留 `mirror_done_count` 诊断镜像）；mismatch 批次照常
+交付并打双计数 WARN 进 ⑥ error ring（相邻去重）；无内容裸 commit（fcitx5
+`updatePreeditDelegate` 面板清空时的正常行为）单独安静记录，不再共用
+DROPPED 文案。回归覆盖：relay 单测（wire 计数为 0/落后/镜像污染三形态）、
+tests.rs 全事件序列 + serial 竞态 + 换代顶替、tests_real.rs 真 fcitx5
+`real_fcitx5_serial_drift_still_commits`（在 SPACE 选词键事件之后注入一次
+状态 done，确定化复现 serial 落后一拍）。
 
 ## 6. Preedit / Commit 工作方式
 
 一个组合周期（以拼音 nihao → 你好 为例）：
 
 1. IME 每步发送 `preedit_string("n"…"nihao") + commit(serial)`；
-2. Relay 缓冲操作，serial 匹配后整批放行；
+2. Relay 缓冲操作，`commit(serial)` 到达即整批放行（serial 与 wire 计数
+   不符也放行——sync8 起永不丢文本，不符仅不做状态确认并出 WARN 诊断）；
 3. 编辑器收到 `preedit_string` … `done(N)`，N = 它自己发过的 commit 数；
 4. 选定候选：`preedit_string("")` + `commit_string("你好")` 同批到达，
    编辑器按协议固定次序应用：替换旧 preedit → 删除 surrounding → 插入
@@ -209,8 +240,9 @@ cargo test --lib ime::           # 仅 IME 子系统（20 个）
 
 两层测试：
 
-- **relay 单元测试**（9 个）：纯逻辑状态机的 serial 链、丢弃语义、
-  端点重连、焦点丢失、组合全流程。
+- **relay 单元测试**：纯逻辑状态机的 serial 链、mismatch 永不丢文本
+  （sync8 回归：wire 计数为 0 / 陈旧 serial / 镜像污染三形态）、空批与
+  mismatch 可区分、端点重连、焦点丢失、组合全流程。
 - **线缆级集成测试**（11 个，`ime/tests.rs`）：真实 `Display<WLCState>`
   （无 GPU 模式，dmabuf 关闭）+ 两个真实 wayland-client 连接——
   「编辑器」（ti3 客户端）与「模拟 fcitx5」（im2 客户端），覆盖：
