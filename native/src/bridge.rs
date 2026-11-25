@@ -52,6 +52,24 @@ use thiserror::Error;
 /// Rust 侧是否真的收到/发出按键（eprintln 只进 stderr，不进 latest.log）。
 static KB_LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
+/// ⑥ 统一日志时间戳：本地时 [HH:MM:SS.mmm]（失败回退 epoch 秒）。
+/// 没有它，Java latest.log（带时间戳）与 Rust 侧文件（不带）无法对时；
+/// IME/按键/音频跨层链路只能靠行序人肉对齐。统一后所有 Rust 日志行可对齐。
+pub fn log_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dur = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(d) => d,
+        Err(e) => return format!("[epoch=-{}]", e.duration().as_secs()),
+    };
+    let secs = dur.as_secs() as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::localtime_r(&secs, &mut tm) };
+    if ok.is_null() {
+        return format!("[epoch={}]", dur.as_secs());
+    }
+    format!("[{:02}:{:02}:{:02}.{:03}]", tm.tm_hour, tm.tm_min, tm.tm_sec, dur.subsec_millis())
+}
+
 /// 追加一行到 KB_LOG_FILE（若已设置），失败静默忽略。
 pub fn kb_log_write(s: &str) {
     use std::io::Write;
@@ -60,7 +78,7 @@ pub fn kb_log_write(s: &str) {
         Err(_) => return,
     };
     if let Some(f) = guard.as_mut() {
-        let _ = writeln!(f, "{s}");
+        let _ = writeln!(f, "{} {s}", log_timestamp());
         let _ = f.flush();
     }
 }
@@ -79,7 +97,7 @@ pub fn audio_log_write(s: &str) {
         Err(_) => return,
     };
     if let Some(f) = guard.as_mut() {
-        let _ = writeln!(f, "{s}");
+        let _ = writeln!(f, "{} {s}", log_timestamp());
         let _ = f.flush();
     }
 }
@@ -99,7 +117,7 @@ pub fn ime_log_write(s: &str) {
         Err(_) => return,
     };
     if let Some(f) = guard.as_mut() {
-        let _ = writeln!(f, "{s}");
+        let _ = writeln!(f, "{} {s}", log_timestamp());
         let _ = f.flush();
     }
 }
