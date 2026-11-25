@@ -76,9 +76,12 @@ pub(crate) struct WaylandCraft<'a> {
     pub egl: EGLHelper,
     pub xdg: XDGSpecHelper,
     /// 宿主 IME 桥接（dbus-ibus / dbus-fcitx5）。
-    /// 启动时探测一次；连接断开后由 update() 重建。
-    /// 当前用途：C 方案 Layer 3 等待 XIM server 上线后启用。
+    /// ⑧：update() 周期重探——缺失/dead/not-ready 时按 next_host_probe
+    /// 节流重建（此前注释宣称"断开后由 update() 重建"从未实现，
+    /// 导致启动时 IME daemon 未就绪 = 整个会话键盘直通失效、永不恢复）。
     pub host_bridge: Option<crate::host_bridge::HostBridgeHandle>,
+    /// ⑧ 下次 host_bridge 重探测时刻（Transient/Unsupported 5s、Ready 死亡也走同一路）
+    pub next_host_probe: std::time::Instant,
     /// 启动时间（v0.13.4 status.rs 用）。`Instant` 而非 `SystemTime`——
     /// 状态报告关心"uptime 秒数"，不关心 wall clock。
     pub start_time: std::time::Instant,
@@ -419,6 +422,7 @@ pub(crate) fn wlc_init(
         egl,
         xdg,
         host_bridge,
+        next_host_probe: std::time::Instant::now() + std::time::Duration::from_secs(5),
         start_time: std::time::Instant::now(),
     };
     Ok(instance)
@@ -470,6 +474,32 @@ impl<'a> WaylandCraft<'a> {
 
         // dispatch 后把 host_bridge 取回 self.host_bridge（避免下一帧重复 take）
         self.host_bridge = state.host_bridge.take();
+
+        // ⑧ host_bridge 周期自愈：None（启动时无 daemon）/ dead（fcitx5 单次
+        // dbus 错误即永久 dead）/ not-ready（ibus 连接降级）时，每 5s 重探一次。
+        // 没有这个路径，用户"先开游戏后开 fcitx5"或 daemon 中途重启都会让
+        // 整会话输入法永久失效。probe() 只做 NameHasOwner 级别的总线握手，
+        // 5s 节流下主线程成本可忽略；成功后下一帧 update 顶部自动挂回 state。
+        let hb_broken = match &self.host_bridge {
+            None => true,
+            Some(hb) => hb.is_dead() || !hb.is_ready(),
+        };
+        if hb_broken {
+            let now = std::time::Instant::now();
+            if self.next_host_probe <= now {
+                self.next_host_probe = now + std::time::Duration::from_secs(5);
+                match crate::host_bridge::probe() {
+                    crate::host_bridge::BridgeInit::Ready(b) => {
+                        eprintln!(
+                            "[waylandcraft][host_bridge] ⑧ re-probe OK -> {} (auto recovered)",
+                            b.name()
+                        );
+                        self.host_bridge = Some(crate::host_bridge::HostBridgeHandle::new(b));
+                    }
+                    crate::host_bridge::BridgeInit::Transient(_) | crate::host_bridge::BridgeInit::Unsupported(_) => {}
+                }
+            }
+        }
     }
 }
 

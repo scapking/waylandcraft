@@ -1627,12 +1627,21 @@ fn keyboard_input<'local>(
         }
     }
 
-    // v0.11.3 修：v0.11.0 commit message 说"删 Path B"——但代码 fall through
-    // `if !handled { seat.keyboard_key() }` 仍存在。**真删**——host_bridge
-    // 是唯一键盘通道。如果 host_bridge 没接管，按键**丢失**（GNOME 原生
-    // IME daemon 死亡时一样行为）。也修了一个隐藏 bug——fall through
-    // 可能调 seat.keyboard_key 时 xkb_state 未就绪（user 报告"创建窗口
-    // 或放置时崩溃"的可能根因之一）。
+    // v0.11.3 曾"真删" fall through（host_bridge 唯一通道，没接管=丢键），
+    // 但它把"宿主根本没有 IME daemon"的情况一起删死了：Sway/无 portal/
+    // daemon 死亡时连英文、符号、Backspace 都进不了窗口——用户报"打不了字"。
+    //
+    // ⑧ 恢复回退但保持单路不变式：**只有** host_bridge 完全缺席/not-ready/dead
+    // （即上方分支没有接管，handled=false）时才走 seat raw 直通；
+    // host_bridge 就绪时绝不双发（v0.11 双路导致拼音+数字乱序的根因保留修复）。
+    // keyboard_key 自带 kb_active/focus 防护并逐键 kb-log；xkb_state 为常驻字段。
+    // 配合 lib.rs update() 的 5s 重探，daemon 后起/中途恢复会自动切回 IME 通道。
+    if !handled {
+        crate::bridge::ime_log_write(&format!(
+            "[waylandcraft][ime] ⑧ raw-key fallback -> seat.keyboard_key scancode={scancode} action={action:?} (no ready host bridge)"
+        ));
+        instance.state.seat.keyboard_key(scancode as u32, action);
+    }
     Ok(())
 }
 
