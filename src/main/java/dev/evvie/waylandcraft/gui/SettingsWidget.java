@@ -11,9 +11,12 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.components.AbstractWidget;
+import net.minecraft.client.gui.components.EditBox;
 import net.minecraft.client.gui.narration.NarrationElementOutput;
+import net.minecraft.client.input.CharacterEvent;
 import net.minecraft.client.input.KeyEvent;
 import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.client.input.MouseButtonInfo;
 import net.minecraft.client.resources.sounds.SimpleSoundInstance;
 import net.minecraft.network.chat.Component;
 import net.minecraft.sounds.SoundEvents;
@@ -48,6 +51,12 @@ public class SettingsWidget extends AbstractWidget {
 
 	public static SettingsWidget createIntWidget(WaylandCraft instance, String settingName, Component message) {
 		IntControlElement control = new IntControlElement(instance, settingName);
+		return new SettingsWidget(instance, control, message);
+	}
+
+	// upstream 26350c4: 文本设置行（EditBox 控件）
+	public static SettingsWidget createTextWidget(WaylandCraft instance, String settingName, Component message) {
+		TextControlElement control = new TextControlElement(instance, settingName);
 		return new SettingsWidget(instance, control, message);
 	}
 
@@ -86,12 +95,17 @@ public class SettingsWidget extends AbstractWidget {
 		control.extractControlElement(graphics, mouseX, mouseY, a);
 	}
 
+	// upstream 26350c4: 焦点丢失 / 屏幕关闭时提交控件的挂起值
+	public void saveValue() {
+		control.saveValue();
+	}
+
 	@Override
 	public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
 		if(!this.isActive()) return false;
 		if(!isMouseOver(event.x(), event.y())) return false;
 
-		if(!doubleClick) control.onClick((int) event.x(), (int) event.y());
+		if(!doubleClick) control.onClick((int) event.x(), (int) event.y(), event.buttonInfo());
 		else control.onDoubleClick();
 		return true;
 	}
@@ -106,6 +120,12 @@ public class SettingsWidget extends AbstractWidget {
 	public boolean keyReleased(KeyEvent event) {
 		if(!this.isActive()) return false;
 		return control.onKeyReleased(event);
+	}
+
+	@Override
+	public boolean charTyped(CharacterEvent event) {
+		if(!this.isActive()) return false;
+		return control.onCharTyped(event);
 	}
 
 	@Override
@@ -164,7 +184,18 @@ public class SettingsWidget extends AbstractWidget {
 		}
 
 		public abstract void extractControlElement(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float a);
+
+		// upstream 26350c4: 提交挂起的编辑值。
+		// Boolean 控件点击即写、Int 控件失焦即写，默认空实现保持 fork 现有行为不变；
+		// TextControlElement 覆写此方法。
+		public void saveValue() {}
+
 		public void onClick(int mouseX, int mouseY) {}
+		// upstream 26350c4: 带按键信息的点击。默认转发到旧 2 参签名，
+		// 现有 Boolean/Int 控件行为不变；TextControlElement 覆写本方法。
+		public void onClick(int mouseX, int mouseY, MouseButtonInfo buttonInfo) {
+			onClick(mouseX, mouseY);
+		}
 		public void onDoubleClick() {}
 		public void onDrag() {}
 
@@ -177,6 +208,11 @@ public class SettingsWidget extends AbstractWidget {
 		}
 
 		public boolean onKeyReleased(KeyEvent event) {
+			return false;
+		}
+
+		// upstream 26350c4: 文本输入事件
+		public boolean onCharTyped(CharacterEvent event) {
 			return false;
 		}
 
@@ -299,6 +335,12 @@ public class SettingsWidget extends AbstractWidget {
 			entry = null;
 		}
 
+		// upstream 26350c4: 外部提交通道复用既有的失焦保存逻辑，行为不变
+		@Override
+		public void saveValue() {
+			stopEntry();
+		}
+
 		@Override
 		public void setFocused(boolean focused) {
 			if(!focused && isFocused()) {
@@ -341,6 +383,81 @@ public class SettingsWidget extends AbstractWidget {
 				return true;
 			}
 			return false;
+		}
+
+	}
+
+	/** upstream 26350c4: EditBox 文本控件（如默认终端选择）。
+	 *  持久化复用 fork 已有的 string 设置接口（setStringSetting/getStringSetting）。 */
+	public static class TextControlElement extends ControlElement {
+
+		private EditBox editBox;
+
+		public TextControlElement(WaylandCraft wlc, String settingName) {
+			super(wlc, settingName);
+
+			editBox = new EditBox(Minecraft.getInstance().font, getWidth(), getHeight(), Component.literal(settingName));
+			String saved = getSavedValue();
+			if(saved != null) {
+				editBox.insertText(saved);
+			}
+			editBox.moveCursorTo(0, false);
+		}
+
+		private @Nullable String getSavedValue() {
+			return wlc.settingsManager.getStringSetting(settingName);
+		}
+
+		@Override
+		public void setPosSize(int x, int y, int width, int height) {
+			super.setPosSize(x, y, width, height);
+			editBox.setRectangle(width, height, x, y);
+		}
+
+		@Override
+		public void extractControlElement(GuiGraphicsExtractor graphics, int mouseX, int mouseY, float a) {
+			editBox.extractRenderState(graphics, mouseX, mouseY, a);
+		}
+
+		@Override
+		public void saveValue() {
+			wlc.settingsManager.setStringSetting(settingName, editBox.getValue());
+		}
+
+		@Override
+		public void onClick(int mouseX, int mouseY, MouseButtonInfo buttonInfo) {
+			editBox.onClick(new MouseButtonEvent(mouseX, mouseY, buttonInfo), false);
+		}
+
+		@Override
+		public void setFocused(boolean focused) {
+			if(!focused && isFocused()) {
+				// Focus lost
+				saveValue();
+			}
+
+			editBox.setFocused(focused);
+			super.setFocused(focused);
+		}
+
+		@Override
+		public boolean onKeyPressed(KeyEvent event) {
+			if(event.key() == GLFW.GLFW_KEY_ENTER) {
+				saveValue();
+				return true;
+			}
+
+			return editBox.keyPressed(event);
+		}
+
+		@Override
+		public boolean onKeyReleased(KeyEvent event) {
+			return editBox.keyReleased(event);
+		}
+
+		@Override
+		public boolean onCharTyped(CharacterEvent event) {
+			return editBox.charTyped(event);
 		}
 
 	}

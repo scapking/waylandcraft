@@ -454,6 +454,11 @@ bind_java_type! {
             sig = (instance: jlong, app_id: JString) -> jboolean,
             fn = exec_app,
         },
+        // upstream f23fdcb: 设置首选终端（Terminal=true 的 desktop entry 直启）
+        static extern fn set_preferred_terminal {
+            sig = (instance: jlong, cmd: JString),
+            fn = set_preferred_terminal,
+        },
         static extern fn set_satellite_binary {
             sig = (path: JString),
             name = "setSatelliteBinary",
@@ -2458,6 +2463,21 @@ fn exec_app<'local>(
     }
 
     Ok(instance.xdg.exec_app(app_id, env_vars))
+}
+
+// upstream f23fdcb: Java 侧下发首选终端命令
+fn set_preferred_terminal<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    cmd: JString<'local>,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "setPreferredTerminal")?;
+    let cmd = cmd.try_to_string(env)?;
+
+    instance.xdg.set_preferred_terminal(cmd);
+
+    Ok(())
 }
 
 fn check_app<'local>(

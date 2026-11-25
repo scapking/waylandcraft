@@ -1079,6 +1079,11 @@ public class WaylandCraftBridge {
 	public boolean execApp(String appId) {
 		return execApp(instance, appId);
 	}
+
+	// upstream f23fdcb: 设置首选终端命令（用于直接启动 Terminal=true 的 desktop entry）
+	public void setPreferredTerminal(String cmd) {
+		setPreferredTerminal(instance, cmd);
+	}
 	
 	/**
 	 * 检测应用是否可以启动（静态检查，不真正启动进程）。
@@ -1283,7 +1288,10 @@ public class WaylandCraftBridge {
 	private static native boolean renderSVG(String path, int width, int height, long bufferPtr);
 	
 	private static native boolean execApp(long instance, String appId);
-	
+
+	// upstream f23fdcb
+	private static native void setPreferredTerminal(long instance, String cmd);
+
 	/** 把 jar 内嵌的 xwayland-satellite 二进制路径交给 native 层（在 native 库加载后调用） */
 	private static native void setSatelliteBinary(String path);
 	

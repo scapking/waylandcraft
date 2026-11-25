@@ -11,6 +11,8 @@ use std::path::{Path, PathBuf};
 pub struct XDGSpecHelper {
     locales: Vec<String>,
     entries: Vec<DesktopEntry>,
+    // upstream f23fdcb: 首选终端命令（Terminal=true 的 entry 用它包一层 -e 启动）
+    preferred_terminal: String,
 }
 
 pub struct RawDesktopEntry {
@@ -31,7 +33,16 @@ impl XDGSpecHelper {
         let locales = get_languages_from_env();
         let entries = desktop_entries(&locales);
 
-        XDGSpecHelper { locales, entries }
+        XDGSpecHelper {
+            locales,
+            entries,
+            preferred_terminal: String::new(),
+        }
+    }
+
+    // upstream f23fdcb
+    pub fn set_preferred_terminal(&mut self, cmd: String) {
+        self.preferred_terminal = cmd;
     }
 
     fn to_raw(&self, entry: &DesktopEntry) -> RawDesktopEntry {
@@ -136,6 +147,17 @@ impl XDGSpecHelper {
         if args.is_empty() {
             eprintln!("[waylandcraft] _exec_app: args empty after split");
             return None;
+        }
+
+        // upstream f23fdcb: Terminal=true 的 entry 用首选终端包一层（-e）直启；
+        // 未配置终端时不启动（与上游行为一致）
+        if entry.terminal() {
+            if self.preferred_terminal.is_empty() {
+                eprintln!("[waylandcraft] _exec_app: app_id={:?} requires terminal, none configured", app_id);
+                return None;
+            }
+            args.insert(0, "-e".to_string());
+            args.insert(0, self.preferred_terminal.clone());
         }
 
         let cmd = args.remove(0);

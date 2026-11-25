@@ -23,7 +23,9 @@ public class WaylandCraftSettings {
 	 * fork 保留 /wl settings 开关（Iris 光影回退路径下本就不生效），不删除设置项本身。 */
 	boolean windowAntialiasing = true;
 	boolean focusOnHover = false;
-	
+	/** 首选终端程序命令名（如 "kitty"），用于直接启动 Terminal=true 的 desktop entry（upstream 26350c4） */
+	String terminalChoice = "";
+
 	/* ---- 控制距离 / 游戏优化 / 布局 ---- */
 	/** 控制窗口时隐藏虚拟鼠标光标（默认不自动隐藏，按键切换） */
 	boolean hideCursor = false;
@@ -61,6 +63,7 @@ public class WaylandCraftSettings {
 	public static final String PIXELS_PER_BLOCK = "pixelsPerBlock";
 	public static final String WINDOW_ANTIALIASING = "windowAntialiasing";
 	public static final String FOCUS_ON_HOVER = "focusOnHover";
+	public static final String TERMINAL_CHOICE = "terminalChoice";
 	public static final String HIDE_CURSOR = "hideCursor";
 	public static final String LAYOUT_ENABLED = "layoutEnabled";
 	public static final String LAYOUT_AUTO_JOIN = "layoutAutoJoin";
@@ -91,6 +94,10 @@ public class WaylandCraftSettings {
 	
 	public boolean getFocusOnHover() {
 		return focusOnHover;
+	}
+
+	public String getTerminalChoice() {
+		return terminalChoice;
 	}
 	
 	public boolean getHideCursor() {
@@ -193,6 +200,18 @@ public class WaylandCraftSettings {
 		}
 	}
 	
+	// upstream 7f1de7b: 不区分类型地读取设置当前值（供 responder 注册时回放）
+	protected @Nullable Object getSettingAnyType(String name) {
+		try {
+			Field field = WaylandCraftSettings.class.getDeclaredField(name);
+			return field.get(this);
+		} catch (NoSuchFieldException | IllegalArgumentException | IllegalAccessException e) {
+			WaylandCraftCommon.LOGGER.error("Invalid setting accessed: '" + name + "'!");
+			e.printStackTrace();
+		}
+		return null;
+	}
+
 	protected void setStringSetting(String name, String value) {
 		try {
 			Field field = WaylandCraftSettings.class.getDeclaredField(name);
