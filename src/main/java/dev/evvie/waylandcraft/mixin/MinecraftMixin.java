@@ -28,6 +28,9 @@ public class MinecraftMixin {
 		// Phase 2：游戏内候选窗 overlay 帧轮询（与光标上报同 tick 点位；
 		// 客户端 tick 即渲染线程，纹理原地上传）。
 		dev.evvie.waylandcraft.ime.ImeCandidateOverlay.tick();
+		// sync14：候选窗世界形态（键盘捕获 → 应用窗口旁候选 quad）显隐与
+		// 锚定解算。排在 overlay.tick 之后——消费其本轮 worldFrame 保留位。
+		dev.evvie.waylandcraft.ime.ImeCandidateWorld.tick();
 	}
 	
 	@Inject(method = "renderFrame", at = @At(value = "INVOKE_STRING", target = "Lnet/minecraft/util/profiling/ProfilerFiller;push(Ljava/lang/String;)V", args = "ldc=present"))

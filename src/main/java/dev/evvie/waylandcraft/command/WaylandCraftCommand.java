@@ -2781,6 +2781,10 @@ public class WaylandCraftCommand {
 			if(line.isEmpty()) continue;
 			source.sendFeedback(Component.literal(" §7" + line + "§r"));
 		}
+		// sync14 世界形态（Java 半程）：锚定模式 gui/world/none + 目标窗口 +
+		// 候选 rect + 原始 ti3 光标矩形。native 行给"帧到哪了"，本行给"显示在哪"。
+		source.sendFeedback(Component.literal(" §7"
+				+ dev.evvie.waylandcraft.ime.ImeCandidateWorld.describe() + "§r"));
 		return 1;
 	}
 }

@@ -379,6 +379,12 @@ public class WaylandCraft implements ClientModInitializer {
 			sharedDisplay.clampIfResized();
 			sharedDisplay.render(ctx);
 		}
+
+		// sync14：IME 候选窗世界形态（键盘捕获往应用窗口打字时贴在窗口旁的
+		// 候选 quad）。放在窗口之后提交：同深度序下后画在上层，且候选 quad
+		// 自身沿窗口法线向相机抬升——候选永远盖在窗口内容上。内部自带全套门
+		// 判定（未显示即空操作），bridge==null 时恒静默。
+		dev.evvie.waylandcraft.ime.ImeCandidateWorld.render(ctx);
 	}
 	
 	public void updateWorld(LevelExtractionContext ctx) {
@@ -613,6 +619,42 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 	}
 	
+	/**
+	 * sync14 世界形态候选窗的目标窗口：与 ensureKeyboardFocus **同一条优先链**
+	 * （hover 的本地窗口 → 最近焦点窗口），但不做"displays 第一个"兜底——
+	 * 候选窗锚错窗口比不显示更糟。native 的 ti3 光标矩形/候选帧都源自当前
+	 * 聚焦会话，与此处按键入 focusSurface 的窗口一致。null = 无有效目标。
+	 */
+	public @Nullable WindowDisplay imeWorldTargetDisplay() {
+		if(hoveredDisplay != null && hoveredDisplay.dist >= 0 && hoveredDisplay.target.window instanceof WLCToplevel t) {
+			WindowDisplay d = getDisplay(t);
+			if(d != null && d.isValid()) return d;
+		}
+		if(bridge == null) return null;
+		WLCToplevel recent = bridge.getMostToLeastRecentFocus()
+				.filter((w) -> hasDisplayFor(w))
+				.findFirst()
+				.orElse(null);
+		if(recent == null) return null;
+		WindowDisplay d = getDisplay(recent);
+		return d != null && d.isValid() ? d : null;
+	}
+
+	/**
+	 * surface 所属的窗口对象（沿 surface 树上溯到根，再匹配各 display 的树根）。
+	 * HARD_CAPTURE 候选窗命中判定用：虚拟光标在 surface 局部，需知道它属于
+	 * 哪个窗口才能换算到该窗口的平面局部像素。无匹配 → null。
+	 */
+	public @Nullable WLCAbstractWindow windowOfSurface(WLCSurface s) {
+		if(s == null) return null;
+		WLCSurface root = s;
+		while(root.getParent() != null) root = root.getParent();
+		for(WindowDisplay d : displays) {
+			if(d.window.getSurfaceTree() == root) return d.window;
+		}
+		return null;
+	}
+
 	/**
 	 * 退出键盘捕获。顺序：**先解除键盘绑定，再解除鼠标绑定**——
 	 * 玩家先恢复 WASD/空格等角色控制，鼠标视角随后恢复，
@@ -1116,6 +1158,15 @@ public class WaylandCraft implements ClientModInitializer {
 			return true;
 		}
 
+		// sync14 世界形态候选 quad 优先命中（键盘捕获 → 应用窗口旁的候选窗）：
+		// 与 GUI 拦截同款规则——仅候选显示中且输入点（HARD_CAPTURE=窗口虚拟
+		// 光标，CAPTURE=准星射线）落在候选 quad 上才消费；拖拽/缩放窗口独占
+		// 时不抢。press/release 配对由 ImeCandidateWorld 内部跟踪。
+		if(!pointerGrabs.isExclusiveGrabActive()
+				&& dev.evvie.waylandcraft.ime.ImeCandidateWorld.handleClick(button, action != 0)) {
+			return true;
+		}
+
 		if(pointerCapture != null) {
 			if(action == 1 && !pointerCapture.pressedButtons.contains(button)) {
 				bridge.sendButton(0x110 + button, 1);
@@ -1254,6 +1305,13 @@ public class WaylandCraft implements ClientModInitializer {
 		// 仅 overlay 区域内消费；窗外滚轮维持窗口缩放/聊天历史等既有语义）。
 		if(dev.evvie.waylandcraft.ime.ImeCandidateOverlay.handleScroll(
 				imeMouseX(), imeMouseY(), scrollY)) {
+			return true;
+		}
+
+		// sync14 世界形态候选 quad 滚轮优先（翻页 > 手持窗口的距离缩放）：
+		// 仅候选显示中且输入点命中 quad 才消费，与 onButtonPress 同款规则。
+		if(!pointerGrabs.isExclusiveGrabActive()
+				&& dev.evvie.waylandcraft.ime.ImeCandidateWorld.handleScroll(scrollY)) {
 			return true;
 		}
 
