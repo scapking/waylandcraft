@@ -24,6 +24,8 @@ pub struct DbusFcitx5Bridge {
     ev_rx: Receiver<FromWorker>,
     ready: bool,
     dead: Option<String>,
+    /// ⑧ 同步等待 consumed 时截获的其他上行事件（FIFO 补发）。
+    stash: std::collections::VecDeque<FromWorker>,
 }
 
 #[derive(Debug)]
@@ -42,6 +44,8 @@ pub(crate) enum FromWorker {
     DeleteSurrounding { before: u32, after: u32 },
     LookupTable { candidates: Vec<String>, cursor_pos: u32, visible: bool },
     Done,
+    /// ⑧ ProcessKeyEvent 的 consumed 回执。
+    KeyConsumed { release: bool, consumed: bool },
     Fatal(String),
 }
 
@@ -85,6 +89,7 @@ impl DbusFcitx5Bridge {
             ev_rx,
             ready: true,
             dead: None,
+            stash: std::collections::VecDeque::new(),
         }))
     }
 
@@ -95,6 +100,7 @@ impl DbusFcitx5Bridge {
             ev_rx,
             ready: true,
             dead: None,
+            stash: std::collections::VecDeque::new(),
         }
     }
 }
@@ -145,13 +151,67 @@ impl HostBridge for DbusFcitx5Bridge {
         }
     }
 
+    fn submit_key_sync(&mut self, ev: &DownEvent) -> super::KeyResult {
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::{Duration, Instant};
+        if !self.is_ready() {
+            return super::KeyResult::Unavailable;
+        }
+        let (expect_release, keysym_zero) = match ev {
+            DownEvent::Key(KeyEvent { keysym, action, .. }) => (
+                matches!(action, crate::seat::KeyboardAction::Release),
+                *keysym == 0,
+            ),
+            _ => return super::KeyResult::Unavailable,
+        };
+        if keysym_zero {
+            return super::KeyResult::Unconsumed;
+        }
+        self.submit(ev.clone());
+        let deadline = Instant::now() + Duration::from_millis(150);
+        loop {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                ime_log!("[waylandcraft][host_bridge][dbus-fcitx5] ⑧ submit_key_sync 超时 → 按未消费直通");
+                return super::KeyResult::Unavailable;
+            }
+            match self.ev_rx.recv_timeout(wait) {
+                Ok(FromWorker::KeyConsumed { release, consumed }) => {
+                    if release == expect_release {
+                        return if consumed {
+                            super::KeyResult::Consumed
+                        } else {
+                            super::KeyResult::Unconsumed
+                        };
+                    }
+                    self.stash.push_back(FromWorker::KeyConsumed { release, consumed });
+                }
+                Ok(other) => self.stash.push_back(other),
+                Err(RecvTimeoutError::Timeout) => {
+                    ime_log!("[waylandcraft][host_bridge][dbus-fcitx5] ⑧ submit_key_sync 超时 → 按未消费直通");
+                    return super::KeyResult::Unavailable;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.dead = Some("worker channel closed".into());
+                    return super::KeyResult::Unavailable;
+                }
+            }
+        }
+    }
+
     fn take_up_events(&mut self) -> Vec<UpEvent> {
         if !self.is_ready() {
             return Vec::new();
         }
         let mut out = Vec::new();
         loop {
-            match self.ev_rx.try_recv() {
+            let ev_res = if let Some(ev) = self.stash.pop_front() {
+                Ok(ev)
+            } else {
+                self.ev_rx.try_recv()
+            };
+            match ev_res {
+                Ok(FromWorker::KeyConsumed { .. }) => {} // 控制事件：sync 等待已处理
                 Ok(FromWorker::Commit(text)) => {
                     out.push(UpEvent::Commit(Commit { text }));
                 }
@@ -255,10 +315,14 @@ fn command_loop(
                 .map_err(|e| e.to_string()),
             ToWorker::ProcessKey { keysym, evdev, state, release } => {
                 let time_ms: u32 = 0;
-                let _ = ic_conns.ic.call::<_, _, bool>(
+                let consumed = ic_conns.ic.call::<_, _, bool>(
                     "ProcessKeyEvent",
                     &(keysym, evdev, state, release, time_ms),
                 );
+                // ⑧ consumed 回执送回提交线程
+                if let Ok(consumed) = consumed {
+                    let _ = ev_tx.send(FromWorker::KeyConsumed { release, consumed });
+                }
                 Ok(())
             }
         };

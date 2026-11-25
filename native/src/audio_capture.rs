@@ -95,9 +95,15 @@ fn enumerate_topology(collect_ms: u64) -> Result<PwTopology, String> {
     let topology = Arc::new(Mutex::new(PwTopology::default()));
 
     let topo_ref = topology.clone();
-    let _registry = core
+    // ⑤ 关键修复：Registry 的 Drop 会 pw_proxy_destroy——旧写法把
+    // get_registry() 的临时 Registry 在链式表达式结束时立即销毁，
+    // 监听器挂在一个已销毁的 proxy 上，global 事件永远 0 个
+    // （= 音频"找不到默认 sink"的真根因，与 PipeWire 是否运行无关）。
+    // 必须用具名变量持有到 mainloop 结束。
+    let registry = core
         .get_registry()
-        .map_err(|e| format!("registry: {}", e))?
+        .map_err(|e| format!("registry: {}", e))?;
+    let _listener = registry
         .add_listener_local()
         .global(move |global| {
             let mut t = topo_ref.lock().unwrap();
@@ -466,3 +472,24 @@ pub fn get_audio_capture_status() -> String {
         }
     )
 }
+
+#[cfg(test)]
+mod repro_tests {
+    use super::*;
+
+    /// 环境复现：在与 Minecraft 相同的桌面会话环境跑真实拓扑枚举。
+    /// CI（无 pipewire 守护）跳过；本机开发环境手动验证枚举是否非空。
+    #[test]
+    #[ignore = "需要运行中的 PipeWire 守护"]
+    fn enumerate_topology_live() {
+        let topo = enumerate_topology(3000).expect("topology enum failed");
+        eprintln!("nodes={}", topo.nodes.len());
+        for (id, (mc, pid, name, proc)) in &topo.nodes {
+            eprintln!("  id={id} class={mc} pid={pid} name={name} proc={proc}");
+        }
+        let sink = find_default_sink(&topo);
+        eprintln!("sink={sink:?}");
+        assert!(!topo.nodes.is_empty(), "enumerate returned 0 nodes while pipewire running");
+    }
+
+   }

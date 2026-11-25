@@ -80,6 +80,11 @@ pub struct ImeState {
     /// v0.13.4 改为 pub(crate) 让 status.rs 读取（之前私有+有 has_focus() 方法）。
     pub(crate) has_focus: bool,
 
+    /// ⑧ press 时被 raw 直通（引擎未消费）的按键集合（scancode）。
+    /// release 必须与 press 同路：引擎在应用没收到 press 的情况下不应看到孤立 release，
+    /// 反之应用也不能只有 release 没有 press。由 bridge::keyboard_input 维护。
+    pub(crate) raw_keys: std::collections::HashSet<u32>,
+
     /// 最近一次候选窗快照（Java 每帧轮询）。
     lookup_table: Option<LookupTableSnapshot>,
 

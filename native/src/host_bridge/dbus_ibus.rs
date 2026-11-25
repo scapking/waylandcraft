@@ -111,6 +111,8 @@ pub(crate) enum FromWorker {
     /// 任意信号边界：mod 层用这个把同一批 commit/preedit/delete 一起发给 relay。
     /// batch_id 是诊断 ID（递增）。
     Done(u32),
+    /// ⑧ ProcessKeyEvent 的 consumed 回执（state: press/repeat=0, release=1<<30）。
+    KeyConsumed { state: u32, consumed: bool },
     Fatal(String),
 }
 
@@ -126,6 +128,8 @@ pub struct DbusIbusBridge {
     ready: bool,
     /// 后端是否已死。
     dead: Option<String>,
+    /// ⑧ 同步等待 consumed 时被截获的其他上行事件，按 FIFO 补发。
+    stash: std::collections::VecDeque<FromWorker>,
 }
 
 impl DbusIbusBridge {
@@ -172,6 +176,7 @@ impl DbusIbusBridge {
             next_batch: 0,
             ready: true,
             dead: None,
+            stash: std::collections::VecDeque::new(),
         }))
     }
 
@@ -184,6 +189,7 @@ impl DbusIbusBridge {
             next_batch: 0,
             ready: true,
             dead: None,
+            stash: std::collections::VecDeque::new(),
         }
     }
 }
@@ -252,13 +258,72 @@ impl HostBridge for DbusIbusBridge {
         }
     }
 
+    fn submit_key_sync(&mut self, ev: &DownEvent) -> super::KeyResult {
+        use std::sync::mpsc::RecvTimeoutError;
+        use std::time::{Duration, Instant};
+        if !self.is_ready() {
+            return super::KeyResult::Unavailable;
+        }
+        let (expect_state, keysym_zero) = match ev {
+            DownEvent::Key(KeyEvent { keysym, action, .. }) => {
+                let st = match action {
+                    crate::seat::KeyboardAction::Release => 1u32 << 30,
+                    _ => 0,
+                };
+                (st, *keysym == 0)
+            }
+            _ => return super::KeyResult::Unavailable,
+        };
+        if keysym_zero {
+            // 引擎无法识别 keysym=0：不发 ProcessKeyEvent，按未消费直通
+            return super::KeyResult::Unconsumed;
+        }
+        self.submit(ev.clone());
+        let deadline = Instant::now() + Duration::from_millis(150);
+        loop {
+            let wait = deadline.saturating_duration_since(Instant::now());
+            if wait.is_zero() {
+                ime_log!("[waylandcraft][host_bridge][dbus-ibus] ⑧ submit_key_sync 超时 150ms → 按未消费直通");
+                return super::KeyResult::Unavailable;
+            }
+            match self.ev_rx.recv_timeout(wait) {
+                Ok(FromWorker::KeyConsumed { state, consumed }) => {
+                    if state == expect_state {
+                        return if consumed {
+                            super::KeyResult::Consumed
+                        } else {
+                            super::KeyResult::Unconsumed
+                        };
+                    }
+                    self.stash.push_back(FromWorker::KeyConsumed { state, consumed });
+                }
+                Ok(other) => self.stash.push_back(other),
+                Err(RecvTimeoutError::Timeout) => {
+                    ime_log!("[waylandcraft][host_bridge][dbus-ibus] ⑧ submit_key_sync 超时 → 按未消费直通");
+                    return super::KeyResult::Unavailable;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    self.dead = Some("worker channel closed".into());
+                    return super::KeyResult::Unavailable;
+                }
+            }
+        }
+    }
+
     fn take_up_events(&mut self) -> Vec<UpEvent> {
         if !self.is_ready() {
             return Vec::new();
         }
         let mut out = Vec::new();
         loop {
-            match self.ev_rx.try_recv() {
+            // ⑧ 同步等待期间截获的其他事件优先从 stash 消费（保序）
+            let ev_res = if let Some(ev) = self.stash.pop_front() {
+                Ok(ev)
+            } else {
+                self.ev_rx.try_recv()
+            };
+            match ev_res {
+                Ok(FromWorker::KeyConsumed { .. }) => {} // 控制事件：sync 等待已处理
                 Ok(FromWorker::Commit(text)) => {
                     out.push(UpEvent::Commit(Commit { text }));
                 }
@@ -438,6 +503,9 @@ fn command_loop(
                         ime_log!(
                             "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent keysym={keysym:#x} evdev={evdev} state={state:#x} -> consumed={consumed}"
                         );
+                        // ⑧ consumed 回执送回提交线程（submit_key_sync 拦截；
+                        // 正常 drain 忽略该控制事件）。
+                        let _ = ev_tx.send(FromWorker::KeyConsumed { state, consumed });
                     }
                     Err(e) => {
                         ime_log!(

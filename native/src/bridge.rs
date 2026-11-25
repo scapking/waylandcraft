@@ -397,6 +397,11 @@ bind_java_type! {
             name = "getStatusReportNative",
             fn = get_status_report,
         },
+        static extern fn set_mod_version {
+            sig = (version: JString),
+            name = "setModVersionNative",
+            fn = set_mod_version,
+        },
         static extern fn notify_host_focus_gained {
             sig = (instance: jlong),
             name = "notifyHostFocusGainedNative",
@@ -1576,71 +1581,59 @@ fn keyboard_input<'local>(
         .ime
         .handle_key(scancode as u32, action, mods);
 
-    // 2) C 方案：host_bridge 接嵌套应用键盘事件，转发到宿主 dbus-ibus/dbus-fcitx5。
-    //    关键：嵌套应用（firefox/gnome-terminal）**不**用 GdkIMContext 直通——
-    //    mod 接管键盘，host_bridge 触发宿主引擎，commit/preedit 由 mod 通过 ti3
-    //    推到 firefox 文本框。这样**双客户端冲突消失**。
-    //
-    //    firefox 自己的 GdkIMContext 路径仍然可用（firefox 仍连宿主 ibus），
-    //    但**只在 host_bridge 没接管时**生效——目前 host_bridge 永远接管，
-    //    所以 firefox GdkIMContext 实际上**收不到键盘**。
+    // 2) ⑧ 协议正确的按键路由（修复实测"输入法不可用"根因）：
+    //    旧 C 方案 fire-and-forget 吞键——宿主引擎未激活时 ProcessKeyEvent 返回
+    //    consumed=false，键被吞掉且永远不会进应用：**英文字母/符号/Backspace 全丢**
+    //    （GNOME/mutter 嵌套 focus 隔离使引擎常不激活；v1.2.5+ 实测每键 consumed=false）。
+    //    IBus/fcitx5 协议语义：consumed=true 引擎接管（commit 经 ti3 到达窗口）；
+    //    consumed=false / 同步超时 / 无就绪桥 → raw 直通焦点窗口。
+    //    press/release 用 ime.raw_keys 保证同路，杜绝孤立 release 或丢 release。
+    //    （历史：v0.11 为修"拼音+数字双路乱序"删掉了无条件 fall-through——方向对、
+    //    力度错：应该按 consumed 分流，而不是全部吞掉。本实现保持单路不变式：
+    //    引擎消费时绝无 raw，引擎未消费时绝无静默丢失。）
     if !handled {
+        use crate::seat::KeyboardAction as KA;
+        let keycode = scancode as u32;
+        let mut key_result: Option<crate::host_bridge::KeyResult> = None;
         if let Some(hb) = &mut instance.host_bridge {
             if hb.is_ready() {
-                use crate::ime::{KeyEvent};
-                use crate::seat::KeyboardAction as KA;
-                // v0.11.0：mod 接管键盘（仅 mod 转发给宿主 ibus）。
-                // 删 v0.9.43-v0.10.2 的双路（seat.keyboard_key）——**双路**
-                // 导致 firefox GdkIMContext 与 mod 独立工作：
-                //   - 字母键到窗口（Path B：firefox GdkIMContext）
-                //   - 拼音+数字到窗口（Path B 主导）
-                //   - 偶尔 commit 进（Path A：mod ti3 推）
-                // v0.11 删 Path B：mod 完全吞键——firefox 不再收到 raw key——
-                // firefox 自己的 GdkIMContext 不工作——**只有** mod 通过 ti3 推
-                // commit 文本到 firefox 文本框。
-                // 候选窗由宿主 ibus kimpanel 显示（独立窗口，不嵌入 firefox）。
-                match action {
-                    KA::Press | KA::Repeat | KA::Release => {
-                        let keycode = scancode as u32;
-                        // v0.10.2：xkb 解码 keysym（不是 evdev，是 ibus keyval）
-                        let keysym = instance
-                            .state
-                            .seat
-                            .xkb_state
-                            .key_get_one_sym(xkbcommon::xkb::Keycode::new(keycode))
-                            .raw() as u32;
-                        let ke = KeyEvent {
-                            keysym,
-                            keycode,
-                            action: action,
-                            mods,
-                        };
-                        crate::bridge::ime_log_write(&format!(
-                            "[waylandcraft][ime] bridge submit_key scancode={keycode} keysym={keysym:#x} action={:?}",
-                            action
-                        ));
-                        hb.submit(crate::ime::DownEvent::Key(ke));
-                        handled = true; // **v0.11 完全吞**——不调 seat.keyboard_key
-                    }
-                }
+                // v0.10.2：xkb 解码 keysym（ibus/fcitx keyval，不是 evdev）
+                let keysym = instance
+                    .state
+                    .seat
+                    .xkb_state
+                    .key_get_one_sym(xkbcommon::xkb::Keycode::new(keycode))
+                    .raw() as u32;
+                crate::bridge::ime_log_write(&format!(
+                    "[waylandcraft][ime] bridge submit_key scancode={keycode} keysym={keysym:#x} action={action:?}"
+                ));
+                let ke = crate::ime::KeyEvent {
+                    keysym,
+                    keycode,
+                    action,
+                    mods,
+                };
+                key_result = Some(hb.submit_key_sync(&crate::ime::DownEvent::Key(ke)));
             }
         }
-    }
-
-    // v0.11.3 曾"真删" fall through（host_bridge 唯一通道，没接管=丢键），
-    // 但它把"宿主根本没有 IME daemon"的情况一起删死了：Sway/无 portal/
-    // daemon 死亡时连英文、符号、Backspace 都进不了窗口——用户报"打不了字"。
-    //
-    // ⑧ 恢复回退但保持单路不变式：**只有** host_bridge 完全缺席/not-ready/dead
-    // （即上方分支没有接管，handled=false）时才走 seat raw 直通；
-    // host_bridge 就绪时绝不双发（v0.11 双路导致拼音+数字乱序的根因保留修复）。
-    // keyboard_key 自带 kb_active/focus 防护并逐键 kb-log；xkb_state 为常驻字段。
-    // 配合 lib.rs update() 的 5s 重探，daemon 后起/中途恢复会自动切回 IME 通道。
-    if !handled {
-        crate::bridge::ime_log_write(&format!(
-            "[waylandcraft][ime] ⑧ raw-key fallback -> seat.keyboard_key scancode={scancode} action={action:?} (no ready host bridge)"
-        ));
-        instance.state.seat.keyboard_key(scancode as u32, action);
+        // None=没有就绪桥（⑧ 原始回退：纯 raw）；Unavailable=超时/通道断按未消费处理
+        let raw_needed = !matches!(key_result, Some(crate::host_bridge::KeyResult::Consumed));
+        if matches!(action, KA::Release) {
+            if instance.state.ime.raw_keys.remove(&keycode) || raw_needed {
+                instance.state.seat.keyboard_key(keycode, action);
+            }
+        } else {
+            if raw_needed {
+                instance.state.ime.raw_keys.insert(keycode);
+                crate::bridge::ime_log_write(&format!(
+                    "[waylandcraft][ime] ⑧ raw forward scancode={keycode} key_result={key_result:?}"
+                ));
+                instance.state.seat.keyboard_key(keycode, action);
+            }
+        }
+        if key_result.is_some() {
+            handled = true;
+        }
     }
     Ok(())
 }
@@ -1742,6 +1735,17 @@ fn native_version<'local>(
     ))?)
 }
 
+/// setModVersionNative(version) —— ⑥ Java 注入真实 mod 版本（Fabric metadata）。
+fn set_mod_version<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    version: JString<'local>,
+) -> Result<(), BridgeError> {
+    let v: String = version.try_to_string(env).map_err(|e| BridgeError::JniError(e))?;
+    crate::status::set_mod_version(&v);
+    Ok(())
+}
+
 /// getStatusReportNative(instance, javaThread) —— 返回 JSON 状态报告。
 ///
 /// Java 端每 N 帧调用一次，把结果写入覆盖式 `status.log`——一个文件包含
@@ -1761,11 +1765,9 @@ fn get_status_report<'local>(
     let thread_name: String = java_thread
         .try_to_string(env)
         .map_err(|e| BridgeError::JniError(e))?;
-    let report = crate::status::StatusReport::gather(
-        &instance,
-        thread_name,
-        "1.2.13", // mod_version — 与 waylandcraft/gradle.properties 同步
-    );
+    // ⑥ mod_version 不再硬编码（历史上三次 bump 忘同步导致 status.log 谎报
+    // "1.2.13"）；由 Java 启动时 setModVersionNative 注入真实版本。
+    let report = crate::status::StatusReport::gather(&instance, thread_name);
     Ok(env.new_string(report.to_json())?)
 }
 

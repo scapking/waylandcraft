@@ -64,6 +64,16 @@ use crate::ime::{
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 
 /// 宿主 IME 后端能力探测结果。
+/// ⑧ 按键同步提交结果：引擎是否消费该键。
+/// Consumed=引擎吞键（等 ti3 commit）；Unconsumed=引擎未消费（必须 raw 直通应用）；
+/// Unavailable=桥不可用/同步超时（按 Unconsumed 语义直通，宁可 raw 双发绝不丢键）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyResult {
+    Consumed,
+    Unconsumed,
+    Unavailable,
+}
+
 pub enum BridgeInit {
     /// 初始化成功，后端就绪。
     Ready(Box<dyn HostBridge>),
@@ -93,6 +103,12 @@ pub trait HostBridge: Send {
     /// 调用方**不应假设**事件被同步处理——后端可以立即返回（非阻塞），
     /// 由后台 worker 线程异步发送到 dbus。
     fn submit(&mut self, ev: DownEvent);
+
+    /// ⑧ 同步提交按键并返回引擎 consumed 语义。默认 Unavailable
+    /// （未实现该协议的后端保持旧行为：由调用方 raw 直通）。
+    fn submit_key_sync(&mut self, _ev: &DownEvent) -> KeyResult {
+        KeyResult::Unavailable
+    }
 
     /// 上行事件出站：从宿主 daemon 接收的 commit/preedit/delete/lookup。
     /// 调用方**必须**每帧调用一次以 drain 队列。
@@ -132,6 +148,12 @@ impl HostBridgeHandle {
     /// 提交下行事件。
     pub fn submit(&mut self, ev: DownEvent) {
         self.backend.submit(ev);
+    }
+
+    /// ⑧ 同步提交按键：返回引擎 consumed 语义（后端未实现时为 Unavailable，
+    /// 调用方按 raw 直通处理）。
+    pub fn submit_key_sync(&mut self, ev: &DownEvent) -> KeyResult {
+        self.backend.submit_key_sync(ev)
     }
 
     /// 取走所有上行事件（每帧由 lib.rs 调用）。

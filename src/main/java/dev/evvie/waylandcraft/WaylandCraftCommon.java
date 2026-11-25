@@ -34,6 +34,13 @@ public class WaylandCraftCommon implements ModInitializer {
 	public void onInitialize() {
 		instance = this;
 		WindowItem.register();
+
+		// ⑥ 真实 mod 版本注入 native（status.log / getStatusReport 不再谎报硬编码值）
+		dev.evvie.waylandcraft.bridge.WaylandCraftBridge.setModVersion(
+			net.fabricmc.loader.api.FabricLoader.getInstance()
+				.getModContainer(MOD_ID)
+				.map(c -> c.getMetadata().getVersion().getFriendlyString())
+				.orElse("unknown"));
 		WaylandCraftNetworking.register();
 		
 		// 注册服务器事件处理器

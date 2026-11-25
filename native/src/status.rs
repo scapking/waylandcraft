@@ -52,6 +52,21 @@ pub fn snapshot_errors() -> Vec<ErrorEntry> {
     RECENT_ERRORS.lock().map(|ring| ring.iter().cloned().collect()).unwrap_or_default()
 }
 
+/// ⑥ mod_version 由 Java 在初始化时经 setModVersionNative 注入真实值
+/// （旧实现 Rust 硬编码 "1.2.13"，bump 三次都忘同步——status.log 版本谎报根因）。
+pub fn set_mod_version(v: &str) {
+    if let Ok(mut g) = MOD_VERSION.lock() {
+        *g = v.to_string();
+    }
+}
+fn mod_version_field_empty() -> bool {
+    MOD_VERSION.lock().map(|g| g.is_empty()).unwrap_or(false)
+}
+pub fn mod_version() -> String {
+    MOD_VERSION.lock().map(|g| g.clone()).unwrap_or_else(|_| "unknown".into())
+}
+static MOD_VERSION: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 /// 状态档位（与 issue 严重度对齐）
 #[derive(Debug, Clone, Copy)]
 pub enum State {
@@ -106,7 +121,7 @@ impl SubEntry {
 
 /// 完整状态报告
 pub struct StatusReport {
-    pub mod_version: &'static str,
+    pub mod_version: String,
     pub native_version: &'static str,
     pub uptime_s: u64,
     pub java_thread: String,
@@ -125,7 +140,9 @@ pub struct ErrorEntry {
 impl StatusReport {
     /// 收集所有子系统状态。从 `WaylandCraft` 拿只读引用，**不**持有可变借用。
     /// 内部用 `StatusExt` trait 取数据——避免 lib.rs 暴露大量 getter。
-    pub fn gather(wc: &WaylandCraft, java_thread: String, mod_version: &'static str) -> Self {
+    pub fn gather(wc: &WaylandCraft, java_thread: String) -> Self {
+        // ⑥ 真实 mod 版本（Java setModVersionNative 注入；未注入显示 not-set）
+        let mod_version = if mod_version_field_empty() { "not-set".to_string() } else { mod_version() };
         use StatusExt;
         let mut subsystems = Vec::new();
 
@@ -148,7 +165,10 @@ impl StatusReport {
         ));
 
         // ── host_bridge ──────────────────────────────────────────
-        match &wc.state.host_bridge {
+        // ⑤ 修谎报：update() 帧末把 host_bridge 从 state 挪回 self（mem::take 模式），
+        // getStatusReport 恰在帧间调用 → 旧实现读 state.host_bridge 恒 None。
+        // 正确来源 = self 优先、state 兜底。
+        match wc.host_bridge.as_ref().or(wc.state.host_bridge.as_ref()) {
             Some(hb) => {
                 if hb.is_ready() {
                     subsystems.push((

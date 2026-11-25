@@ -1138,6 +1138,17 @@ public class WaylandCraftBridge {
 	private static native String socket(long instance);
 	private static native String getSatelliteDisplay(long instance);
 	private static native String getStatusReportNative(long instance, String javaThread);
+	private static native void setModVersionNative(String version);
+
+	/** ⑥ 把 Fabric metadata 的真实 mod 版本注入 native，供 status.log / getStatusReport
+	 *  使用（替代 Rust 硬编码 "1.2.13" 的版本谎报）。旧 .so 无此符号时静默跳过。 */
+	public static void setModVersion(String version) {
+		try {
+			setModVersionNative(version);
+		} catch(Throwable t) {
+			dev.evvie.waylandcraft.WaylandCraftCommon.LOGGER.warn("[status] setModVersion unavailable: {}", t.toString());
+		}
+	}
 	private static native void sendFrame(long surfaceHandle);
 	
 	private static native void updateSurfaceData(long instance, WLCSurface surface);
