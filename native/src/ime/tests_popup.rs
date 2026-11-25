@@ -8,7 +8,7 @@
 //!   → 角色登记 + text_input_rectangle 回报
 //! shm pool(memfd, ARGB8888) → create_buffer → attach/damage/commit
 //!   → CompositorHandler::commit 认领 → 拷帧 → wl_buffer.release
-//! Java 轮询 = ImeState::take_popup_snapshot(kb_active)
+//! Java 轮询 = ImeState::take_popup_snapshot()
 //!   → PopupSnapshot { w, h, seq, visible, argb }
 //! popup.destroy / input_method.destroy / attach(NULL)
 //!   → 采集轨道解除（gone_for 按对象 id 匹配）
@@ -493,7 +493,7 @@ fn popup_attach_commit_frame_visible_and_released() {
     let snap = f
         .server
         .ime
-        .take_popup_snapshot(true)
+        .take_popup_snapshot()
         .expect("有新帧状态应交付");
     assert!(snap.visible, "activate+focus+kb → visible=1");
     assert_eq!((snap.width, snap.height), (4, 3));
@@ -501,7 +501,7 @@ fn popup_attach_commit_frame_visible_and_released() {
     assert_eq!(snap.argb.as_ref().expect("可见应有像素"), &px);
 
     // 再轮询：零拷贝 null。
-    assert!(f.server.ime.take_popup_snapshot(true).is_none(), "无变化必须 null");
+    assert!(f.server.ime.take_popup_snapshot().is_none(), "无变化必须 null");
 
     // 缓冲必须被 release（否则 fcitx5 双缓冲两帧后冻结）。
     assert!(f.ime.state.buffer_releases >= 1, "commit 的缓冲应收到 wl_buffer.release");
@@ -526,7 +526,7 @@ fn popup_second_frame_updates_seq_and_xrgb_alpha() {
     surface.damage_buffer(0, 0, 2, 2);
     surface.commit();
     assert!(f.drive());
-    let s1 = f.server.ime.take_popup_snapshot(true).expect("第一帧");
+    let s1 = f.server.ime.take_popup_snapshot().expect("第一帧");
     assert_eq!(s1.seq, 1);
     assert_eq!(s1.argb.as_ref().unwrap(), &px1);
 
@@ -537,7 +537,7 @@ fn popup_second_frame_updates_seq_and_xrgb_alpha() {
     surface.damage_buffer(0, 0, 2, 2);
     surface.commit();
     assert!(f.drive());
-    let s2 = f.server.ime.take_popup_snapshot(true).expect("第二帧");
+    let s2 = f.server.ime.take_popup_snapshot().expect("第二帧");
     assert_eq!(s2.seq, 2);
     assert_eq!(s2.argb.as_ref().unwrap(), &px2);
 
@@ -548,13 +548,13 @@ fn popup_second_frame_updates_seq_and_xrgb_alpha() {
     surface.damage_buffer(0, 0, 1, 1);
     surface.commit();
     assert!(f.drive());
-    let s3 = f.server.ime.take_popup_snapshot(true).expect("第三帧");
+    let s3 = f.server.ime.take_popup_snapshot().expect("第三帧");
     assert_eq!(s3.argb.as_ref().unwrap().as_slice(), &[0x11, 0x22, 0x33, 0xff]);
 }
 
-/// 可见性门：帧先于会话到达 → visible=0；会话激活后可见；失焦→0；
-/// 游戏未 focused（kb_active=false）→ 0（协议 activate/deactivate 蕴含
-/// popup 显隐的本地落实，v2 无显式 visible 事件）。
+/// 可见性门：帧先于会话到达 → visible=0；会话激活后可见；会话终结→0。
+/// 显隐跟随 IME 会话（popup_ime_active），**与窗口捕获键盘 kb_active 无关**
+/// （聊天打字 kb_active 恒 false 仍须可见——sync11 根因回归）。
 #[test]
 fn popup_visibility_follows_activate_and_focus() {
     let mut f = setup_popup();
@@ -562,7 +562,7 @@ fn popup_visibility_follows_activate_and_focus() {
     let (_surface, _popup, px) = popup_with_frame(&mut f, 2, 1, 0);
 
     // 有帧但无会话 → 交付"不可见"快照（尺寸在、无像素）。
-    let s = f.server.ime.take_popup_snapshot(true).expect("帧到达应有状态变化");
+    let s = f.server.ime.take_popup_snapshot().expect("帧到达应有状态变化");
     assert!(!s.visible, "无 activate/focus 会话时 popup 不得可见");
     assert_eq!(s.width, 2);
     assert!(s.argb.is_none());
@@ -570,18 +570,20 @@ fn popup_visibility_follows_activate_and_focus() {
 
     // 会话开始 → Activate（exec_on_im2 touch epoch）→ 再次轮询可见。
     f.focus_and_enable();
-    let s = f.server.ime.take_popup_snapshot(true).expect("activate 应推进可见性");
+    let s = f.server.ime.take_popup_snapshot().expect("activate 应推进可见性");
     assert!(s.visible);
     assert_eq!(s.argb.as_ref().unwrap(), &px);
 
     // 失焦 → clear_focus touch + relay focus_lost Deactivate → 不可见。
     f.unfocus();
-    let s = f.server.ime.take_popup_snapshot(true).expect("失焦应推进可见性");
+    let s = f.server.ime.take_popup_snapshot().expect("失焦应推进可见性");
     assert!(!s.visible, "ti3 焦点离开 → 候选窗必须隐藏");
 
-    // 游戏未 focused：重新 focus+enable 后按 keyboard_deactivate 语义
-    // （seat.deactivate_keyboard + bridge popup_touch）→ 必须不可见；
-    // 重新 activate（bridge keyboard_activate 同径）→ 恢复可见。
+    // sync11 生产根因回归：候选窗显隐跟随 **IME 会话**，与窗口捕获键盘
+    // 状态（seat.kb_active）无关。聊天框打字时没有 native 窗口被聚焦
+    // （focusSurface 只接受 ToplevelSurface），kb_active 恒 false——旧门
+    // 误用它（连同 has_focus）做可见性条件，导致聊天场景候选窗永不显示
+    // （用户四轮"采到帧但候选窗从不显示"的真正根因）。
     let surface = f.editor_server_surface();
     let mut ime = std::mem::take(&mut f.server.ime);
     ime.set_focus(&surface, &mut f.server);
@@ -591,14 +593,15 @@ fn popup_visibility_follows_activate_and_focus() {
     ti.enable();
     ti.commit();
     assert!(f.drive());
+    // 窗口捕获键盘关闭（聊天形态 kb_active=false）但会话仍激活 → 必须仍可见。
     f.server.seat.deactivate_keyboard();
     f.server.ime.popup_touch();
-    let s = f.server.ime.take_popup_snapshot(false).expect("deactivate 应推进可见性");
-    assert!(!s.visible, "游戏失焦（kb_active=false）→ visible 必须 0");
-    f.server.seat.activate_keyboard();
-    f.server.ime.popup_touch();
-    let s = f.server.ime.take_popup_snapshot(true).expect("重新聚焦应推进可见性");
-    assert!(s.visible, "游戏重新 focused → 候选窗恢复可见");
+    let s = f.server.ime.take_popup_snapshot().expect("kb_active 变化应推进 epoch");
+    assert!(s.visible, "聊天形态 kb_active=false 但会话激活 → 候选窗必须可见（sync11 根因）");
+    // 会话终结（clear_focus → relay focus_lost Deactivate）才隐藏。
+    f.unfocus();
+    let s = f.server.ime.take_popup_snapshot().expect("会话终结应推进可见性");
+    assert!(!s.visible, "IME 会话 deactivate → 候选窗隐藏（与键盘捕获无关）");
 }
 
 /// attach(NULL)（fcitx5 隐藏候选窗第一步 `WaylandShmWindow::hide()`）→
@@ -610,14 +613,14 @@ fn popup_null_attach_hides_and_recommit_returns() {
     let (surface, _popup, _px) = popup_with_frame(&mut f, 1, 1, 3);
 
     // 正常帧已交付。
-    let s = f.server.ime.take_popup_snapshot(true).expect("首帧");
+    let s = f.server.ime.take_popup_snapshot().expect("首帧");
     assert!(s.visible);
 
     // attach(NULL) + commit → hide 语义。
     surface.attach(None, 0, 0);
     surface.commit();
     assert!(f.drive());
-    let s = f.server.ime.take_popup_snapshot(true).expect("隐藏应推进状态");
+    let s = f.server.ime.take_popup_snapshot().expect("隐藏应推进状态");
     assert!(!s.visible, "attach(NULL) 后候选窗必须隐藏");
     assert_eq!((s.width, s.height), (0, 0));
 
@@ -629,7 +632,7 @@ fn popup_null_attach_hides_and_recommit_returns() {
     surface.damage_buffer(0, 0, 3, 1);
     surface.commit();
     assert!(f.drive());
-    let s = f.server.ime.take_popup_snapshot(true).expect("重新提交应恢复");
+    let s = f.server.ime.take_popup_snapshot().expect("重新提交应恢复");
     assert!(s.visible);
     assert_eq!((s.width, s.height), (3, 1));
     assert!(s.seq > 1, "seq 单调推进");
@@ -641,12 +644,12 @@ fn popup_destroy_stops_capture() {
     let mut f = setup_popup();
     f.focus_and_enable();
     let (surface, popup, _px) = popup_with_frame(&mut f, 1, 1, 5);
-    assert!(f.server.ime.take_popup_snapshot(true).expect("首帧").visible);
+    assert!(f.server.ime.take_popup_snapshot().expect("首帧").visible);
 
     popup.destroy();
     assert!(f.drive());
     // 销毁交付"消失"状态（不可见、无帧）。
-    let s = f.server.ime.take_popup_snapshot(true).expect("销毁应推进状态");
+    let s = f.server.ime.take_popup_snapshot().expect("销毁应推进状态");
     assert!(!s.visible);
     assert_eq!((s.width, s.height), (0, 0));
     assert!(f.server.ime.im2.popup.is_none(), "既有字段同步清除");
@@ -659,7 +662,7 @@ fn popup_destroy_stops_capture() {
     surface.damage_buffer(0, 0, 1, 1);
     surface.commit();
     assert!(f.drive());
-    assert!(f.server.ime.take_popup_snapshot(true).is_none(), "销毁后不得再采集");
+    assert!(f.server.ime.take_popup_snapshot().is_none(), "销毁后不得再采集");
 }
 
 /// input_method 对象销毁（daemon 顶替/断连路径）→ popup 采集一并解除。
@@ -668,13 +671,13 @@ fn popup_cleared_with_input_method_destroy() {
     let mut f = setup_popup();
     f.focus_and_enable();
     let (_surface, _popup, _px) = popup_with_frame(&mut f, 1, 1, 7);
-    assert!(f.server.ime.take_popup_snapshot(true).expect("首帧").visible);
+    assert!(f.server.ime.take_popup_snapshot().expect("首帧").visible);
 
     let im = f.ime.state.im.take().unwrap();
     im.destroy();
     assert!(f.drive());
     // note_im2_gone → popup.cleared → 交付消失状态。
-    let s = f.server.ime.take_popup_snapshot(true).expect("断连应推进状态");
+    let s = f.server.ime.take_popup_snapshot().expect("断连应推进状态");
     assert!(!s.visible);
     assert!(f.server.ime.im2.instance.is_none(), "im2 实例随 destroy 清空");
 }
@@ -731,7 +734,7 @@ fn popup_same_round_attach_null_race_still_delivers_visible_frame() {
     let popup = f.ime.state.im.as_ref().unwrap().get_input_popup_surface(&surface, &qh, ());
     assert!(f.drive());
     // 角色登记轮消耗 epoch（Java tick 已见不可见交付）。
-    let _ = f.server.ime.take_popup_snapshot(true);
+    let _ = f.server.ime.take_popup_snapshot();
 
     // ── 同一回合：attach 内容 → commit → attach(NULL) → commit → destroy → 新角色 ──
     let px = argb_pattern(4, 3, 0);
@@ -753,7 +756,7 @@ fn popup_same_round_attach_null_race_still_delivers_visible_frame() {
     let snap = f
         .server
         .ime
-        .take_popup_snapshot(true)
+        .take_popup_snapshot()
         .expect("回合内帧+清除应推进 epoch");
     assert!(snap.visible, "回合内 attach(NULL) 竞态不得吞掉从未交付的帧");
     assert_eq!((snap.width, snap.height), (4, 3));
@@ -772,7 +775,7 @@ fn popup_race_frame_expires_to_hidden_after_hold_window() {
     let surface = f.ime.state.compositor.as_ref().unwrap().create_surface(&qh, ());
     let _popup = f.ime.state.im.as_ref().unwrap().get_input_popup_surface(&surface, &qh, ());
     assert!(f.drive());
-    let _ = f.server.ime.take_popup_snapshot(true);
+    let _ = f.server.ime.take_popup_snapshot();
 
     // 同回合竞态：内容帧 + attach(NULL)。
     let px = argb_pattern(2, 2, 5);
@@ -787,24 +790,24 @@ fn popup_race_frame_expires_to_hidden_after_hold_window() {
     assert!(f.drive());
 
     // 第一次轮询：hold 交付可见帧。
-    let s = f.server.ime.take_popup_snapshot(true).expect("竞态帧应交付");
+    let s = f.server.ime.take_popup_snapshot().expect("竞态帧应交付");
     assert!(s.visible);
     assert_eq!(s.argb.as_ref().unwrap(), &px);
 
     // 假时钟推进过 hold 窗口（无新帧）→ 下一次轮询必须隐藏（真清状态）。
     let t = f.server.ime.popup.now();
     f.server.ime.popup.set_clock(t + std::time::Duration::from_millis(401));
-    let s = f.server.ime.take_popup_snapshot(true).expect("hold 到期应推进状态");
+    let s = f.server.ime.take_popup_snapshot().expect("hold 到期应推进状态");
     assert!(!s.visible, "hold 到期且无新帧 → 候选窗必须隐藏");
     assert!(s.argb.is_none());
     // 再轮询零拷贝。
-    assert!(f.server.ime.take_popup_snapshot(true).is_none());
+    assert!(f.server.ime.take_popup_snapshot().is_none());
 }
 
 // ═══════════════ Java 轮询 × JNI 编码合同（sync8 静默故障复盘）═══════════════
 
 /// Java 每 tick 轮询的 native 半程复刻：`ImeCandidateOverlay.tick()` 每帧
-/// 调 `take_popup_snapshot(kb_active)` 再按 `bridge::encode_popup_snapshot`
+/// 调 `take_popup_snapshot()` 再按 `bridge::encode_popup_snapshot`
 /// 编码——**这是编码合同测试**：若这里断，根因在 native；全绿则根因锁定
 /// Java 运行时链（tick→upload→extract）。断言：
 /// - 角色登记轮：13 字节不可见帧（epoch 由 created 推进）；
@@ -823,7 +826,7 @@ fn popup_java_polling_sequence_matches_wire_encoding_contract() {
     let surface = f.ime.state.compositor.as_ref().unwrap().create_surface(&qh, ());
     let _popup = f.ime.state.im.as_ref().unwrap().get_input_popup_surface(&surface, &qh, ());
     assert!(f.drive());
-    let raw = poll_java_tick(&mut f, true).expect("角色登记推进 epoch，tick 应有交付");
+    let raw = poll_java_tick(&mut f).expect("角色登记推进 epoch，tick 应有交付");
     assert_eq!(raw.len(), 13, "无帧交付必须恰为 13 字节头");
     assert_eq!(raw[12], 0, "无帧时 visible=0");
 
@@ -835,7 +838,7 @@ fn popup_java_polling_sequence_matches_wire_encoding_contract() {
     surface.damage_buffer(0, 0, 4, 3);
     surface.commit();
     assert!(f.drive());
-    let raw = poll_java_tick(&mut f, true).expect("新帧必须在下一 tick 交付");
+    let raw = poll_java_tick(&mut f).expect("新帧必须在下一 tick 交付");
     assert_eq!(raw.len(), 13 + 4 * 3 * 4, "编码总长 = 13 + w*h*4");
     assert_eq!(&raw[0..4], &4i32.to_le_bytes(), "w");
     assert_eq!(&raw[4..8], &3i32.to_le_bytes(), "h");
@@ -852,14 +855,14 @@ fn popup_java_polling_sequence_matches_wire_encoding_contract() {
 
     // 3) 无变化连续轮询（模拟 Java 60 tick）→ 全部 null（零拷贝路径）。
     for i in 0..60 {
-        assert!(poll_java_tick(&mut f, true).is_none(), "第 {i} 轮无变化必须 null");
+        assert!(poll_java_tick(&mut f).is_none(), "第 {i} 轮无变化必须 null");
     }
 
     // 4) attach(NULL)（WaylandShmWindow::hide 第一步）→ 13 字节 visible=0。
     surface.attach(None, 0, 0);
     surface.commit();
     assert!(f.drive());
-    let raw = poll_java_tick(&mut f, true).expect("隐藏应交付状态");
+    let raw = poll_java_tick(&mut f).expect("隐藏应交付状态");
     assert_eq!(raw.len(), 13);
     assert_eq!(raw[12], 0);
 
@@ -872,8 +875,8 @@ fn popup_java_polling_sequence_matches_wire_encoding_contract() {
 
 /// Java tick 的 native 半程：take_popup_snapshot + bridge 编码（共用生产
 /// 纯函数，非复刻实现——编码漂移这里直接红）。
-fn poll_java_tick(f: &mut PopupFixture, kb_active: bool) -> Option<Vec<u8>> {
-    let snap = f.server.ime.take_popup_snapshot(kb_active)?;
+fn poll_java_tick(f: &mut PopupFixture) -> Option<Vec<u8>> {
+    let snap = f.server.ime.take_popup_snapshot()?;
     Some(crate::bridge::encode_popup_snapshot(&snap))
 }
 
@@ -909,7 +912,7 @@ fn popup_work_state_production_shapes() {
 
     // 采一帧并交付（overlay 显示候选窗）。
     let (surface, _popup, _px) = popup_with_frame(&mut f, 6, 2, 1);
-    let s = f.server.ime.take_popup_snapshot(true).expect("首帧").visible;
+    let s = f.server.ime.take_popup_snapshot().expect("首帧").visible;
     assert!(s);
 
     // 证据 2 + 旧 bug 锁定：选字上屏 = 纯 commit_string 批次。新语义
@@ -944,13 +947,13 @@ fn popup_work_state_production_shapes() {
     std::mem::forget(buf);
     assert!(f.drive());
     assert!(f.server.ime.popup_work_state(), "采到新帧 = 组字证据置位");
-    let s = f.server.ime.take_popup_snapshot(true).expect("hold 交付");
+    let s = f.server.ime.take_popup_snapshot().expect("hold 交付");
     assert!(s.visible && s.argb.as_deref() == Some(&px2[..]));
     assert!(f.server.ime.popup_work_state(), "hold 交付期间证据保持");
     // 假时钟推过 hold 窗口 → 轮询到期 → 可见性与角标同步回落。
     let t = f.server.ime.popup.now();
     f.server.ime.popup.set_clock(t + std::time::Duration::from_millis(POPUP_HOLD_MS + 1));
-    let s = f.server.ime.take_popup_snapshot(true).expect("到期应推进");
+    let s = f.server.ime.take_popup_snapshot().expect("到期应推进");
     assert!(!s.visible);
     assert!(!f.server.ime.popup_work_state(), "hold 到期无新帧 → 角标终结");
 }
@@ -966,7 +969,7 @@ fn popup_pointer_click_sends_enter_motion_button() {
     f.focus_and_enable();
     let (surface, _popup, _px) = popup_with_frame(&mut f, 40, 12, 0);
     // 交付首帧，让 overlay 侧"已显示"。
-    assert!(f.server.ime.take_popup_snapshot(true).expect("首帧").visible);
+    assert!(f.server.ime.take_popup_snapshot().expect("首帧").visible);
 
     let srv = f.server_surface_of_ime(&surface);
     // 按下（候选区某点）。
@@ -1014,7 +1017,7 @@ fn popup_pointer_axis_sends_wheel() {
     let mut f = setup_popup();
     f.focus_and_enable();
     let (surface, _popup, _px) = popup_with_frame(&mut f, 40, 12, 0);
-    assert!(f.server.ime.take_popup_snapshot(true).expect("首帧").visible);
+    assert!(f.server.ime.take_popup_snapshot().expect("首帧").visible);
     let srv = f.server_surface_of_ime(&surface);
 
     f.server.seat.popup_pointer_axis(&srv, 20.0, 6.0, 1.0);
@@ -1219,7 +1222,7 @@ fn real_fcitx5_popup_frame_capture_and_click() {
                         if server.ime.popup_surface().is_some() {
                             popup_seen = true;
                         }
-                        if let Some(s) = server.ime.take_popup_snapshot(true) {
+                        if let Some(s) = server.ime.take_popup_snapshot() {
                             let full_pixels = s
                                 .argb
                                 .as_ref()
@@ -1256,7 +1259,7 @@ fn real_fcitx5_popup_frame_capture_and_click() {
                 pump(&mut display, &mut server, &mut editor, &listener);
                 popup_seen = server.ime.popup_surface().is_some();
                 if popup_seen {
-                    if let Some(s) = server.ime.take_popup_snapshot(true) {
+                    if let Some(s) = server.ime.take_popup_snapshot() {
                         if s.visible {
                             snap_opt = Some(s);
                             break;

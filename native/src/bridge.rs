@@ -2032,9 +2032,9 @@ fn ime_popup_frame<'local>(
     instance: jlong,
 ) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
     let instance = jptr_to_instance!(instance, "imePopupFrame")?;
-    // 拆分借用：kb_active 在 seat、快照在 ime——顺序读避免双 &mut。
-    let kb_active = instance.state.seat.kb_active;
-    let Some(snap) = instance.state.ime.take_popup_snapshot(kb_active) else {
+    // 可见性门已不依赖 seat.kb_active（窗口捕获信号，聊天打字恒 false——
+    // sync11 根因）；快照只跟 IME 会话激活 + 内容，输入框聚焦由 Java hasBox 把守。
+    let Some(snap) = instance.state.ime.take_popup_snapshot() else {
         return Ok(JPrimitiveArray::null());
     };
     let data = encode_popup_snapshot(&snap);

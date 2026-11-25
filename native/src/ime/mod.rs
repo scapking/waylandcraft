@@ -235,7 +235,7 @@ impl ImeState {
     /// 这是协议 activate/deactivate"popup 仅在 IM active 时可见"语义的本地
     /// 落实（v2 无显式 visible 事件，见 input_popup.rs 模块头）。
     /// Java 侧再叠加"聊天框 focused"等屏幕语境决定是否真的绘制。
-    pub fn take_popup_snapshot(&mut self, kb_active: bool) -> Option<PopupSnapshot> {
+    pub fn take_popup_snapshot(&mut self) -> Option<PopupSnapshot> {
         // display hold 到期结算（轮询驱动，无需定时器）：到期仍无新帧 →
         // 快照通道回落不可见（Java 隐藏），同时终结组字证据（角标落）。
         let now = self.popup.now();
@@ -245,13 +245,19 @@ impl ImeState {
         if !self.popup.changed() {
             return None;
         }
-        // 可见性门用 has_content（live 帧或 hold 暂存帧）：sync9 回合内
-        // 竞态里 attach(NULL) 先于轮询到达，live 帧恒空——hold 交付保证
-        // 每个真实采到的帧至少经历一次 visible=true。
-        let visible = self.popup.has_content(now)
-            && self.popup_ime_active()
-            && self.has_focus
-            && kb_active;
+        // 可见性门 = 有内容（live 帧或 hold 暂存帧）&& IME 会话激活。
+        //
+        // sync11 生产根因修复：**不再用 has_focus / kb_active 做门**。
+        // 那两个是「native 窗口键盘焦点 / 窗口捕获键盘 grab」信号——
+        // 聊天框打字时没有 native 窗口被聚焦（focusSurface 只接受
+        // ToplevelSurface），二者恒 false，导致聊天场景候选窗可见性恒 0
+        // （用户四轮"采到帧但候选窗从不显示"的真正根因；last_visible_delivery
+        // 偶尔有值只是用户开窗口捕获恰好撞上的巧合）。
+        // 正确的会话语义由 popup_ime_active（im2 在位 && relay.app_active，
+        // 即 ti3 enable/disable）承载，Activate/Deactivate 已 popup_touch
+        // 推进 epoch；「用户是否在输入框打字」由 Java 侧 hasBox（EditBox
+        // focused）门把守，native 不该重复且错误地用窗口信号再 gate 一次。
+        let visible = self.popup.has_content(now) && self.popup_ime_active();
         let snap = self.popup.snapshot(visible);
         self.popup.mark_delivered(snap.visible);
         // 观测网（sync8 静默故障复盘）：交付侧记账——"native 采到了帧"
