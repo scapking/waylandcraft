@@ -31,6 +31,70 @@ public class SharedWindowClientHandler {
 	// 远程窗口缓存: windowHandle -> WindowInfo
 	private static final Map<Long, WindowInfo> remoteWindows = new ConcurrentHashMap<>();
 	
+	// ⑦ 窗口列表到达前暂存的音频包（列表广播与音频包到达顺序不保证）：
+	// TTL 15s、每窗口 100 包封顶，超时/超量丢最旧。
+	private record HeldAudio(SharedWindowAudioPayload payload, long arrivalMs) {}
+	private static final Map<Long, java.util.ArrayDeque<HeldAudio>> pendingAudio = new ConcurrentHashMap<>();
+	private static final long PENDING_AUDIO_TTL_MS = 15_000;
+	private static final int PENDING_AUDIO_MAX_PACKETS = 100;
+	private static volatile long lastPendingAudioLogMs = 0;
+	
+	/** ⑦ 音频范围衰减用：窗口在世界中的 pivot（未知返回 null，播放侧保持上次增益） */
+	public static Vec3 getWindowPivot(long windowHandle) {
+		WindowInfo info = remoteWindows.get(windowHandle);
+		return info != null ? info.pivot() : null;
+	}
+	
+	private static void holdAudio(SharedWindowAudioPayload payload) {
+		java.util.ArrayDeque<HeldAudio> q =
+			pendingAudio.computeIfAbsent(payload.windowHandle(), h -> new java.util.ArrayDeque<>());
+		int size;
+		long now = System.currentTimeMillis();
+		synchronized(q) {
+			q.addLast(new HeldAudio(payload, now));
+			while(q.size() > PENDING_AUDIO_MAX_PACKETS) q.removeFirst();
+			size = q.size();
+		}
+		// 首次暂存提示一次（10s 节流），便于定位"无声"是否为时序问题
+		if(now - lastPendingAudioLogMs > 10_000) {
+			lastPendingAudioLogMs = now;
+			LOGGER.info("[audio] holding packets for not-yet-listed window 0x{} ({} pending) — list update not arrived yet",
+				Long.toHexString(payload.windowHandle()), size);
+		}
+	}
+	
+	/** 列表更新后补放暂存音频；过期整批丢弃 */
+	private static void flushPendingAudio() {
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.audioPlaybackManager == null) return;
+		long now = System.currentTimeMillis();
+		for(Long handle : new ArrayList<>(pendingAudio.keySet())) {
+			if(!remoteWindows.containsKey(handle)) {
+				java.util.ArrayDeque<HeldAudio> q = pendingAudio.get(handle);
+				if(q != null) {
+					synchronized(q) {
+						while(!q.isEmpty() && now - q.peekFirst().arrivalMs() > PENDING_AUDIO_TTL_MS) q.removeFirst();
+						if(q.isEmpty()) pendingAudio.remove(handle);
+					}
+				}
+				continue;
+			}
+			java.util.ArrayDeque<HeldAudio> q = pendingAudio.remove(handle);
+			if(q == null) continue;
+			int flushed = 0;
+			synchronized(q) {
+				HeldAudio held;
+				while((held = q.pollFirst()) != null) {
+					if(now - held.arrivalMs() > PENDING_AUDIO_TTL_MS) continue;
+					SharedWindowAudioPayload p = held.payload();
+					wlc.audioPlaybackManager.enqueue(p.windowHandle(), p.sampleRate(), p.channels(), p.pcmData(), p.captureTimestampMs());
+					flushed++;
+				}
+			}
+			LOGGER.info("[audio] flushed {} held packets for window 0x{}", flushed, Long.toHexString(handle));
+		}
+	}
+	
 	/**
 	 * 注册客户端网络处理器
 	 */
@@ -60,10 +124,15 @@ public class SharedWindowClientHandler {
 		ClientPlayNetworking.registerGlobalReceiver(SharedWindowAudioPayload.TYPE, (payload, ctx) -> {
 			WaylandCraft wlc = WaylandCraft.instance;
 			if(wlc != null && wlc.audioPlaybackManager != null) {
-				// 只播放已知窗口的声音（窗口列表里有才播放，避免脏包）
+				// ⑦ 此前"窗口列表未到就丢音频包"是多人收不到声音的根因之一
+				// （音频包往往先于列表广播到达）。现在暂存，列表更新时补放。
 				if(remoteWindows.containsKey(payload.windowHandle())) {
 					wlc.audioPlaybackManager.enqueue(
-						payload.windowHandle(), payload.sampleRate(), payload.channels(), payload.pcmData());
+						payload.windowHandle(), payload.sampleRate(), payload.channels(),
+						payload.pcmData(), payload.captureTimestampMs());
+				}
+				else {
+					holdAudio(payload);
 				}
 			}
 		});
@@ -100,6 +169,7 @@ public class SharedWindowClientHandler {
 				if(wlc.remoteWindowRenderer != null) {
 					wlc.remoteWindowRenderer.clear();
 				}
+				pendingAudio.clear(); // ⑦ 断线清空暂存音频
 				if(wlc.audioPlaybackManager != null) {
 					// OpenAL 必须在主线程释放
 					client.execute(() -> wlc.audioPlaybackManager.closeAll());
@@ -131,6 +201,8 @@ public class SharedWindowClientHandler {
 				}
 				if(!stillListed) {
 					instance.remoteWindowRenderer.destroyTexture(handle);
+					instance.remoteWindowRenderer.removeWindow(handle); // ⑦ 丢 playout 流与缓冲
+					pendingAudio.remove(handle);
 					if(instance.audioPlaybackManager != null) {
 						instance.audioPlaybackManager.close(handle);
 					}
@@ -151,6 +223,9 @@ public class SharedWindowClientHandler {
 		
 		// 更新WaylandCraft的共享窗口显示
 		updateSharedDisplays();
+		
+		// ⑦ 列表就绪后补放此前因"窗口未知"被暂存的音频包
+		flushPendingAudio();
 	}
 	
 	/**
@@ -182,13 +257,16 @@ public class SharedWindowClientHandler {
 			return;
 		}
 		
-		// 节流：JPEG 解码已移到后台工作线程（updateTexture 只入队），主线程不再被解码卡住。
-		// 保留 50ms 节流匹配 20fps，防止入队/状态更新过频造成无意义堆积。
-		long now = System.currentTimeMillis();
-		if(now - info.lastImageProcessTime < 50) {
-			return;
+		// 节流：仅在低延迟模式（D=0）保留 50ms 入队节流匹配 20fps。
+		// ⑦ 预缓冲模式下绝不丢包——每一帧都是缓冲深度的来源，由 playout 时钟
+		// 决定何时解码/显示；updateTexture 只 append 环形队列，主线程成本 O(1)。
+		if(RemoteWindowRenderer.playoutDelayMs() <= 0) {
+			long now = System.currentTimeMillis();
+			if(now - info.lastImageProcessTime < 50) {
+				return;
+			}
+			info.lastImageProcessTime = now;
 		}
-		info.lastImageProcessTime = now;
 		
 		// 更新图像数据
 		info.updateImage(payload.imageData(), payload.width(), payload.height());
@@ -220,7 +298,8 @@ public class SharedWindowClientHandler {
 				payload.windowHandle(),
 				payload.x(), payload.y(),
 				payload.width(), payload.height(),
-				payload.imageData()
+				payload.imageData(),
+				payload.captureTimestampMs(), payload.frameSeq()
 			);
 		}
 		

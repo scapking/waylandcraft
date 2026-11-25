@@ -1104,6 +1104,38 @@ public class WaylandCraftCommand {
 					source.sendFeedback(Component.literal("§a✔ §eterminalChoice§r = §e" + value + "§r"));
 					return 1;
 				}
+				// ⑦ 共享接收端预缓冲深度：用延迟换零卡顿
+				case "sharePlayoutDelayMs" -> {
+					int ms;
+					try { ms = Integer.parseInt(value); }
+					catch(NumberFormatException e) {
+						source.sendError(Component.literal("§c✘ sharePlayoutDelayMs 需要整数（毫秒）§r"));
+						return 0;
+					}
+					if(ms < 0 || ms > 8000) {
+						source.sendError(Component.literal("§c✘ sharePlayoutDelayMs 范围 0..8000；0=低延迟旧行为，4000=默认（预缓冲 4s 换流畅）§r"));
+						return 0;
+					}
+					wlc.settingsManager.setIntSetting(WaylandCraftSettings.SHARE_PLAYOUT_DELAY_MS, ms);
+					source.sendFeedback(Component.literal("§a✔ §esharePlayoutDelay§r = §e" + ms + "ms§r（接收端立即生效）"));
+					return 1;
+				}
+				// ⑦ 共享窗口声音可听范围（格）
+				case "audioShareRangeBlocks" -> {
+					double blocks;
+					try { blocks = Double.parseDouble(value); }
+					catch(NumberFormatException e) {
+						source.sendError(Component.literal("§c✘ audioShareRangeBlocks 需要数字（格）§r"));
+						return 0;
+					}
+					if(blocks < 0 || blocks > 256) {
+						source.sendError(Component.literal("§c✘ audioShareRangeBlocks 范围 0..256；0=全局恒响（旧行为）§r"));
+						return 0;
+					}
+					wlc.settingsManager.setDoubleSetting(WaylandCraftSettings.AUDIO_SHARE_RANGE_BLOCKS, blocks);
+					source.sendFeedback(Component.literal("§a✔ §eaudioShareRangeBlocks§r = §e" + blocks + "§r 格"));
+					return 1;
+				}
 				case "hideCursor" -> {
 					wlc.settingsManager.setBooleanSetting(WaylandCraftSettings.HIDE_CURSOR, Boolean.parseBoolean(value));
 					source.sendFeedback(Component.literal("§a✔ §ehideCursor§r = §e" + value + "§r"));

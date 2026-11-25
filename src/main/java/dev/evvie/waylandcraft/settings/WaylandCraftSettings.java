@@ -59,6 +59,12 @@ public class WaylandCraftSettings {
 	/** Ctrl+方向键在布局中切换核心窗口（0上 1下 2左 3右 由按键决定，见代码） */
 	double moveStep = 0.5;
 	
+	/* ---- ⑦ 多人共享 playout / 音频范围 ---- */
+	/** 接收端预缓冲深度（ms）：0=低延迟（旧行为，最新帧直传），默认 4000=用 4s 延迟换零卡顿 */
+	int sharePlayoutDelayMs = 4000;
+	/** 共享窗口声音的可听范围（格）：窗口位置超过该距离衰减到 0；0=全局恒响（旧行为） */
+	double audioShareRangeBlocks = 32.0;
+	
 	/* This is where the field names go to avoid typos */
 	public static final String PIXELS_PER_BLOCK = "pixelsPerBlock";
 	public static final String WINDOW_ANTIALIASING = "windowAntialiasing";
@@ -81,6 +87,8 @@ public class WaylandCraftSettings {
 	public static final String LAYOUT_DEFAULT_HEIGHT = "layoutDefaultHeight";
 	public static final String GROUND_CLEARANCE = "groundClearance";
 	public static final String MOVE_STEP = "moveStep";
+	public static final String SHARE_PLAYOUT_DELAY_MS = "sharePlayoutDelayMs";
+	public static final String AUDIO_SHARE_RANGE_BLOCKS = "audioShareRangeBlocks";
 	
 	/* This is where the getters go */
 	
@@ -166,6 +174,14 @@ public class WaylandCraftSettings {
 	
 	public double getMoveStep() {
 		return moveStep;
+	}
+	
+	public int getSharePlayoutDelayMs() {
+		return sharePlayoutDelayMs;
+	}
+	
+	public double getAudioShareRangeBlocks() {
+		return audioShareRangeBlocks;
 	}
 	
 	/* Methods to modifiy settings by name */

@@ -13,15 +13,20 @@ import net.minecraft.resources.Identifier;
  * 服务端原样转发给有 VIEW 权限的其他玩家；
  * 接收端按 windowHandle 用 OpenAL 连续播放。
  * 
+ * ⑦ v2：新增 captureTimestampMs——接收端用它与视频共用同一 playout 时钟
+ * （captureTs + 估计偏移 + 预缓冲延迟 到点才喂 OpenAL），使音频与预缓冲后的
+ * 视频保持同步；不依赖它做重组。
+ * 
  * @param windowHandle 共享窗口句柄（用于区分不同共享源）
  * @param seq         递增序号（同窗口内保序；丢包可接受，音频不重组）
  * @param sampleRate  采样率（Hz），如 48000
  * @param channels    声道数（1=mono, 2=stereo）
  * @param pcmData     S16LE PCM 数据
+ * @param captureTimestampMs 该 chunk 首样本的捕获时刻（发送端墙钟，ms）
  */
-public record SharedWindowAudioPayload(long windowHandle, int seq, int sampleRate, int channels, byte[] pcmData) implements CustomPacketPayload {
+public record SharedWindowAudioPayload(long windowHandle, int seq, int sampleRate, int channels, byte[] pcmData, long captureTimestampMs) implements CustomPacketPayload {
 	
-	public static final Identifier ID = Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "shared_window_audio");
+	public static final Identifier ID = Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "shared_window_audio_v2");
 	
 	public static final CustomPacketPayload.Type<SharedWindowAudioPayload> TYPE = new CustomPacketPayload.Type<>(ID);
 	
@@ -33,6 +38,7 @@ public record SharedWindowAudioPayload(long windowHandle, int seq, int sampleRat
 			buf.writeVarInt(payload.channels);
 			buf.writeVarInt(payload.pcmData.length);
 			buf.writeBytes(payload.pcmData);
+			buf.writeLong(payload.captureTimestampMs);
 		},
 		buf -> {
 			long windowHandle = buf.readLong();
@@ -42,7 +48,8 @@ public record SharedWindowAudioPayload(long windowHandle, int seq, int sampleRat
 			int dataLength = buf.readVarInt();
 			byte[] pcmData = new byte[dataLength];
 			buf.readBytes(pcmData);
-			return new SharedWindowAudioPayload(windowHandle, seq, sampleRate, channels, pcmData);
+			long captureTimestampMs = buf.readLong();
+			return new SharedWindowAudioPayload(windowHandle, seq, sampleRate, channels, pcmData, captureTimestampMs);
 		}
 	);
 	

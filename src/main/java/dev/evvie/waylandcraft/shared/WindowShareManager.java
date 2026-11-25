@@ -399,6 +399,8 @@ public class WindowShareManager {
 			senderPixelsPerBlock = WaylandCraft.instance.settings.getPixelsPerBlock();
 		}
 		
+		// ⑦ captureTs 取发送时刻（与捕获仅隔一次编码，<数十ms，作为 playout 时钟足够）；
+		// frameSeq 用发送前的 frameCount，单调递增，供接收端观测丢帧/乱序。
 		SharedWindowImagePayload imagePayload = new SharedWindowImagePayload(
 			state.windowHandle, 0, framebufferXOff, framebufferYOff,
 			originalW, originalH,
@@ -407,7 +409,8 @@ public class WindowShareManager {
 			normalX, normalY, normalZ,
 			downX, downY, downZ,
 			viewScale, geometryWidth, geometryHeight,
-			senderPixelsPerBlock
+			senderPixelsPerBlock,
+			System.currentTimeMillis(), (int) state.frameCount
 		);
 		ClientPlayNetworking.send(imagePayload);
 		
@@ -509,7 +512,8 @@ public class WindowShareManager {
 			0, 0, 1,
 			0, -1, 0,
 			1.0, srcW, srcH,
-			senderPixelsPerBlock()
+			senderPixelsPerBlock(),
+			System.currentTimeMillis(), (int) state.frameCount
 		);
 		ClientPlayNetworking.send(imagePayload);
 

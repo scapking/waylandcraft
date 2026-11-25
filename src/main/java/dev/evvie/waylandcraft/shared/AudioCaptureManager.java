@@ -138,14 +138,18 @@ public class AudioCaptureManager {
 			nextAudioLogBytes += 1_000_000;
 		}
 		
-		// 分包发送
+		// 分包发送。⑦ 每个 chunk 的 captureTs = 本次 poll 时刻回推该 chunk 在
+		// PCM 时间线上的样本位置（poll 到点收集了 [now-span, now) 的音频），
+		// 使接收端音视频共用同一 playout 时钟。
+		int bytesPerSecond = sampleRate * channels * 2;
 		for(int offset = 0; offset < pcm.length; offset += MAX_PACKET_BYTES) {
 			int len = Math.min(MAX_PACKET_BYTES, pcm.length - offset);
 			byte[] chunk = new byte[len];
 			System.arraycopy(pcm, offset, chunk, 0, len);
+			long chunkCaptureTs = now - (long)(pcm.length - offset) * 1000 / Math.max(1, bytesPerSecond);
 			
 			SharedWindowAudioPayload payload = new SharedWindowAudioPayload(
-				windowHandle(), seqCounter++, sampleRate, channels, chunk);
+				windowHandle(), seqCounter++, sampleRate, channels, chunk, chunkCaptureTs);
 			ClientPlayNetworking.send(payload);
 			sentPackets++;
 		}
