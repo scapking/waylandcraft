@@ -429,6 +429,13 @@ bind_java_type! {
             name = "takeLookupTableNative",
             fn = take_lookup_table,
         },
+        // Phase 1 候选窗帧轮询：byte[] = [w i32][h i32][seq u32][visible u8]
+        // [argb w*h*4]；**null = 无新状态**（零拷贝廉价路径，见 ime_popup_frame）。
+        static extern fn ime_popup_frame {
+            sig = (instance: jlong) -> byte[],
+            name = "imePopupFrameNative",
+            fn = ime_popup_frame,
+        },
         static extern fn update_cursor_rect {
             sig = (instance: jlong, x: jint, y: jint, w: jint, h: jint),
             name = "updateCursorRectNative",
@@ -1556,6 +1563,9 @@ fn keyboard_activate<'local>(
 ) -> Result<(), BridgeError> {
     let instance = jptr_to_instance!(instance, "keyboardActivate")?;
     instance.state.seat.activate_keyboard();
+    // 游戏 focused 原料变化 → 候选窗可见性可能翻转，推进采集 epoch
+    // （否则 kb_active false→true 而内容不变时，轮询看不到 visible=true）。
+    instance.state.ime.popup_touch();
 
     Ok(())
 }
@@ -1567,6 +1577,7 @@ fn keyboard_deactivate<'local>(
 ) -> Result<(), BridgeError> {
     let instance = jptr_to_instance!(instance, "keyboardDeactivate")?;
     instance.state.seat.deactivate_keyboard();
+    instance.state.ime.popup_touch();
 
     Ok(())
 }
@@ -1963,6 +1974,39 @@ fn take_lookup_table<'local>(
         None => String::new(),
     };
     env.new_string(json).map_err(BridgeError::JniError)
+}
+
+/// imePopupFrame(instance) —— 轮询嵌套 fcitx5 候选窗帧（Phase 1）。
+///
+/// 编码（小端）：`[width i32][height i32][seq u32][visible u8][argb…]`，
+/// 其中 argb 仅 visible=1 时在场（w*h*4 字节，ARGB8888 小端内存序，
+/// 即 u32 0xAARRGGBB/像素——Java 侧 ByteBuffer.getInt() 直接解出标准
+/// ARGB int）。**返回 null = 自上次轮询以来无任何状态变化**（无新帧且
+/// 可见性原料未变），零拷贝；无 popup 时同样落在这条极廉价路径。
+///
+/// Java 侧解码为 `ImeCandidateOverlay.PopupFrame`：null→保持现状；
+/// visible=false→隐藏；visible=true+新 seq→上传纹理并显示。
+fn ime_popup_frame<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imePopupFrame")?;
+    // 拆分借用：kb_active 在 seat、快照在 ime——顺序读避免双 &mut。
+    let kb_active = instance.state.seat.kb_active;
+    let Some(snap) = instance.state.ime.take_popup_snapshot(kb_active) else {
+        return Ok(JPrimitiveArray::null());
+    };
+    let pixels = snap.argb.as_ref().map(|a| a.len()).unwrap_or(0);
+    let mut data = Vec::with_capacity(13 + pixels);
+    data.extend_from_slice(&snap.width.to_le_bytes());
+    data.extend_from_slice(&snap.height.to_le_bytes());
+    data.extend_from_slice(&snap.seq.to_le_bytes());
+    data.push(snap.visible as u8);
+    if let Some(argb) = &snap.argb {
+        data.extend_from_slice(argb);
+    }
+    Ok(env.byte_array_from_slice(&data)?)
 }
 
 /// C 方案：Java 端 CursorRectReporter 已不再需要（嵌套应用通过自己的 ti3

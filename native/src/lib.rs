@@ -208,7 +208,13 @@ impl CompositorHandler for WLCState {
         &client.get_data::<WLCClient>().unwrap().compositor_state
     }
 
-    fn commit(&mut self, _surface: &WlSurface) {}
+    fn commit(&mut self, surface: &WlSurface) {
+        // Phase 1 候选窗采集：若该 surface 持有 input_popup 角色，
+        // 把 shm 缓冲拷成 ARGB8888 帧并 release。非 popup 极廉价返回
+        // （一次 Option 比较），不影响 xdg/satellite 窗口既有路径——
+        // 它们不经这里取帧（Java update_surface_data 拉取式）。
+        crate::ime::input_popup::on_popup_commit(self, surface);
+    }
 }
 
 impl BufferHandler for WLCState {

@@ -201,7 +201,7 @@ impl Dispatch<ZwpInputMethodV2, ()> for WLCState {
             zwp_input_method_v2::Request::Commit { serial } => {
                 state.ime.ime_commit_from_wire(serial);
             }
-            zwp_input_method_v2::Request::GetInputPopupSurface { id, surface: _ } => {
+            zwp_input_method_v2::Request::GetInputPopupSurface { id, surface } => {
                 let popup: ZwpInputPopupSurfaceV2 = data_init.init(id, ());
                 // 如实上报最近已知矩形（尚未上报时按协议语义发 0 矩形占位）。
                 let (x, y, w, h) = state
@@ -210,7 +210,20 @@ impl Dispatch<ZwpInputMethodV2, ()> for WLCState {
                     .last_cursor_rect
                     .unwrap_or((0, 0, 0, 0));
                 popup.text_input_rectangle(x, y, w, h);
-                state.ime.im2.popup = Some(popup);
+                state.ime.im2.popup = Some(popup.clone());
+                // ── Phase 1 候选窗采集（纯加线，上方既有逻辑不改）──
+                // 协议：surface 已有角色 → 二次赋予即协议错误。v2 XML 无
+                // error 枚举，沿用 KWin im2 实现的 code=1 "Role" 约定。
+                // （new_id 必须先 init 再报错，否则 wayland-server 对
+                // 未初始化资源会 panic——报错后连接本就会终止。）
+                if state.ime.popup.role_taken(&surface) {
+                    popup.post_error(
+                        1u32,
+                        "surface already assigned an input_popup role",
+                    );
+                    return;
+                }
+                state.ime.register_popup_role(&popup, &surface);
             }
             zwp_input_method_v2::Request::GrabKeyboard { keyboard } => {
                 let grab: ZwpInputMethodKeyboardGrabV2 = data_init.init(keyboard, ());
@@ -279,5 +292,7 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for WLCState {
         if state.ime.im2.popup.as_ref().is_some_and(|p| p.id() == popup.id()) {
             state.ime.im2.popup = None;
         }
+        // Phase 1 候选窗采集轨道同步解除（仅当销毁的是当前登记对象）。
+        state.ime.clear_popup_role(popup.id());
     }
 }
