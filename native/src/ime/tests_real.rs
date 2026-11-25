@@ -728,3 +728,248 @@ fn real_fcitx5_serial_drift_still_commits() {
         r.ti_events
     );
 }
+
+// ════════════════ 种子 v2：全部已装引擎 + Ctrl+Shift+B 切换 ════════════════
+
+/// 按修饰键顺序发一个和弦（evdev 码 + press/release 序列），完全复刻
+/// 生产链路：keyboardUpdate 先行更新 seat xkb 态 → keyboardInput 读
+/// modifiers_tuple 喂 handle_key（KeyboardHandlerMixin 的次序纪律）。
+fn type_chord(h: &mut Harness, seq: &[(u32, bool)]) {
+    for (evdev, press) in seq {
+        let xkb = evdev + 8;
+        h.server.seat.keyboard_update_xkb(xkb, *press);
+        let mods = h.server.seat.modifiers_tuple();
+        h.server.ime.handle_key(
+            xkb,
+            if *press { KeyboardAction::Press } else { KeyboardAction::Release },
+            mods,
+        );
+        h.pump_burst(Duration::from_millis(80));
+    }
+}
+
+/// 等编辑器 ti3 出现新的非 ASCII commit（自 `since` 索引起），返回文本。
+fn wait_new_cjk(h: &mut Harness, since: usize, timeout: Duration) -> Option<String> {
+    let t0 = Instant::now();
+    while t0.elapsed() < timeout {
+        h.pump();
+        if let Some(ev) = h
+            .editor
+            .state
+            .ti_events
+            .iter()
+            .skip(since)
+            .find(|e| e.starts_with("commit(") && e.chars().skip(7).any(|c| !c.is_ascii()))
+        {
+            return Some(ev.clone());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// 种子 v2 端到端（真机）：生产种子函数写全新隔离 HOME → 真 fcitx5 拉起
+/// → 默认引擎拼音出汉字 commit → **连按 Ctrl+Shift+B 枚举走到 wbpy（五笔
+/// 拼音混合）**（种子补的 EnumerateForwardKeys——5.1.12 出厂该键为空，见
+/// seed_fcitx5_home_v2 文档）→ wbpy 用同一段拼音编码再次 commit → SIGTERM
+/// 后 fcitx5 退出保存把切换结果写回 profile，DefaultIM=wbpy 落盘为硬证。
+///
+/// 即“种子 v2 后真 fcitx5 至少两个引擎可切换/可 commit”的验收用例。
+/// 前提（本机实况）：fcitx5-chinese-addons 已装且 pinyin/wbpy 均 conf
+/// Enable=true（注意 cangjie.conf 出厂 Enable=False——fcitx5 语义下不算
+/// 已装引擎，发现逻辑如实排除）；无宿主 profile（镜像路径有独立单测）。
+#[test]
+#[ignore = "真 fcitx5 端到端验收（本机跑）：种子 v2 全引擎 + Ctrl+Shift+B 切换"]
+fn real_fcitx5_seed_v2_all_engines_switchable() {
+    use super::nested_daemon::{
+        parse_profile_groups, seed_fcitx5_home_v2, SeedPaths, SEEDED_MARK_V2,
+    };
+    use crate::ime::nested_daemon::kill_pid;
+
+    let base = std::env::temp_dir().join(format!("wlc-f5e2e-v2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let home = base.join("home");
+    let runtime = base.join("runtime");
+    for d in [&home, &home.join("config"), &runtime, &home.join("data"), &home.join("cache")] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // 1) 生产种子函数（游戏进程 env = 真实宿主 env）种全新隔离 HOME。
+    let out = seed_fcitx5_home_v2(&home, &SeedPaths::from_process_env());
+    eprintln!("=== [v2] 种子诊断行:");
+    for n in &out.notes {
+        eprintln!("    {n}");
+    }
+    assert!(out.engine_count >= 2, "种子 v2 应发现 ≥2 引擎: {:?}", out.notes);
+    assert!(
+        out.engines.iter().any(|e| e == "pinyin") && out.engines.iter().any(|e| e == "wbpy"),
+        "本机应有 pinyin+wbpy（fcitx5-chinese-addons 默认启用）；实得: {:?}",
+        out.engines
+    );
+    let profile_path = home.join("config/fcitx5/profile");
+    let seeded = std::fs::read_to_string(&profile_path).expect("v2 profile 必须已写出");
+    assert!(seeded.contains(SEEDED_MARK_V2), "种子 profile 必须带所有权标记");
+    let groups = parse_profile_groups(&seeded);
+    // keyboard-us 在首、pinyin 第二（枚举循环可预期起点）；其余升序。
+    assert_eq!(groups[0].items[0], "keyboard-us");
+    assert_eq!(groups[0].items[1], "pinyin");
+    assert_eq!(groups[0].default_im, "pinyin");
+    let switch_to = "wbpy";
+    let target_idx = groups[0]
+        .items
+        .iter()
+        .position(|i| i == switch_to)
+        .expect("wbpy 必须在 v2 条目表里");
+    let presses = target_idx - 1; // pinyin(idx1) → 目标引擎的枚举步数
+    assert!(std::fs::read_to_string(home.join("config/fcitx5/config"))
+        .unwrap()
+        .contains("[Hotkey/EnumerateForwardKeys]"));
+
+    // 2) 合成器 + 编辑器（真监听 socket，同既有真机测试族）。
+    let socket_name = format!("wayland-wc-v2-{}", std::process::id());
+    let sock_path = runtime.join(&socket_name);
+    let listener = UnixListener::bind(&sock_path).expect("bind wayland socket");
+    listener.set_nonblocking(true).unwrap();
+    let (mut display, mut server) = server_setup();
+    let (es, ec) = UnixStream::pair().unwrap();
+    let editor_client: Client = display
+        .handle()
+        .insert_client(es, Arc::new(ServerClientData))
+        .unwrap();
+    let mut editor: TestClient<EditorState> = editor_connect(ec, &mut display, &mut server);
+
+    // 3) 起真 fcitx5（隔离 env = build_spawn_plan 口径；HOME 下已是 v2 种子）。
+    let mut cmd = Command::new("fcitx5");
+    cmd.args(["-D", "--disable=dbus"])
+        .arg("--verbose")
+        .arg("default=3,waylandim=5,key_trace=5")
+        .env("WAYLAND_DISPLAY", &socket_name)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("LANG", "C.UTF-8")
+        .env_remove("DISPLAY")
+        .env_remove("XAUTHORITY")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base.join("fcitx5.log"))
+        .unwrap();
+    let log_err = log.try_clone().unwrap();
+    cmd.stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(log_err));
+    let mut fcitx = cmd.spawn().expect("spawn fcitx5");
+
+    let mut harness = Harness {
+        display: &mut display,
+        server: &mut server,
+        editor: &mut editor,
+        listener: &listener,
+    };
+
+    // 4) bind → 聚焦 enable → grab。
+    let bound = harness.wait_for(|s| s.ime.im2.instance.is_some(), Duration::from_secs(90));
+    assert!(bound, "fcitx5 应 bind im2（v2 种子不破坏 waylandim 链路）");
+    let surface = harness.server_surface(&editor_client);
+    {
+        let mut ime = std::mem::take(&mut harness.server.ime);
+        ime.set_focus(&surface, harness.server);
+        harness.server.ime = ime;
+        harness.server.seat.keyboard_focus(surface);
+    }
+    let ti = harness.editor.state.ti.as_ref().unwrap().clone();
+    ti.enable();
+    ti.commit();
+    harness.pump_burst(Duration::from_millis(400));
+    let grabbed = harness.wait_for(|s| s.ime.im2.grab.is_some(), Duration::from_secs(15));
+    assert!(grabbed, "fcitx5 应 grab 键盘");
+
+    // 5) 默认引擎（拼音）：nihao + 空格 → CJK commit。
+    for k in [N, I, H, A, O, SPACE] {
+        harness.type_evdev(k, Duration::from_millis(180));
+    }
+    let commit_a = wait_new_cjk(&mut harness, 0, Duration::from_secs(10));
+    let snapshot = harness.editor.state.ti_events.len();
+    assert!(
+        commit_a.is_some(),
+        "拼音引擎应出汉字 commit；ti3: {:?}",
+        harness.editor.state.ti_events
+    );
+
+    // 6) Ctrl+Shift+B 和弦 × presses 次（每次完整 按下→释放 序列）
+    //    → 沿枚举序列走到目标引擎（每个中间引擎只收到被热键消费的
+    //    B 和弦，不会污染组字）。
+    for _ in 0..presses {
+        type_chord(
+            &mut harness,
+            &[(29, true), (42, true), (48, true), (48, false), (42, false), (29, false)],
+        );
+    }
+    harness.pump_burst(Duration::from_millis(1000));
+
+    // 7) 切后引擎必须可 commit：wbpy 是五笔/拼音混合引擎，同一段拼音
+    //    编码 nihao+空格 → 新非 ASCII commit。
+    for k in [N, I, H, A, O, SPACE] {
+        harness.type_evdev(k, Duration::from_millis(220));
+    }
+    let commit_b = wait_new_cjk(&mut harness, snapshot, Duration::from_secs(12));
+    let events = harness.editor.state.ti_events.clone();
+    harness.pump_burst(Duration::from_millis(300));
+    let ti_final = harness.editor.state.ti_events.clone();
+    drop(harness);
+
+    // 8) SIGTERM → fcitx5 退出保存（instance.cpp exitEvent → save）把
+    //    枚举结果写回 profile：DefaultIM=切换目标引擎 是“切换真实发生”的硬证。
+    kill_pid(fcitx.id());
+    let mut persisted = None;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(6) {
+        if let Ok(text) = std::fs::read_to_string(&profile_path) {
+            let g = parse_profile_groups(&text);
+            if g.first().is_some_and(|x| x.default_im == switch_to) {
+                persisted = Some(text);
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = fcitx.kill();
+    let _ = fcitx.wait();
+    let _ = std::fs::remove_file(&sock_path);
+
+    let r = RunResult {
+        ti_events: ti_final.clone(),
+        key_events: Vec::new(),
+        im2_seen_bind: bound,
+        im2_seen_grab: grabbed,
+        log_dir: base.clone(),
+        // v2 用例不校验 serial 漂移（漂移回归由 real_fcitx5_serial_drift_still_commits 负责）
+        serial_mismatch_seen: 0,
+    };
+    dump_diags(&r, "seedv2");
+    eprintln!("=== [v2] commit A（拼音）: {commit_a:?}\n=== [v2] commit B（切后）: {commit_b:?}");
+    eprintln!("=== [v2] 引擎切换前的中间 ti3 事件（快照后）: {:?}", &events[snapshot.min(events.len())..]);
+
+    assert!(
+        commit_b.is_some(),
+        "Ctrl+Shift+B 切换后新引擎（仓颉）必须可 commit；切换后 ti3: {events:?}"
+    );
+    let persisted = persisted.unwrap_or_else(|| {
+        panic!(
+            "fcitx5 退出应把枚举切换结果（DefaultIM={switch_to}）写回 profile；\
+             未观察到=枚举热键没生效或退出保存未发生（见 fcitx5.log）。\
+             当前 profile: {:?}",
+            std::fs::read_to_string(&profile_path)
+        )
+    });
+    // 落盘文件仍应保持全引擎条目（fcitx5 重写只动 DefaultIM/丢标记——
+    // 我们的所有权规则据此在下次启动无缝升级）。
+    let pg = parse_profile_groups(&persisted);
+    assert!(pg[0].items.iter().any(|i| i == "pinyin") && pg[0].items.iter().any(|i| i == switch_to));
+    assert_eq!(pg[0].items.len(), groups[0].items.len(), "重写后条目数必须不变");
+    eprintln!("=== [v2] base dir kept for forensics: {}", base.display());
+}
