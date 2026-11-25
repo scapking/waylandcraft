@@ -297,6 +297,11 @@ public class WaylandCraftCommand {
 					.then(ClientCommands.literal("diagnostic")
 						.executes(WaylandCraftCommand::imeDiagnostic)
 					)
+					// IME 透明度总览（sync8 静默故障复盘）：nested 裁决/种子引擎/
+					// 候选窗采集-交付统计/引擎工作态——Rust ime_info，纯读。
+					.then(ClientCommands.literal("info")
+						.executes(WaylandCraftCommand::imeInfo)
+					)
 					// v0.14 嵌套 IM 守护进程三级子命令（裁决全在 Rust NestedIme）
 					.then(ClientCommands.literal("nested")
 						.then(ClientCommands.literal("status")
@@ -2740,6 +2745,40 @@ public class WaylandCraftCommand {
 		}
 		source.sendFeedback(Component.literal("§6▬▬▬ nested IM §7(" + sub + ")§6 ▬▬▬"));
 		for(String line : reply.split("\\n")) {
+			source.sendFeedback(Component.literal(" §7" + line + "§r"));
+		}
+		return 1;
+	}
+
+	// ===== /wl ime info —— IME 透明度总览（Rust ime_info，纯读） =====
+
+	/**
+	 * 一次给出：nested daemon 裁决、种子引擎列表、会话/路由原料、
+	 * 候选窗采集/交付统计（frames/deliveries/epoch/delivered/可见性五门）、
+	 * 引擎工作态。sync8 复盘："候选窗不显示"零日志可查——这行命令 +
+	 * latest.log 的 [ime][overlay] 五元组就是标准排查入口。
+	 */
+	private static int imeInfo(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.bridge == null) {
+			source.sendError(Component.literal("§c✘ native bridge 不可用（平台不支持 / native 未加载）§r"));
+			return 0;
+		}
+		String reply;
+		try {
+			reply = wlc.bridge.imeInfo();
+		} catch(UnsatisfiedLinkError | RuntimeException t) {
+			source.sendError(Component.literal("§c✘ imeInfo 不可用（旧 .so 缺符号）: §f" + t));
+			return 0;
+		}
+		if(reply == null || reply.isEmpty()) {
+			source.sendError(Component.literal("§c✘ imeInfo 空响应（instance==0 / native 未初始化）§r"));
+			return 0;
+		}
+		source.sendFeedback(Component.literal("§6▬▬▬ IME info §6▬▬▬"));
+		for(String line : reply.split("\\n")) {
+			if(line.isEmpty()) continue;
 			source.sendFeedback(Component.literal(" §7" + line + "§r"));
 		}
 		return 1;
