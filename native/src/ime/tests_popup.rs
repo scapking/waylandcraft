@@ -707,6 +707,99 @@ fn popup_double_role_posts_protocol_error() {
     assert!(f.ime.flush_err(), "协议错误后 client 连接必须已死");
 }
 
+// ═══════════ 回合内竞态回归（sync9 生产实锤：候选窗永远不可见）═══════════
+
+/// 生产故障形态的回归测试（sync9 观测网实锤）：fcitx5 classicui 在**同一个
+/// wayland 事件循环回合**里完成"attach 内容帧 commit → attach(NULL) commit
+/// → popup.destroy →（下一候选）新角色登记"。Java 只在回合结束后轮询一次，
+/// 修复前的快照序列：note_frame 采到帧（epoch+1）→ 同回合 attach(NULL) 清帧
+/// （epoch+1）→ 轮询拿到 changed=true 但 has_frame=false → visible=false——
+/// 帧内容生命周期 < 轮询间隔 → 候选窗永远不可见（尽管帧真实采到过）。
+///
+/// 本测试把三个请求（内容 commit、NULL commit、destroy+重新登记）压进
+/// **一次 drive()**（dispatch_clients 按请求到达序在同一回合全部消化），
+/// 然后**只轮询一次**，断言修复后必须拿到 visible=true 的完整像素帧
+/// （display hold：采到但从未交付过的帧在 hold 窗口内继续交付）。
+/// 修复前此断言为红（visible=false），作为回归门槛锁死。
+#[test]
+fn popup_same_round_attach_null_race_still_delivers_visible_frame() {
+    let mut f = setup_popup();
+    f.focus_and_enable();
+    let qh = f.ime.qh();
+    let surface = f.ime.state.compositor.as_ref().unwrap().create_surface(&qh, ());
+    let popup = f.ime.state.im.as_ref().unwrap().get_input_popup_surface(&surface, &qh, ());
+    assert!(f.drive());
+    // 角色登记轮消耗 epoch（Java tick 已见不可见交付）。
+    let _ = f.server.ime.take_popup_snapshot(true);
+
+    // ── 同一回合：attach 内容 → commit → attach(NULL) → commit → destroy → 新角色 ──
+    let px = argb_pattern(4, 3, 0);
+    let buf = ShmBuf::new(&f.ime.state, &qh, 4, 3, 16, wl_shm::Format::Argb8888);
+    buf.write(&px);
+    surface.attach(Some(&buf.buffer), 0, 0);
+    surface.damage_buffer(0, 0, 4, 3);
+    surface.commit();
+    surface.attach(None, 0, 0);
+    surface.commit();
+    popup.destroy();
+    let surface2 = f.ime.state.compositor.as_ref().unwrap().create_surface(&qh, ());
+    let _popup2 = f.ime.state.im.as_ref().unwrap().get_input_popup_surface(&surface2, &qh, ());
+    std::mem::forget(buf);
+    // 一次 pump = 一个 wayland 事件循环回合（修复前后的差别全在本回合内）。
+    assert!(f.drive());
+
+    // ── Java 只轮询一次：必须看到本回合采到过的帧（display hold 交付）──
+    let snap = f
+        .server
+        .ime
+        .take_popup_snapshot(true)
+        .expect("回合内帧+清除应推进 epoch");
+    assert!(snap.visible, "回合内 attach(NULL) 竞态不得吞掉从未交付的帧");
+    assert_eq!((snap.width, snap.height), (4, 3));
+    assert_eq!(snap.argb.as_ref().expect("hold 交付应携带完整像素"), &px);
+    assert!(snap.seq >= 1, "seq 必须是采到的那一帧的序号");
+}
+
+/// hold 到期（假时钟推进）→ 快照必须回落不可见（真隐藏不被无限延长）；
+/// 到期前新帧到达 → 正常重排续期。e2e 级生命周期收口（单测细节见
+/// input_popup::tests 的 hold_* 用例）。
+#[test]
+fn popup_race_frame_expires_to_hidden_after_hold_window() {
+    let mut f = setup_popup();
+    f.focus_and_enable();
+    let qh = f.ime.qh();
+    let surface = f.ime.state.compositor.as_ref().unwrap().create_surface(&qh, ());
+    let _popup = f.ime.state.im.as_ref().unwrap().get_input_popup_surface(&surface, &qh, ());
+    assert!(f.drive());
+    let _ = f.server.ime.take_popup_snapshot(true);
+
+    // 同回合竞态：内容帧 + attach(NULL)。
+    let px = argb_pattern(2, 2, 5);
+    let buf = ShmBuf::new(&f.ime.state, &qh, 2, 2, 8, wl_shm::Format::Argb8888);
+    buf.write(&px);
+    surface.attach(Some(&buf.buffer), 0, 0);
+    surface.damage_buffer(0, 0, 2, 2);
+    surface.commit();
+    surface.attach(None, 0, 0);
+    surface.commit();
+    std::mem::forget(buf);
+    assert!(f.drive());
+
+    // 第一次轮询：hold 交付可见帧。
+    let s = f.server.ime.take_popup_snapshot(true).expect("竞态帧应交付");
+    assert!(s.visible);
+    assert_eq!(s.argb.as_ref().unwrap(), &px);
+
+    // 假时钟推进过 hold 窗口（无新帧）→ 下一次轮询必须隐藏（真清状态）。
+    let t = f.server.ime.popup.now();
+    f.server.ime.popup.set_clock(t + std::time::Duration::from_millis(401));
+    let s = f.server.ime.take_popup_snapshot(true).expect("hold 到期应推进状态");
+    assert!(!s.visible, "hold 到期且无新帧 → 候选窗必须隐藏");
+    assert!(s.argb.is_none());
+    // 再轮询零拷贝。
+    assert!(f.server.ime.take_popup_snapshot(true).is_none());
+}
+
 // ═══════════════ Java 轮询 × JNI 编码合同（sync8 静默故障复盘）═══════════════
 
 /// Java 每 tick 轮询的 native 半程复刻：`ImeCandidateOverlay.tick()` 每帧

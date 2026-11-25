@@ -230,10 +230,17 @@ impl ImeState {
     /// 落实（v2 无显式 visible 事件，见 input_popup.rs 模块头）。
     /// Java 侧再叠加"聊天框 focused"等屏幕语境决定是否真的绘制。
     pub fn take_popup_snapshot(&mut self, kb_active: bool) -> Option<PopupSnapshot> {
+        // display hold 到期结算（轮询驱动，无需定时器）：到期仍无新帧 →
+        // 快照通道回落不可见（Java 隐藏）。
+        let now = self.popup.now();
+        self.popup.expire_hold(now);
         if !self.popup.changed() {
             return None;
         }
-        let visible = self.popup.has_frame()
+        // 可见性门用 has_content（live 帧或 hold 暂存帧）：sync9 回合内
+        // 竞态里 attach(NULL) 先于轮询到达，live 帧恒空——hold 交付保证
+        // 每个真实采到的帧至少经历一次 visible=true。
+        let visible = self.popup.has_content(now)
             && self.popup_ime_active()
             && self.has_focus
             && kb_active;
@@ -252,9 +259,18 @@ impl ImeState {
             Some(s) => format!("{s}s前"),
             None => "从未".to_string(),
         };
+        // display hold 观测面（sync9 竞态修复判读）：held=暂存帧在窗口内，
+        // remaining=距回落不可见的剩余 ms。latest.log 五元组的 visible 语义
+        // 不变（快照交付合同原样）。
+        let now = self.popup.now();
+        let hold = match self.popup.hold_remaining_ms(now) {
+            Some(ms) if self.popup.held_active(now) => format!("held=true remaining={ms}ms"),
+            _ => "held=false".to_string(),
+        };
         format!(
             "frames={} deliveries={} seq={} epoch={} delivered={} \
-             gate=[role={} frame={} im2active={} focus={} kb={}] last_visible_delivery={}",
+             gate=[role={} frame={} im2active={} focus={} kb={}] \
+             hold=[{}] last_visible_delivery={}",
             self.popup.frames_captured(),
             self.popup.deliveries(),
             self.popup.seq_for_diag(),
@@ -265,6 +281,7 @@ impl ImeState {
             self.popup_ime_active(),
             self.has_focus,
             kb_active,
+            hold,
             last,
         )
     }
@@ -581,7 +598,8 @@ impl ImeState {
         self.im2.grab = None;
         self.im2.popup = None;
         // popup 角色随 input_method 对象一并销毁（协议 destroy 语义：input_method
-        // 销毁即销毁其 popup 子对象）：解除采集轨道、让 Java 轮询看到消失。
+        // 销毁即销毁其 popup 子对象）：解除采集轨道、让 Java 轮询看到消失
+        // （未交付帧仍走 hold 窗口）。
         self.popup.cleared();
         crate::bridge::ime_log_write(
             "[waylandcraft][ime][im2] 输入法客户端断开 → 回退 host_bridge/raw",
