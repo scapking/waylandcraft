@@ -13,6 +13,45 @@ use std::fmt::Write;
 
 use crate::WaylandCraft;
 
+// ═══ ⑥ recent_errors：全局错误环形缓冲（v0.13.4 只有结构没有生产者，
+// status.log 的 errors 永远为空——本块补上生产者/消费者全链路）═══
+//
+// 设计：任何线程可 note_error()；连续相同消息去重（fcitx5 类重试路径
+// 会按节流重复报同一错误，刷屏没有意义）；容量 64，满丢最旧。
+// getStatusReport 每次 gather 时快照进 errors 字段，status.log 和
+// /wl status（Java 侧解析）共用同一来源。
+
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::sync::LazyLock;
+
+static RECENT_ERRORS: LazyLock<Mutex<VecDeque<ErrorEntry>>> = LazyLock::new(|| Mutex::new(VecDeque::new()));
+const ERROR_RING_CAPACITY: usize = 64;
+
+/// 记录一条子系统错误（非 panic 路径的失败事件）。线程安全、去重、永不阻塞。
+pub fn note_error(level: &str, msg: &str) {
+    let Ok(mut ring) = RECENT_ERRORS.try_lock() else { return }; // 锁忙直接放弃——诊断绝不反噬主流程
+    if let Some(last) = ring.back() {
+        if last.msg == msg {
+            return; // 连续相同消息去重
+        }
+    }
+    let entry = ErrorEntry {
+        ts: crate::bridge::log_timestamp(),
+        level: level.to_string(),
+        msg: msg.to_string(),
+    };
+    ring.push_back(entry);
+    while ring.len() > ERROR_RING_CAPACITY {
+        ring.pop_front();
+    }
+}
+
+/// 快照（供 gather）。
+pub fn snapshot_errors() -> Vec<ErrorEntry> {
+    RECENT_ERRORS.lock().map(|ring| ring.iter().cloned().collect()).unwrap_or_default()
+}
+
 /// 状态档位（与 issue 严重度对齐）
 #[derive(Debug, Clone, Copy)]
 pub enum State {
@@ -371,8 +410,8 @@ impl<'a> StatusExt for WaylandCraft<'a> {
         (self.bridge.toplevels.len(), self.bridge.popups.len())
     }
     fn recent_errors(&self) -> Vec<ErrorEntry> {
-        // v0.13.4：错误缓冲未实现；返回空
-        // 未来可以加一个 thread_local 错误 ring buffer
-        Vec::new()
+        // ⑥ 全局环形缓冲快照（生产者见 note_error 调用点：
+        // host_bridge 死亡/重探失败、satellite 重启、Err→Ok 降级、音频启动失败）
+        snapshot_errors()
     }
 }

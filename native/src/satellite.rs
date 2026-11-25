@@ -48,6 +48,7 @@ impl SatelliteState {
                     "[waylandcraft] xwayland-satellite died (status={:?}); restarting",
                     status
                 );
+                crate::status::note_error("warn", &format!("[satellite] process died (status={status:?}); auto-restart requested"));
                 drop(handle); // 释放 borrow
                 self.restart()
             }

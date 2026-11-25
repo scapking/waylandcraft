@@ -464,6 +464,7 @@ impl<'a> WaylandCraft<'a> {
             if let Err(e) = sat.ensure_alive() {
                 // 节流错误不致命——只记一次
                 eprintln!("[waylandcraft] satellite ensure_alive: {e}");
+                crate::status::note_error("error", &format!("[satellite] ensure_alive failed: {e}"));
             }
         }
 
@@ -490,13 +491,17 @@ impl<'a> WaylandCraft<'a> {
                 self.next_host_probe = now + std::time::Duration::from_secs(5);
                 match crate::host_bridge::probe() {
                     crate::host_bridge::BridgeInit::Ready(b) => {
+                        let name = b.name().to_string();
                         eprintln!(
-                            "[waylandcraft][host_bridge] ⑧ re-probe OK -> {} (auto recovered)",
-                            b.name()
+                            "[waylandcraft][host_bridge] ⑧ re-probe OK -> {name} (auto recovered)"
                         );
+                        crate::status::note_error("info", &format!("[host_bridge] recovered -> {name}"));
                         self.host_bridge = Some(crate::host_bridge::HostBridgeHandle::new(b));
                     }
-                    crate::host_bridge::BridgeInit::Transient(_) | crate::host_bridge::BridgeInit::Unsupported(_) => {}
+                    crate::host_bridge::BridgeInit::Transient(msg) | crate::host_bridge::BridgeInit::Unsupported(msg) => {
+                        // 去重保证同一失败只在 ring 出现一次（note_error 相邻同消息抑制）
+                        crate::status::note_error("warn", &format!("[host_bridge] re-probe failed: {msg}"));
+                    }
                 }
             }
         }

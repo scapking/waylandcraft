@@ -264,6 +264,8 @@ fn command_loop(
         };
         if let Err(e) = res {
             ime_log!("[waylandcraft][host_bridge][dbus-fcitx5] 命令失败: {e}");
+            let fatal_msg = format!("[host_bridge][dbus-fcitx5] worker fatal: {e}");
+            crate::status::note_error("error", &fatal_msg);
             let _ = ev_tx.send(FromWorker::Fatal(e));
             return;
         }

@@ -201,6 +201,7 @@ pub fn start_audio_capture(pid: u32) -> Result<(), String> {
     let topo = enumerate_topology(500).map_err(|e| {
         let msg = format!("[audio] 拓扑枚举失败: {}", e);
         audio_log!("{}", msg);
+        crate::status::note_error("error", &msg);
         msg
     })?;
     audio_log!(
