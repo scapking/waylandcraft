@@ -74,24 +74,33 @@ The feature upstream called impossible, shipped end-to-end (see [docs/IME.md](do
 - **Live sharing + mobile viewing** — Android/Windows/macOS viewers join with zero extra setup; multi-window relay is sharded per window across worker threads.
 - **Adaptive quality** — configurable scale, JPEG quality, framerate, bitrate, plus built-in presets.
 
-### 🔐 Granular Permissions (production model)
+### 🔐 Permissions
 
-Server-authoritative, audit-logged, tamper-evident. Four-level permission model per player per window:
+Four levels, per player per window — `NONE` (invisible) < `VIEW` (see it) < `INTERACT` (send mouse/keys) < `CONTROL` (move/resize/manage). The owner is always `CONTROL` on their own windows. Effective access is composed server-side in a fixed priority:
 
-| Level | Meaning |
-|-------|---------|
-| `NONE` | Window is invisible and unknown to the player |
-| `VIEW` | Can see the shared window in the world |
-| `INTERACT` | Can send mouse/keyboard events to the window |
-| `CONTROL` | Can resize, reposition and manage permissions |
+```
+owner(CONTROL) > blacklist(NONE) > whitelist > per-window grant > default(NONE)
+```
 
-Owner is *always* CONTROL on their own windows; effective permission composes as blacklist > whitelist > per-window grant > default policy. On top of that:
+New viewers are governed by the **default policy** (`/wl share default …`):
 
-- **Timed grants** — `/wl share grant <win> <player> VIEW 10m`; expiry swept server-side, revoked windows dismantle instantly on the viewer (texture, audio, buffers).
-- **Invite mode** — `/wl share default ask`: new viewers trigger a clickable *allow-10m / always-allow / deny* prompt to the owner instead of auto-access.
-- **Handle-reuse safety** — re-registering a window (even same owner) wipes its ACL; no stale grants.
-- **Audit** — `/wl share acl` shows every grant (who/what/until/source); structured ACL log + ops counters.
-- Malformed/hostile inputs are clamped everywhere (levels, sizes, rates) — hardened against the full threat model in `ShareAcl*Test` (37 tests).
+| Policy | Behavior for **public** windows | Behavior for **targeted** windows |
+|--------|--------------------------------|----------------------------------|
+| `allow` *(default)* | auto-granted `VIEW` — the window appears with no owner action | never auto-granted (invite-only) |
+| `ask` | owner gets a clickable invite per viewer (allow-10m / always / deny); **nothing is auto-approved** | only manual `grant` |
+| `deny` | nothing auto-granted; only manual `grant` works | only manual `grant` |
+
+> **Back-compat note:** the shipped default is `allow`, i.e. a public shared window is *immediately visible to every online player* with no approval step — same as prior versions. Switch to `ask`/`deny` to require approval. An explicit owner `revoke` writes a `NONE` tombstone that **outranks** the default policy, so auto-visibility never overrides a manual revocation.
+
+CLI, all via `/wl share`:
+```
+grant  <win> <player> <PERM> [10m|1h|2d]   grant (timed; no duration = permanent)
+revoke <win> <player>                      revoke (tombstone; survives default re-derivation)
+default   allow|ask|deny                   set the new-viewer policy above
+acl      [<win>]                           list grants: who / level / time-left / source
+```
+
+Hardening: timed expiry swept server-side (revoked windows dismantle instantly on viewers), handle-reuse wipes stale ACLs, and hostile inputs (levels, sizes, rates) are clamped — locked by `ShareAcl*Test` (37 tests).
 
 ### 🧩 Works without a server mod
 
@@ -233,7 +242,7 @@ Windows can be arranged automatically around a fixed initialized origin (they no
 
 | Command | Purpose |
 |---------|---------|
-| `/wl share start <handle>` | Start sharing a window (`all` / `*` = share every window) |
+| `/wl share start <handle> [player]` | Start sharing; optional `player` = **targeted** (only that player, never auto-visible to others). `all` / `*` = every window |
 | `/wl share stop <handle>` | Stop sharing (`all` / `*` = stop all) |
 | `/wl share quality <handle> <s> <q> <fps>` | Set scale / quality / framerate |
 | `/wl share preset <handle> <preset>` | Apply a preset (see [Configuration](#️-configuration)) |
@@ -245,19 +254,21 @@ Windows can be arranged automatically around a fixed initialized origin (they no
 
 ### Permissions
 
-| Command | Purpose |
-|---------|---------|
-| `/wl permission list` | List all permissions |
-| `/wl permission default <PERM>` | Set default permission |
-| `/wl permission allow <player> <PERM>` | Whitelist a player |
-| `/wl permission deny <player>` | Blacklist a player |
-| `/wl permission remove <player>` | Remove a player |
-| `/wl share grant <win> <player> <PERM> [10m]` | Grant (optionally time-limited) |
-| `/wl share revoke <win> <player>` | Revoke (tombstoned against defaults) |
-| `/wl share default ask\|allow\|deny` | New-viewer policy (`ask` = invite prompts) |
-| `/wl share acl [win]` | Audit view: who has what, until when, from where |
+Two families: **per-window owner controls** (`/wl share …`, "who shares, who manages") and **server-wide tables** (`/wl permission …`, ops-level, outrank the default policy). Both feed the single compose chain shown in [Permissions](#-permissions).
 
-`PERM`: `NONE` / `VIEW` / `INTERACT` / `CONTROL`
+| Command | Scope | Purpose |
+|---------|-------|---------|
+| `/wl share grant <win> <player> <PERM> [dur]` | owner | grant; optional duration `10m`/`1h`/`2d` (no dur = permanent, cap 30d) |
+| `/wl share revoke <win> <player>` | owner | revoke (NONE tombstone; survives default re-derivation) |
+| `/wl share default allow\|ask\|deny` | owner | new-viewer policy for public windows (see table above) |
+| `/wl share acl [win]` | owner/self | audit: who / level / time-left / source |
+| `/wl permission list` | ops | list server whitelist/blacklist/default |
+| `/wl permission default <PERM>` | ops | server-wide default VIEW-level for public windows |
+| `/wl permission allow <player> <PERM>` | ops | whitelist (bypasses per-window, still not owner) |
+| `/wl permission deny <player>` | ops | blacklist (hard NONE, even owner-granted) |
+| `/wl permission remove <player>` | ops | drop the player from the tables |
+
+`PERM`: `NONE` / `VIEW` / `INTERACT` / `CONTROL`. Durations accept `s/m/h/d` suffixes or bare seconds.
 
 ---
 
@@ -494,9 +505,9 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
   - **Security hardening (27 audit findings)** — two remote server-crash P0s closed (permission-command clamp + auth, give_items thread/DoS), viewer backpressure + capability filtering, invite-based timed grants with revocation propagation, handle-reuse ACL wipe, input clamps end-to-end.
   - **Cross-platform capture backends** — Windows (Graphics.Capture) and macOS (ScreenCaptureKit) natives merged at Rust level with module-level cross-compilation gates; Java wiring and native CI packaging in progress.
   - **Diagnostics** — `/wl status` one-screen subsystem dashboard, error ring, key-latency histograms, structured ACL audit, release-vs-verbose log tiers.
-- **v0.9.27** — **IME protocol-level rewrite.** The old implementation could never reliably deliver IME text: the passthrough path sent `commit_string`/`preedit_string` to apps **without ever sending the mandatory `done` event**, so GTK/Qt buffered the text forever and nothing appeared on screen; host events were split into three unordered buffers (breaking the protocol-mandated `delete_surrounding` → `commit` order); IME state was forwarded before `commit(serial)` validation, making protocol discard impossible; and serial bookkeeping was wrong in three ways (`clear_focus` emitted a `done` without counting it — after any focus change *every* subsequent composition was discarded as stale; one global serial counter shared by all text-input instances instead of per-instance). The legacy `text-input-v1`/`input-method-v1` paths (~470 lines, which steered ibus onto the deprecated stack) are removed entirely; only the modern `zwp_text_input_v3` + `zwp_input_method_v2` stack remains, rebuilt around a pure-logic relay state machine (`ime/relay.rs`) that owns serial accounting, atomic batching and discard semantics. Host-desktop passthrough now preserves event order, reverse-syncs surrounding text / cursor rect / content type back to the desktop IME, replaces the 15s polling recreate with an event-driven renegotiation on window focus (GLFW callback → JNI), and detects structurally unsupported setups (X11/XWayland backend) up front instead of polling forever. Verified by 22 tests including wire-level integration tests that run a real compositor with two real Wayland clients (an editor and a simulated fcitx5). See [docs/IME.md](docs/IME.md).
-- **v0.9.17** — Fixed shared-window audio being effectively unusable: the PipeWire capture stream's `process` callback handle (`StreamListener`) was a function-local variable dropped on return, which unregistered the callback — so no PCM was ever captured. It is now kept alive in capture state. Added full audio-pipeline logging (native first-capture, per-stage errors now reach the Java log with the real reason, send/receive-side first-packet & byte-count logs).
-- **v0.9.16** — Added `/wl show all` / `/wl hide all` (also `*`) to show/hide every window in one command; `hide all` also unpins.
+- **v0.9.27** — **IME protocol-level rewrite.** Rebuilt the passthrough onto the modern `zwp_text_input_v3` + `zwp_input_method_v2` stack (legacy v1 paths removed) around a pure-logic relay state machine (`ime/relay.rs`) with correct `done`/`commit(serial)` accounting, atomic batching and protocol-discard semantics — the reason IME text now reliably reaches apps. See [docs/IME.md](docs/IME.md).
+- **v0.9.17** — Fixed shared-window audio (a dropped `StreamListener` handle meant no PCM was ever captured); full audio-pipeline logging.
+- **v0.9.16** — `/wl show all` / `/wl hide all` (also `*`).
 - **v0.9.15** — Layout order now updates in real time as windows close/open — slots are compactly renumbered to fill gaps.
 - **v0.9.14** — Ctrl+arrow now swaps positions with the adjacent window (swapCore); fixed inverted left/right direction.
 - **v0.9.13** — Ctrl+arrow restored to moving the hovered window (manualOffset survives per-frame layout re-anchoring).
