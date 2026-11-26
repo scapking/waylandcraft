@@ -85,6 +85,24 @@ public class WaylandCraftSettings {
 	 */
 	String imeSource = "auto";
 
+	/* ---- ⑩ 本地直显模式：显示档 / 按服摆位记忆 / 教学去重 ---- */
+	/**
+	 * 窗口显示档全局默认：auto|items|display（语义与风险边界见
+	 * dev.evvie.waylandcraft.localmode.LocalModePolicy；items 档在无反作弊的
+	 * 无 mod 服由客户端自维护窗口物品——反作弊服开启可能被判定刷物品，
+	 * 只在用户显式选择时生效，默认 auto 绝不自动启用）。
+	 */
+	String localItems = "auto";
+	/**
+	 * 按服务器记忆显示档：serverKey → auto|items|display。
+	 * 用户在可信服选一次 items 后该服默认（/wl localitems 在世界内设置时写入）。
+	 */
+	java.util.Map<String, String> localItemsByServer = new java.util.HashMap<String, String>();
+	/** 本地直显摆位记忆：storageKey(serverKey, 窗口别名) → "x,y,z,yaw,dist"（编码见 WindowPlacementMemory）。 */
+	java.util.Map<String, String> localWindowPlacements = new java.util.HashMap<String, String>();
+	/** 本地模式教学已展示的 serverKey 集合（每服一次，不再刷屏）。 */
+	java.util.List<String> localModeTutorialShown = new java.util.ArrayList<String>();
+
 	/* ---- 日志分级（verboseLogging）---- */
 	/**
 	 * 详细日志开关：true=全量（逐键/逐事件/周期采样行都写）；false=发布档
@@ -123,6 +141,7 @@ public class WaylandCraftSettings {
 	public static final String IME_NESTED = "imeNested";
 	public static final String IME_SOURCE = "imeSource";
 	public static final String VERBOSE_LOGGING = "verboseLogging";
+	public static final String LOCAL_ITEMS = "localItems";
 	
 	/* This is where the getters go */
 	
@@ -228,6 +247,24 @@ public class WaylandCraftSettings {
 
 	public boolean getVerboseLogging() {
 		return verboseLogging;
+	}
+
+	public String getLocalItems() {
+		return localItems;
+	}
+
+	// 以下三个容器字段由 WindowPlacementMemory 纯函数读写（编码/键派生规则见该类），
+	// 返回的是活动视图——上层修改后必须调 settingsManager.writeSettings() 落盘。
+	public java.util.Map<String, String> localItemsByServer() {
+		return localItemsByServer;
+	}
+
+	public java.util.Map<String, String> localWindowPlacements() {
+		return localWindowPlacements;
+	}
+
+	public java.util.List<String> localModeTutorialShown() {
+		return localModeTutorialShown;
 	}
 	
 	/* Methods to modifiy settings by name */
