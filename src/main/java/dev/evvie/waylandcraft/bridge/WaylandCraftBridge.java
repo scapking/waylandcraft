@@ -1239,6 +1239,82 @@ public class WaylandCraftBridge {
 	}
 	private static native void setImeNestedNative(long instance, String mode, String homeDir);
 
+	/**
+	 * settings 下发：内置引擎来源档 imeSource（auto|fcitx5|builtin）。
+	 * Rust ImeState::set_ime_source 校验，非法值记日志不改状态。
+	 * native 不可用时静默（与 setImeNested 同纪律）。
+	 */
+	public void setImeSource(String mode) {
+		if(!nativeAvailable || instance == 0) return;
+		try {
+			setImeSourceNative(instance, mode);
+		} catch(Throwable t) {
+			WaylandCraftCommon.LOGGER.warn("[ime][source] setImeSource unavailable: {}", t.toString());
+		}
+	}
+	private static native void setImeSourceNative(long instance, String mode);
+
+	/** /wl ime source <mode> → Rust 即时切档回执（含生效档与内置简报）。 */
+	public String imeSourceCommand(String sub) {
+		if(!nativeAvailable || instance == 0) return null;
+		try {
+			return imeSourceCommandNative(instance, sub);
+		} catch(Throwable t) {
+			WaylandCraftCommon.LOGGER.warn("[ime][source] imeSourceCommand({}) unavailable: {}", sub, t.toString());
+			return null;
+		}
+	}
+	private static native String imeSourceCommandNative(long instance, String sub);
+
+	/** /wl ime eng → 引擎清单（内置拼音 + fcitx5 种子引擎，如实）。 */
+	public String imeEngList() {
+		if(!nativeAvailable || instance == 0) return null;
+		try {
+			return imeEngListNative(instance);
+		} catch(Throwable t) {
+			WaylandCraftCommon.LOGGER.warn("[ime][eng] imeEngList unavailable: {}", t.toString());
+			return null;
+		}
+	}
+	private static native String imeEngListNative(long instance);
+
+	/**
+	 * 内置候选面板轮询（结构化文本，与像素帧 imePopupFrame 互斥——来源档
+	 * 决定谁在产数据）。空串/null = 无变化；否则快照 JSON（合同见 Rust
+	 * BuiltinEngine::snapshot_json，解码入口 ImeCandidateLayout.decodeBuiltin）。
+	 */
+	public String imeBuiltinCandidates() {
+		if(!nativeAvailable || instance == 0) return null;
+		try {
+			return imeBuiltinCandidatesNative(instance);
+		} catch(Throwable t) {
+			return null;
+		}
+	}
+	private static native String imeBuiltinCandidatesNative(long instance);
+
+	/** 候选面板点选（页内下标 0..8）。返回提交文本（空=无效果）。 */
+	public String imeBuiltinSelect(int pageIndex) {
+		if(!nativeAvailable || instance == 0) return "";
+		try {
+			return imeBuiltinSelectNative(instance, pageIndex);
+		} catch(Throwable t) {
+			return "";
+		}
+	}
+	private static native String imeBuiltinSelectNative(long instance, int pageIndex);
+
+	/** 候选面板翻页（±1）。返回是否实际翻动。 */
+	public boolean imeBuiltinPage(int delta) {
+		if(!nativeAvailable || instance == 0) return false;
+		try {
+			return imeBuiltinPageNative(instance, delta);
+		} catch(Throwable t) {
+			return false;
+		}
+	}
+	private static native boolean imeBuiltinPageNative(long instance, int delta);
+
 	private static native void sendFrame(long surfaceHandle);
 	
 	private static native void updateSurfaceData(long instance, WLCSurface surface);

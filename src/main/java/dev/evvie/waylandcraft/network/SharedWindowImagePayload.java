@@ -1,6 +1,7 @@
 package dev.evvie.waylandcraft.network;
 
 import dev.evvie.waylandcraft.WaylandCraftCommon;
+import net.minecraft.network.SkipPacketDecoderException;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
@@ -24,6 +25,13 @@ public record SharedWindowImagePayload(long windowHandle, int frameNumber, int x
 	
 	public static final CustomPacketPayload.Type<SharedWindowImagePayload> TYPE = new CustomPacketPayload.Type<>(ID);
 	
+	/**
+	 * P2-3：解码 dataLength 上限。合法帧 ≤1.9MB（relay 入口还有二次校验），
+	 * 解码端放宽到 4MB；负数/超限/超出剩余可读字节直接 SkipPacketDecoderException
+	 * ——否则 `new byte[dataLength]` 对恶意 VarInt 会 NegativeArraySizeException/OOM。
+	 */
+	static final int MAX_DECODE_BYTES = 4 * 1024 * 1024;
+
 	public static final StreamCodec<RegistryFriendlyByteBuf, SharedWindowImagePayload> CODEC = StreamCodec.of(
 		(buf, payload) -> {
 			buf.writeLong(payload.windowHandle);
@@ -58,6 +66,10 @@ public record SharedWindowImagePayload(long windowHandle, int frameNumber, int x
 			int width = buf.readVarInt();
 			int height = buf.readVarInt();
 			int dataLength = buf.readVarInt();
+			// P2-3：恶意 VarInt 长度先验证再分配（skip 该包，不崩 netty 线程）
+			if (dataLength < 0 || dataLength > MAX_DECODE_BYTES || dataLength > buf.readableBytes()) {
+				throw new SkipPacketDecoderException("shared_window_image: invalid imageData length " + dataLength);
+			}
 			byte[] imageData = new byte[dataLength];
 			buf.readBytes(imageData);
 			double pivotX = buf.readDouble();

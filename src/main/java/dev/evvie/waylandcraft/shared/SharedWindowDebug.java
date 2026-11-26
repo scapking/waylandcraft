@@ -119,6 +119,27 @@ public class SharedWindowDebug {
 		java.util.Set<UUID> blacklist = server.permissionManager.getBlacklist();
 		sb.append("Blacklist: ").append(blacklist.size()).append(" players\n");
 		
+		// P3：帧/音频转发计数（frames/bytes/slow_viewer），排障时直接看出
+		// 是"没帧上来"还是"发不出去（背压/无能力）"
+		var frameRelay = dev.evvie.waylandcraft.network.WaylandCraftNetworking.getFrameRelay();
+		sb.append("Video relay: frames=").append(frameRelay.getTotalFrames())
+			.append(" bytes=").append(frameRelay.getTotalBytes() / 1024).append("KB")
+			.append(" sends=").append(frameRelay.getTotalSends()).append("\n");
+		sb.append("Video drops: oversized=").append(frameRelay.getDroppedOversized())
+			.append(" bad_dim=").append(frameRelay.getDroppedBadDimensions())
+			.append(" no_capability=").append(frameRelay.getDroppedNoCapability())
+			.append(" skip_unwritable=").append(frameRelay.getSkippedUnwritable())
+			.append(" slow_viewers=").append(frameRelay.getSlowViewerEvents()).append("\n");
+		
+		var audioRelay = dev.evvie.waylandcraft.network.WaylandCraftNetworking.getAudioRelay();
+		sb.append("Audio relay: packets=").append(audioRelay.getTotalPackets())
+			.append(" bytes=").append(audioRelay.getTotalBytes() / 1024).append("KB")
+			.append(" sends=").append(audioRelay.getTotalSends()).append("\n");
+		sb.append("Audio drops: invalid=").append(audioRelay.getDroppedInvalid())
+			.append(" no_capability=").append(audioRelay.getDroppedNoCapability())
+			.append(" skip_unwritable=").append(audioRelay.getSkippedUnwritable())
+			.append(" slow_viewers=").append(audioRelay.getSlowViewerEvents()).append("\n");
+		
 		return sb.toString();
 	}
 	

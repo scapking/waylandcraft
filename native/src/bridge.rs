@@ -106,20 +106,225 @@ pub fn audio_log_write(s: &str) {
 /// 全链路：probe → connect → registry/globals → enter/leave → enable 状态机 →
 /// commit/preedit → 错误。所有 [system_ime] 行同时写 stderr 和此文件
 /// （eprintln 只进 stderr，不进 latest.log——诊断必须靠这个文件）。
-static IME_LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// sync15（性能修复 C）日志写入器：`BufWriter` 缓冲 + 相邻重复行合并。
+///
+/// 病灶（用户实测"输入法特别卡"的日志侧贡献）：旧实现**每行一次
+/// write(2)+flush**（`writeln!+flush` 在 File 上就是每行一条系统调用），
+/// 且 `eprintln!` 未缓冲也逐行一条——组字热路径每键 2-6 行（vk modifiers
+/// 恒定刷屏行、引擎直通、ti3 State…），全部发生在渲染线程/事件回调栈上。
+/// bench50 基线实测：9.4s 打字场景 220 行 = 218 次 fd write。
+///
+/// 修复语义：
+/// 1. **文件写缓冲**（BufWriter 默认 8KiB）：fd write 次数从"每行 1 次"
+///    降到"每 8KiB 1 次 + 心跳 1 次"；
+/// 2. **相邻重复行合并**（metrics::RepeatCollapse）：内容相同的连排行只写
+///    首行本体，段闭合时补一行 `原行 (xN)` 摘要——诊断信息不丢（首尾可见
+///    + 总次数），热刷屏行的 stderr/编码/写入全部省掉；
+/// 3. **重要行即时落盘**：WARN/ERROR/IME_STATE 行写后立即 flush（崩溃取证
+///    的最后防线），其余行由 10s 心跳（`ime_log_flush`，metrics_tick 驱动）
+///    兜底——最坏丢失窗口 = 心跳间隔 + 缓冲余量，且只影响尾部计数行，
+///    最后一条本体早已写出。
+/// stderr 行为保持"逐行即时"（与旧版一致，launcher 控制台实时性不降级）；
+/// 被抑制的重复行**不**再写 stderr（正是省掉的主要成本）。
+static IME_LOG_FILE: Mutex<Option<ImeLogWriter>> = Mutex::new(None);
 
-/// 追加一行到 IME_LOG_FILE（若已设置），失败静默忽略。同时写 stderr。
+/// 日志 IO 全局计数（relaxed 原子——DBus worker 线程与主循环都会
+/// 走 ime_log_write，只做报告不做判定）。
+/// - lines/bytes：实际写出的行数（含摘要行，不含被抑制的重复）与文件字节；
+/// - write_ops：CountingWriter 观察到的 fd write 次数（缓冲化后 ≪ lines，
+///   修复前后对比的核心读数）；
+/// - suppressed_repeats：相邻重复行合并抑制次数。
+pub(crate) static IME_LOG_IO: crate::ime::metrics::LogIoCounters =
+    crate::ime::metrics::LogIoCounters::new();
+
+/// 计数包装：BufWriter 每次真正向 fd 写入都记一次 write_ops——
+/// write_ops/lines 比值就是缓冲生效的直接读数（修复前恒 ≈1.0）。
+struct CountingWriter(std::fs::File);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = std::io::Write::write(&mut self.0, buf)?;
+        IME_LOG_IO.add_write_op();
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.0)
+    }
+}
+
+pub(crate) struct ImeLogWriter {
+    buf: std::io::BufWriter<Box<dyn std::io::Write + Send>>,
+    collapse: crate::ime::metrics::RepeatCollapse,
+    /// 生产 writer 恒 true（保留逐行 stderr 的既有诊断合同）；
+    /// 单测注入 false 以免污染测试输出。
+    stderr: bool,
+}
+
+/// 崩溃取证敏感的"必须立刻在文件里"的行（其余行允许心跳窗口）。
+#[inline]
+fn is_important_line(s: &str) -> bool {
+    s.contains("WARN") || s.contains("ERROR") || s.starts_with("IME_STATE")
+}
+
+impl ImeLogWriter {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            buf: std::io::BufWriter::new(Box::new(CountingWriter(file))),
+            collapse: crate::ime::metrics::RepeatCollapse::default(),
+            stderr: true,
+        }
+    }
+
+    /// 写一行本体（不含重复判定）：stderr（可选）+ 时间戳入缓冲。
+    fn write_line(&mut self, s: &str) {
+        use std::io::Write;
+        if self.stderr {
+            eprintln!("{s}");
+        }
+        let text = format!("{} {s}
+", log_timestamp());
+        IME_LOG_IO.add_line(text.len() as u64);
+        let _ = self.buf.write_all(text.as_bytes());
+        if is_important_line(s) {
+            let _ = self.buf.flush();
+        }
+    }
+
+    /// 闭合未决重复段并冲刷缓冲（心跳/会话边界/测试读档点）。
+    fn settle(&mut self) {
+        use std::io::Write;
+        if let Some((line, n)) = self.collapse.flush() {
+            self.write_line(&format!("{line} (x{n})"));
+        }
+        let _ = self.buf.flush();
+    }
+
+    /// feed + 落子的组合（ime_log_write 生产路径与单测共用，杜绝
+    /// "生产逻辑测试复刻漂移"）。
+    fn ingest(&mut self, s: &str) {
+        use crate::ime::metrics::Feed;
+        match self.collapse.feed(s) {
+            Feed::Absorbed => {
+                IME_LOG_IO.add_suppressed();
+            }
+            Feed::NewLine { closed } => {
+                // 旧段若有重复，先补摘要行再写本体。
+                if let Some((line, n)) = closed {
+                    self.write_line(&format!("{line} (x{n})"));
+                }
+                self.write_line(s);
+            }
+        }
+    }
+}
+
+/// 追加一行到 IME 日志（缓冲 + 相邻重复合并，语义见 [`IME_LOG_FILE`] 文档）。
+/// 未安装文件（早期启动/纯单测环境）时退化为逐行 stderr——与旧行为一致。
 pub fn ime_log_write(s: &str) {
-    eprintln!("{s}");
-    use std::io::Write;
     let mut guard = match IME_LOG_FILE.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
-    if let Some(f) = guard.as_mut() {
-        let _ = writeln!(f, "{} {s}", log_timestamp());
-        let _ = f.flush();
+    match guard.as_mut() {
+        Some(w) => w.ingest(s),
+        None => {
+            eprintln!("{s}");
+            IME_LOG_IO.add_line(s.len() as u64 + 1);
+        }
     }
+}
+
+/// 心跳/边界落盘：闭合重复段 + 冲刷缓冲。metrics_tick 每 10s 与
+/// setImeLogFile 换文件时调用；bench 测试在读取计数前调用。
+pub fn ime_log_flush() {
+    let mut guard = match IME_LOG_FILE.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(w) = guard.as_mut() {
+        w.settle();
+    }
+}
+
+#[cfg(test)]
+mod ime_log_tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct SharedSink(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_writer() -> (ImeLogWriter, std::sync::Arc<Mutex<Vec<u8>>>) {
+        let shared = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let w = ImeLogWriter {
+            // 大缓冲保证测试期间只由 settle 触发落盘（验证"非每行 flush"）。
+            buf: std::io::BufWriter::with_capacity(64 * 1024, Box::new(SharedSink(shared.clone()))),
+            collapse: crate::ime::metrics::RepeatCollapse::default(),
+            stderr: false,
+        };
+        (w, shared)
+    }
+
+    #[test]
+    fn ime_log_writer_collapses_repeats_into_summary_line() {
+        // sync15 修复 C 核心语义：50 连排重复行 = 1 本体 + 1 摘要 (x50)，
+        // 而非 50 次编码 + 50 次缓冲写入 +（旧实现）50 次 fd write。
+        let (mut w, shared) = test_writer();
+        for _ in 0..50 {
+            w.ingest("SPAM identical line");
+        }
+        w.ingest("different line");
+        w.settle();
+        let text = String::from_utf8(shared.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("SPAM identical line").count(), 2, "{text}");
+        assert!(text.contains("SPAM identical line (x50)"), "{text}");
+        assert_eq!(text.lines().count(), 3, "SPAM 本体 + 摘要 + different 本体：{text}");
+        assert!(w.collapse.pending().is_none(), "settle 后无未闭合段");
+    }
+
+    #[test]
+    fn important_lines_flush_immediately_others_buffer() {
+        // 崩溃取证合同：WARN 行写后必达 sink（fd）；普通行留在缓冲，
+        // settle 才落——write_ops 与 lines 解耦的机制本身。
+        let (mut w, shared) = test_writer();
+        w.ingest("normal line without flush");
+        assert!(shared.lock().unwrap().is_empty(), "普通行必须留在 BufWriter 缓冲里");
+        w.ingest("[waylandcraft][ime][relay] WARN serial mismatch 文本照常交付");
+        assert!(!shared.lock().unwrap().is_empty(), "WARN 行必须即时冲刷落盘");
+        let text = String::from_utf8(shared.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("normal line without flush"), "冲刷带上此前的缓冲内容");
+    }
+
+    #[test]
+    fn non_important_lines_do_not_touch_fd_per_line() {
+        // 缓冲生效的直接读数：300 行非重要行在 settle 前 0 次 fd 写入
+        // （旧实现 = 每行 1 次 write+flush）。
+        let (mut w, shared) = test_writer();
+        for i in 0..300 {
+            w.ingest(&format!("distinct line {i}")); // 内容各异，排除重复合并干扰
+        }
+        assert!(shared.lock().unwrap().is_empty(), "64KiB 缓冲未写满前不得触达 fd");
+        w.settle();
+        let text = String::from_utf8(shared.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 300);
+    }
+}
+
+/// 测试/基准专用：把 File 装进 IME_LOG_FILE（等价 setImeLogFile 的 JNI
+/// 路径，但免 JNIEnv）。真机 bench 用它开启文件 IO 以获得 write_ops/bytes
+/// 的真实基线（无文件时 write_ops 恒 0，只有 stderr）。
+#[cfg(test)]
+pub(crate) fn set_ime_log_file_for_test(f: std::fs::File) {
+    let _ = IME_LOG_FILE.lock().map(|mut g| *g = Some(ImeLogWriter::new(f)));
 }
 
 #[allow(clippy::vec_box)]
@@ -393,6 +598,36 @@ bind_java_type! {
             fn = native_version,
         },
         // v0.14 嵌套输入法守护进程：/wl ime nested [status|start|stop]。
+        static extern fn ime_source_command {
+            sig = (instance: jlong, sub: JString) -> JString,
+            name = "imeSourceCommandNative",
+            fn = ime_source_command,
+        },
+        static extern fn set_ime_source {
+            sig = (instance: jlong, mode: JString),
+            name = "setImeSourceNative",
+            fn = set_ime_source,
+        },
+        static extern fn ime_builtin_candidates {
+            sig = (instance: jlong) -> JString,
+            name = "imeBuiltinCandidatesNative",
+            fn = ime_builtin_candidates,
+        },
+        static extern fn ime_builtin_select {
+            sig = (instance: jlong, page_index: jint) -> JString,
+            name = "imeBuiltinSelectNative",
+            fn = ime_builtin_select,
+        },
+        static extern fn ime_builtin_page {
+            sig = (instance: jlong, delta: jint) -> jboolean,
+            name = "imeBuiltinPageNative",
+            fn = ime_builtin_page,
+        },
+        static extern fn ime_eng_list {
+            sig = (instance: jlong) -> JString,
+            name = "imeEngListNative",
+            fn = ime_eng_list,
+        },
         static extern fn ime_nested_command {
             sig = (instance: jlong, sub: JString) -> JString,
             name = "imeNestedCommandNative",
@@ -601,6 +836,8 @@ bind_java_type! {
             fn = portal_capture_stop,
         },
 
+        // macOS ScreenCaptureKit 捕获（docs/CAPTURE_MACOS.md）；非 macos 调用
+        // 抛 unsupported，注册表按条目不可 cfg（同 win_capture_* 的处理）。
         static extern fn mac_capture_list {
             sig = (instance: jlong) -> JString[],
             fn = mac_capture_list,
@@ -624,6 +861,35 @@ bind_java_type! {
         static extern fn mac_capture_stop {
             sig = (instance: jlong) -> void,
             fn = mac_capture_stop,
+        },
+        // Windows.Graphics.Capture 窗口/桌面捕获（对称 portal_capture_* 三件套 +
+        // 目标枚举）。非 Windows 平台注册保留（bind_java_type! 表不支持按条目 cfg），
+        // 调用一律抛 win_capture_unsupported——Java 侧只在 Windows 接线。
+        // 接入清单见 docs/CAPTURE_WINDOWS.md。
+        static extern fn win_capture_targets {
+            sig = (instance: jlong) -> JString,
+            name = "winCaptureTargets",
+            fn = win_capture_targets,
+        },
+        static extern fn win_capture_start_window {
+            sig = (instance: jlong, hwnd: jlong) -> byte[],
+            name = "winCaptureStartWindow",
+            fn = win_capture_start_window,
+        },
+        static extern fn win_capture_start_monitor {
+            sig = (instance: jlong, index: jint) -> byte[],
+            name = "winCaptureStartMonitor",
+            fn = win_capture_start_monitor,
+        },
+        static extern fn win_capture_frame {
+            sig = (instance: jlong) -> byte[],
+            name = "winCaptureFrame",
+            fn = win_capture_frame,
+        },
+        static extern fn win_capture_stop {
+            sig = (instance: jlong) -> JString,
+            name = "winCaptureStop",
+            fn = win_capture_stop,
         },
 
         static extern fn audio_capture_start {
@@ -1655,6 +1921,11 @@ fn keyboard_input<'local>(
     let action = KeyboardAction::from_i32(action)
         .ok_or(BridgeError::UnknownKeyboardState(action))?;
 
+    // sync15 仪表：keyboard_input 全程（JNI 入口→返回，含路由分发与
+    // host 同步等待）。"输入法特别卡"（sync14 用户实测）的第一手读数——
+    // 若 p95 远大于单帧预算，说明渲染线程在按键链路里被同步等待拖住。
+    let t_total = std::time::Instant::now();
+
     // 1) v0.14 嵌套 IM 主路径：输入法 grab 在场（嵌套 daemon 已激活键盘）
     //    → 按键**只**发给 IME。引擎对按键的命运自行裁决：
     //      消费 → im2 preedit/commit 经 relay 推给应用 ti3；
@@ -1665,6 +1936,9 @@ fn keyboard_input<'local>(
         .state
         .ime
         .handle_key(scancode as u32, action, mods);
+    if handled {
+        instance.state.ime.metrics.route_im2_grab += 1;
+    }
 
     // 2) ⑧ 协议正确的按键路由（修复实测"输入法不可用"根因）：
     //    旧 C 方案 fire-and-forget 吞键——宿主引擎未激活时 ProcessKeyEvent 返回
@@ -1684,10 +1958,18 @@ fn keyboard_input<'local>(
         use crate::seat::KeyboardAction as KA;
         let keycode = scancode as u32;
         let nested_live = instance.state.ime.nested_route_live();
+        // sync15 仪表：daemon Starting 期（fcitx5 spawn 后、im2 bind/grab
+        // 就绪前——含 libpinyin 词典加载 4-5s）到达的按键计数。这些键
+        // 必然落在 raw/host 回退路径；计数 + key_input 直方图共同回答
+        // "词典加载期打字是否卡、卡在哪条路"。
+        if matches!(instance.state.ime.nested.phase(), crate::ime::NestedPhase::Starting) {
+            instance.state.ime.metrics.keys_during_starting += 1;
+        }
         let mut key_result: Option<crate::host_bridge::KeyResult> = None;
         if !nested_live {
             if let Some(hb) = &mut instance.host_bridge {
                 if hb.is_ready() {
+                    instance.state.ime.metrics.route_host_submitted += 1;
                     // v0.10.2：xkb 解码 keysym（ibus/fcitx keyval，不是 evdev）
                     let keysym = instance
                         .state
@@ -1704,9 +1986,23 @@ fn keyboard_input<'local>(
                         action,
                         mods,
                     };
+                    // sync15 仪表：submit_key_sync 在渲染线程上的实际等待
+                    // （150ms 上限）。用户日志里桥不可用（portal no owner
+                    // → is_ready false）时这条路根本不走，count=0 即可
+                    // 排除"渲染线程被 dbus 等待卡住"假说；若 count>0 且
+                    // p95 接近 150ms，就是真同步瓶颈，修排队不修语义。
+                    let t_submit = std::time::Instant::now();
                     key_result = Some(hb.submit_key_sync(&crate::ime::DownEvent::Key(ke)));
+                    instance.state.ime.metrics.submit_sync_wait.record(t_submit.elapsed());
                 }
             }
+        } else {
+            // nested 主路径在线但 grab 不在场 = 引擎不接管本键，raw 直通。
+            instance.state.ime.metrics.route_raw_nested += 1;
+        }
+        if !nested_live && !matches!(key_result, Some(_)) {
+            // 无就绪桥的 raw 兜底（⑧ 原始回退路径）。
+            instance.state.ime.metrics.route_raw_no_bridge += 1;
         }
         // None=没有就绪桥（⑧ 原始回退：纯 raw）；Unavailable=超时/通道断按未消费处理；
         // nested_live=true 时 key_result 恒 None——grab 缺席即引擎不接管，raw 直通。
@@ -1730,6 +2026,7 @@ fn keyboard_input<'local>(
             handled = true;
         }
     }
+    instance.state.ime.metrics.key_input.record(t_total.elapsed());
     Ok(())
 }
 
@@ -1882,6 +2179,8 @@ fn set_ime_log_file<'local>(
         .open(&path_str);
     match file {
         Ok(mut f) => {
+            // 换文件前先把旧 writer 缓冲的尾部落盘/摘要闭合（不丢行）。
+            ime_log_flush();
             // 每次进程启动写一条运行边界（带 native 版本标识）。
             // ime.log 是追加模式（不清空），多实例/多版本日志混在一起时，
             // 用这条分隔行区分"本次运行"的起点 —— 诊断时从最新边界行
@@ -1904,7 +2203,7 @@ fn set_ime_log_file<'local>(
                     return Ok(());
                 }
             };
-            *guard = Some(f);
+            *guard = Some(ImeLogWriter::new(f));
             eprintln!(
                 "[system_ime] setImeLogFile: 输入法穿透全链路日志 -> {path_str}"
             );
@@ -1931,6 +2230,96 @@ fn run_ime_diagnostic<'local>(
     let instance = jptr_to_instance!(instance, "runImeDiagnostic")?;
     let report = instance.state.run_diagnostic();
     env.new_string(report).map_err(BridgeError::JniError)
+}
+
+/// setImeSource(instance, "auto"|"fcitx5"|"builtin") —— settings 键
+/// `imeSource` 下发（WaylandCraft.java responder）。非法值如实记日志、
+/// 不改内部状态（与 setImeNested 同纪律）。
+fn set_ime_source<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    mode: JString<'local>,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "setImeSource")?;
+    let mode: String = env.get_string(&mode)?.into();
+    if let Err(e) = instance.state.ime.set_ime_source(&mode) {
+        crate::bridge::ime_log_write(&format!(
+            "[waylandcraft][ime][source] 忽略非法 imeSource={mode:?}（合法 auto|fcitx5|builtin）: {e}"
+        ));
+    }
+    Ok(())
+}
+
+/// imeSourceCommand(instance, "auto"|"fcitx5"|"builtin") —— `/wl ime source`
+/// CLI 即时切档（Java 侧已做合法性预检；这里复用同一 setter 保证语义单一）。
+fn ime_source_command<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    sub: JString<'local>,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeSourceCommand")?;
+    let sub: String = env.get_string(&sub)?.into();
+    let reply = match instance.state.ime.set_ime_source(&sub) {
+        Ok(s) => format!("{s}
+{}", instance.state.ime.builtin_status_brief()),
+        Err(e) => e,
+    };
+    env.new_string(reply).map_err(BridgeError::JniError)
+}
+
+/// imeBuiltinCandidates(instance) —— 内置候选面板轮询（结构化文本）。
+/// 返回空串 = 无变化（轻量合同，与 imePopupFrame 的 null 语义同族）；
+/// 否则为快照 JSON（合同见 builtin::BuiltinEngine::snapshot_json）：
+/// `{"visible","preedit","cursor","page","pages","page_size",
+///    "candidates":[…],"labels":["1"…]}`。仅内置档参与渲染；fcitx5 像素
+/// 帧路径（imePopupFrame）与本通道互斥、互不影响。
+fn ime_builtin_candidates<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeBuiltinCandidates")?;
+    let json = instance.state.ime.take_builtin_snapshot().unwrap_or_default();
+    env.new_string(json).map_err(BridgeError::JniError)
+}
+
+/// imeBuiltinSelect(instance, page_index) —— 候选面板点选（页内 0..8）。
+/// 返回提交的文本（空 = 无效果），供 Java 打观测日志。
+fn ime_builtin_select<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    page_index: jint,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeBuiltinSelect")?;
+    let idx = if page_index < 0 { 0usize } else { page_index as usize };
+    let committed = instance.state.ime.builtin_select(idx);
+    env.new_string(committed).map_err(BridgeError::JniError)
+}
+
+/// imeBuiltinPage(instance, delta) —— 候选面板翻页（±1）。返回是否翻动。
+fn ime_builtin_page<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    delta: jint,
+) -> Result<jboolean, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeBuiltinPage")?;
+    Ok(instance.state.ime.builtin_page(delta as i32))
+}
+
+/// imeEngList(instance) —— `/wl ime eng`：引擎清单（内置拼音 + fcitx5
+/// 种子引擎如实列出）。纯读。
+fn ime_eng_list<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeEngList")?;
+    let text = instance.state.ime.ime_eng_list();
+    env.new_string(text).map_err(BridgeError::JniError)
 }
 
 /// imeNestedCommand(instance, "status"|"start"|"stop") —— v0.14 嵌套 IME
@@ -2069,11 +2458,21 @@ fn ime_popup_frame<'local>(
     let instance = jptr_to_instance!(instance, "imePopupFrame")?;
     // 可见性门已不依赖 seat.kb_active（窗口捕获信号，聊天打字恒 false——
     // sync11 根因）；快照只跟 IME 会话激活 + 内容，输入框聚焦由 Java hasBox 把守。
+    // sync15 仪表：有交付路径的全程（快照构造 + 编码 + JNI byte[]）。
+    // popup_delivered_bytes 直接量化"候选帧全量复制"的流量（~64KB/次；
+    // 同帧重复交付修复后：deliveries 增速与字节增速应同步骤降）。
+    let t_delivery = std::time::Instant::now();
     let Some(snap) = instance.state.ime.take_popup_snapshot() else {
         return Ok(JPrimitiveArray::null());
     };
     let data = encode_popup_snapshot(&snap);
-    Ok(env.byte_array_from_slice(&data)?)
+    let arr = env.byte_array_from_slice(&data)?;
+    {
+        let ime = &mut instance.state.ime;
+        ime.metrics.popup_delivery.record(t_delivery.elapsed());
+        ime.metrics.popup_delivered_bytes += data.len() as u64;
+    }
+    Ok(arr)
 }
 
 /// imePopupWorkState(instance) —— 中文引擎工作态（状态透明度角标用）。
@@ -3081,6 +3480,94 @@ fn mac_capture_stop<'local>(
 ) -> Result<(), BridgeError> {
     crate::capture_macos::stop().map_err(BridgeError::MacCapture)?;
     Ok(())
+}
+
+// Windows.Graphics.Capture 捕获（仅 Windows；见 capture_windows.rs）
+//
+// 与 portal_capture_* 的对称关系：
+//   portal_capture_start → win_capture_start_window / win_capture_start_monitor
+//     （同一 "ok:<id>" byte[] 回执；id：窗口=hwnd 十进制，显示器=负数 -1-index）
+//   portal_capture_frame → win_capture_frame
+//     （帧槽共享 + seq 去重：无新帧返回 null——portal 是每帧盲克隆，这里对齐
+//      ime_popup_frame 的零拷贝语义，RemoteWindowRenderer 按 seq 决定是否上传）
+//   portal_capture_stop  → win_capture_stop
+//     （确定性关闭：session.Close → pool.Close → join "wc-win-capture" 线程
+//      带 3s 预算 → 帧缓冲释放；返回关停报告字符串。portal 的空实现
+//      [僵尸线程直到进程退出] 是有意不参照的缺陷）
+//
+// 实现体全部走 crate::capture_windows 的平台中立 API：非 Windows 上
+// start/list 返回 Err、take/stop 天然空转——注册表条目跨平台保留（宏不支持
+// 按条目 cfg），语义为"该平台上此功能不可用"。
+// ═══════════════════════════════════════════════════════
+
+fn win_capture_targets<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    match crate::capture_windows::list_targets() {
+        Ok(json) => Ok(env.new_string(json)?),
+        Err(e) => {
+            eprintln!("[win-capture] targets failed: {e}");
+            Err(BridgeError::Null("win_capture_unavailable"))
+        }
+    }
+}
+
+fn win_capture_start_window<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+    hwnd: jlong,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    if hwnd == 0 {
+        return Err(BridgeError::Null("win_capture_invalid_hwnd"));
+    }
+    let report = crate::capture_windows::start_window_capture(hwnd as isize)
+        .map_err(|e| {
+            eprintln!("[win-capture] start_window failed: {e}");
+            BridgeError::Null("win_capture_start_failed")
+        })?;
+    Ok(env.byte_array_from_slice(report.as_bytes())?)
+}
+
+fn win_capture_start_monitor<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+    index: jint,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    if index < 0 {
+        return Err(BridgeError::Null("win_capture_invalid_monitor_index"));
+    }
+    let report = crate::capture_windows::start_monitor_capture(index)
+        .map_err(|e| {
+            eprintln!("[win-capture] start_monitor failed: {e}");
+            BridgeError::Null("win_capture_start_failed")
+        })?;
+    Ok(env.byte_array_from_slice(report.as_bytes())?)
+}
+
+fn win_capture_frame<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    // seq 去重：无新帧 → null（Java 保持现纹理，零拷贝零上传）。
+    match crate::capture_windows::take_frame_wire() {
+        Some(data) => Ok(env.byte_array_from_slice(&data)?),
+        None => Ok(JPrimitiveArray::null()),
+    }
+}
+
+fn win_capture_stop<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    // 幂等 + 确定性：返回报告（joined / thread-timeout-detached / no-session）。
+    let report = crate::capture_windows::stop_capture();
+    Ok(env.new_string(report.as_str())?)
 }
 
 // ═══════════════════════════════════════════════════════

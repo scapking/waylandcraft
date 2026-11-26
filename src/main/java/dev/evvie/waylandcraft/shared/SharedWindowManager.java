@@ -42,7 +42,7 @@ public class SharedWindowManager {
 			subscribePlayer(targetPlayerUUID, windowHandle);
 		}
 
-		LOGGER.info("Window registered: 0x{} by {} (targeted={})",
+		LOGGER.debug("Window registered: 0x{} by {} (targeted={})",
 			Long.toHexString(windowHandle), ownerUUID, targetPlayerUUID != null);
 		return entry;
 	}
@@ -51,7 +51,7 @@ public class SharedWindowManager {
 		SharedWindowEntry entry = windowRegistry.remove(windowHandle);
 		if (entry != null) {
 			playerSubscriptions.values().forEach(set -> set.remove(windowHandle));
-			LOGGER.info("Window unregistered: 0x{}", Long.toHexString(windowHandle));
+			LOGGER.debug("Window unregistered: 0x{}", Long.toHexString(windowHandle));
 		}
 	}
 
@@ -78,7 +78,7 @@ public class SharedWindowManager {
 		}
 
 		playerSubscriptions.computeIfAbsent(playerUUID, k -> ConcurrentHashMap.newKeySet()).add(windowHandle);
-		LOGGER.info("Player {} subscribed to window 0x{}", playerUUID, Long.toHexString(windowHandle));
+		LOGGER.debug("Player {} subscribed to window 0x{}", playerUUID, Long.toHexString(windowHandle));
 		return true;
 	}
 

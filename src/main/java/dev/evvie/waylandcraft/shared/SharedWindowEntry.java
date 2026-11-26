@@ -3,6 +3,7 @@ package dev.evvie.waylandcraft.shared;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 import org.jetbrains.annotations.Nullable;
 
@@ -28,7 +29,12 @@ public class SharedWindowEntry {
 	@Nullable
 	private final UUID targetPlayerUUID;
 
-	private final Map<UUID, WindowPermission> permissions = new HashMap<>();
+	/**
+	 * P1-4：帧/音频转发线程读（hasPermission/getPermission），服务端线程写
+	 * （setPermission/grantViewToNewPlayer），原 HashMap 非线程安全——并发读写
+	 * 可能丢条目甚至死循环。改用 ConcurrentHashMap。
+	 */
+	private final Map<UUID, WindowPermission> permissions = new ConcurrentHashMap<>();
 
 	private int x, y;
 	private int width, height;
@@ -107,6 +113,7 @@ public class SharedWindowEntry {
 		return getPermission(playerUUID).hasPermission(required);
 	}
 
+	/** 快照副本：调用方（含转发线程）遍历时不会与写入方产生竞争 */
 	public Map<UUID, WindowPermission> getAllPermissions() {
 		return new HashMap<>(permissions);
 	}

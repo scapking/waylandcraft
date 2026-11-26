@@ -74,6 +74,14 @@ public final class ImeCandidateOverlay {
 	 */
 	private static Frame worldFrame;
 
+	/**
+	 * 上传转码暂存（sync15 修复 D）：按尺寸复用的 direct buffer——字节序
+	 * 交换写入后一次 memCopy 进 NativeImage，替代旧逐像素 16k 次 memPutInt。
+	 * 上限 ~64KB（候选窗 MAX_DIM 4096 也才 16MB；实际 fcitx5 面板 <64KB），
+	 * 只随帧尺寸增长重分配，进程级常驻不泄漏。
+	 */
+	private static java.nio.ByteBuffer uploadScratch;
+
 	// ═══════════════════════════ 观测层计数 ═══════════════════════════
 
 	private static long polls;            // tick 轮询总次数
@@ -146,6 +154,9 @@ public final class ImeCandidateOverlay {
 		}
 		applyTransition(f, box != null, mc);
 		logStateTransition(raw != null, box != null);
+		// 内置候选面板（结构化文本通道）顺路驱动：与像素帧轮询同节拍、
+		// 互不干扰；来源档决定哪路有数据，另一路恒 null/""（天然互斥）。
+		ImeBuiltinPanel.tick();
 	}
 
 	/** 状态转移 + 纹理更新（客户端 tick 线程）。 */
@@ -183,6 +194,12 @@ public final class ImeCandidateOverlay {
 	/** Screen render hook（ScreenRenderMixin → extractRenderStateWithTooltipAndSubtitles RETURN）。 */
 	public static void extract(GuiGraphicsExtractor ctx) {
 		extractHits++;
+		// 内置候选面板优先（与像素帧模式互斥：同时在场时文本面板是权威源）。
+		if(ImeBuiltinPanel.isShowing()) {
+			Minecraft mcB = Minecraft.getInstance();
+			ImeBuiltinPanel.extractGui(ctx, focusedEditBox(mcB), mcB);
+			return;
+		}
 		if(!extractHitLogged) {
 			// 注入证明（观测层）：本行出现 = ScreenRenderMixin 目标方法在运行时
 			// 真实命中。若 latest.log 没有它而五元组正常翻转 → 渲染钩子断了
@@ -276,6 +293,8 @@ public final class ImeCandidateOverlay {
 	 * 返回 true = 事件已消费（overlay 在场且点在区域内——游戏/聊天不得处理）。
 	 */
 	public static boolean handleClick(double mx, double my, int button, boolean pressed) {
+		// 内置面板命中优先（同坐标系：imeMouseX/Y 缩放 GUI 坐标）。
+		if(ImeBuiltinPanel.handleClick(mx, my, pressed)) return true;
 		Rect r = hitRect();
 		if(r == null || !r.contains(mx, my)) return false;
 		int[] local = popupLocalCoords(mx, my, r);
@@ -291,6 +310,8 @@ public final class ImeCandidateOverlay {
 
 	/** 候选窗区域滚轮 → native wl_pointer axis（fcitx5 翻页）。dy = GLFW 语义。 */
 	public static boolean handleScroll(double mx, double my, double dy) {
+		// 内置面板区域滚轮翻页优先。
+		if(ImeBuiltinPanel.handleScroll(mx, my, dy)) return true;
 		Rect r = hitRect();
 		if(r == null || !r.contains(mx, my)) return false;
 		int[] local = popupLocalCoords(mx, my, r);
@@ -355,15 +376,23 @@ public final class ImeCandidateOverlay {
 			int n = f.width() * f.height();
 			// wire 像素字节 [B,G,R,A]（= u32 0xAARRGGBB 小端）；MC 26.x
 			// NativeImage RGBA 内存 [R,G,B,A]（RemoteWindowRenderer 取证），
-			// memPutInt 小端落盘 → 组装 (A<<24)|(B<<16)|(G<<8)|R。
-			for(int i = 0; i < n; i++) {
-				int b = i * 4;
-				int b0 = d[b] & 0xFF;
-				int b1 = d[b + 1] & 0xFF;
-				int b2 = d[b + 2] & 0xFF;
-				int b3 = d[b + 3] & 0xFF;
-				MemoryUtil.memPutInt(ptr + i * 4L, (b3 << 24) | (b0 << 16) | (b1 << 8) | b2);
+			// 小端 int = (A<<24)|(B<<16)|(G<<8)|R。
+			//
+			// sync15 修复 D（批量上传）：旧实现逐像素 memPutInt——16k 次
+			// 单点写，且旧交付闸门下**每次轮询**都跑（bench50 基线：
+			// 1423 次重传 × 16k 写 ≈ 2300 万次/9.4s）。改为转码进复用的
+			// direct buffer + 一次 memCopy：循环仍在（字节序交换无法 memcpy
+			// 直通），但目标写从 16k 次逐点 Unsafe.putInt 变成一次块拷贝，
+			// scratch 按尺寸只分配一次。字节序：x86/ARM 全小端平台
+			// LITTLE_ENDIAN int 视图落盘字节 = 旧 memPutInt 逐字节等价
+			// （MC 无大端目标平台，合同不变）。
+			int bytes = n * 4;
+			if(uploadScratch == null || uploadScratch.capacity() < bytes) {
+				if(uploadScratch != null) MemoryUtil.memFree(uploadScratch);
+				uploadScratch = MemoryUtil.memAlloc(bytes);
 			}
+			ImeCandidateLayout.transferArgb(d, n, uploadScratch);
+			MemoryUtil.memCopy(MemoryUtil.memAddress(uploadScratch), ptr, bytes);
 			texture.upload();
 		} catch(RuntimeException | UnsatisfiedLinkError e) {
 			// 观测层：计数 + 5s 节流 WARN（旧版每次即时 warn，GL 侧持续失败
