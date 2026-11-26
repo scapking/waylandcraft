@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::io::Write;
+use std::sync::{LazyLock, Mutex};
 
 fn log(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -9,6 +10,133 @@ fn log(msg: &str) {
         .open("/tmp/waylandcraft-launch.log")
     {
         let _ = writeln!(f, "{}", msg);
+    }
+}
+
+// ═══ 会话收养登记表（fix/app-launcher-lifecycle）═══
+//
+// 根因：单实例应用（code/firefox/Discord）在**上一个游戏会话**里被 spawn 过，
+// 那个会话的合成器 socket 随 JVM 退出而死，但应用进程存活（double-fork 后由
+// init 收养，mod 从未知道它的 PID）。新会话 `/wl launch` 同一应用时，CLI 进程
+// 把启动请求"交接"给这个绑死在陈旧 socket 上的旧实例后自行退出——旧实例窗口
+// 永远出不来，表现为 mapped=0、进程在、无 toplevel。
+//
+// 修复三件套：
+// 1. spawn 通过 pipe 把孙进程（exec 后即应用主进程）PID 写回父进程，连同
+//    其进程组（setsid 的子进程 PID）记入本登记表——"收养"。
+// 2. 每个被 spawn 的进程注入 WAYLANDCRAFT_SESSION 标记（<jvmPid>-<wayland-N>），
+//    Java 侧据此区分"本会话实例 / 陈旧会话孤儿 / 宿主进程"（判定纯函数见
+//    AppLifecycleLogic，绝不误杀宿主同名进程）。
+// 3. 断开/退出与 /wl close 按登记表精确终止进程树：SIGTERM→限时宽限→SIGKILL。
+
+#[derive(Clone, Debug)]
+pub struct AdoptedApp {
+    /// 孙进程 PID（exec 替换后即应用主进程）
+    pub pid: i32,
+    /// 进程组/会话 id = 中间子进程（setsid 的会话首进程）PID。
+    /// 内核保证：只要进程组还有存活成员，该 PID 不会被复用，
+    /// 因此 kill(-pgid) 始终命中本应用进程树，不会误伤复用同 PID 的新进程。
+    pub pgid: i32,
+    /// 启动命令 argv0（展示与排错用）
+    pub cmd: String,
+}
+
+static ADOPTED: LazyLock<Mutex<Vec<AdoptedApp>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// 会话标记（pid→env→归属会话判定的核心原料，与 Java 侧共享同一公式）。
+pub fn session_marker_for(wayland_display: &str) -> String {
+    format!("{}-{}", std::process::id(), wayland_display)
+}
+
+fn proc_alive(pid: i32) -> bool {
+    pid > 0 && std::path::Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+/// 进程组是否仍有存活成员（signal 0 探测：ESRCH → 组已消亡）。
+fn group_alive(pgid: i32) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    unsafe { libc::kill(-pgid, 0) == 0 }
+}
+
+/// 列出收养进程（顺带回收主进程已退出的条目——树随主进程消亡是常态，
+/// 残留组内孤儿由 close/terminate 的组杀兜底，不在这里追杀）。
+pub fn list_adopted() -> Vec<AdoptedApp> {
+    let Ok(mut reg) = ADOPTED.lock() else {
+        return Vec::new();
+    };
+    reg.retain(|a| proc_alive(a.pid));
+    reg.iter().cloned().collect()
+}
+
+fn record_adopted(pid: i32, pgid: i32, cmd: &str) {
+    let Ok(mut reg) = ADOPTED.lock() else { return };
+    reg.push(AdoptedApp { pid, pgid, cmd: cmd.to_string() });
+    log(&format!("[adopt] tracked pid={} pgid={} cmd={}", pid, pgid, cmd));
+}
+
+fn kill_pid(pid: i32, sig: i32) {
+    if pid > 1 {
+        unsafe { libc::kill(pid, sig); }
+    }
+}
+
+fn kill_group(pgid: i32, sig: i32) {
+    // 双保险：pgid<=1 绝不发（-1 = 全进程表）；也绝不误杀游戏自身进程组。
+    if pgid > 1 && pgid != unsafe { libc::getpgid(0) } {
+        unsafe { libc::kill(-pgid, sig); }
+    }
+}
+
+/// 后台升级线程：force=直接 SIGKILL；否则 SIGTERM→宽限（默认 4s 轮询）→SIGKILL。
+/// 结束（或发起时即目标全灭）后移除登记，避免陈旧条目污染 list/status。
+fn escalate_kill(pid: i32, pgid: i32, force: bool) {
+    std::thread::spawn(move || {
+        if force {
+            kill_group(pgid, libc::SIGKILL);
+            kill_pid(pid, libc::SIGKILL);
+        } else {
+            kill_group(pgid, libc::SIGTERM);
+            kill_pid(pid, libc::SIGTERM);
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                if !proc_alive(pid) && !group_alive(pgid) {
+                    break;
+                }
+            }
+            if proc_alive(pid) || group_alive(pgid) {
+                log(&format!("[adopt] pid={} pgid={} ignored SIGTERM, escalating SIGKILL", pid, pgid));
+                kill_group(pgid, libc::SIGKILL);
+                kill_pid(pid, libc::SIGKILL);
+            }
+        }
+        if let Ok(mut reg) = ADOPTED.lock() {
+            reg.retain(|a| a.pid != pid);
+        }
+    });
+}
+
+/// 按收养登记精确终止单个应用进程树。pid 不在登记表 → false（调用方决定兜底）。
+pub fn kill_adopted(pid: i32, force: bool) -> bool {
+    let entry = list_adopted().into_iter().find(|a| a.pid == pid);
+    let Some(entry) = entry else {
+        return false;
+    };
+    escalate_kill(entry.pid, entry.pgid, force);
+    true
+}
+
+/// 游戏断开/退出：终止**全部**本会话收养的进程树（SIGTERM→限时→SIGKILL）。
+/// 立即返回（升级在后台线程完成），不阻塞客户端 tick 线程。
+pub fn terminate_all_adopted() {
+    let entries = list_adopted();
+    if entries.is_empty() {
+        return;
+    }
+    log(&format!("[adopt] session ending: terminating {} adopted app(s)", entries.len()));
+    for e in entries {
+        escalate_kill(e.pid, e.pgid, false);
     }
 }
 
@@ -71,7 +199,7 @@ fn detect_app_type(cmd: &str) -> &'static str {
 /// 的关键变量。如果不传，应用会尝试默认 `$XDG_RUNTIME_DIR/bus`，但**嵌套
 /// 合成器里 `$XDG_RUNTIME_DIR` 是我们写的**（不是宿主），可能导致 bus
 /// 路径错误。显式传宿主的 bus 地址确保嵌套应用直接连宿主 IME daemon。
-fn build_universal_env_list(wayland_display: &str, display: &str) -> Vec<(String, String)> {
+fn build_universal_env_list(wayland_display: &str, display: &str, session_marker: &str) -> Vec<(String, String)> {
     let mut env = vec![
         ("WAYLAND_DISPLAY".to_string(), wayland_display.to_string()),
         ("DISPLAY".to_string(), display.to_string()),
@@ -83,6 +211,12 @@ fn build_universal_env_list(wayland_display: &str, display: &str) -> Vec<(String
         ("OZONE_PLATFORM_HINT".to_string(), "auto".to_string()),
         ("ELECTRON_OZONE_PLATFORM_HINT".to_string(), "auto".to_string()),
     ];
+    // 会话标记：本 mod spawn 的每个进程都带上 "<jvmPid>-<wayland-N>"。
+    // 旧会话孤儿（jvmPid 已死）与新会话（N 可能因 socket 文件删除+重建而重名）
+    // 由此可严格区分——启动前的陈旧实例检测与 /wl close 精确化都以此为锚。
+    if !session_marker.is_empty() {
+        env.push(("WAYLANDCRAFT_SESSION".to_string(), session_marker.to_string()));
+    }
     // C 方案：嵌套应用需要宿主 dbus 路径找 IME daemon（ibus / fcitx5）
     // 如果有就传（最常见 unix:path=/run/user/1000/bus）
     if let Ok(bus) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
@@ -105,7 +239,7 @@ fn build_universal_env_list(wayland_display: &str, display: &str) -> Vec<(String
 /// 这样任何 flatpak 应用（现在的、未来的、新装上的）都无需识别，行为一致：
 /// 支持 wayland 的走我们的 compositor（原生渲染），只支持 x11 的走 satellite（抓帧），
 /// 音频走 pulseaudio socket（pipewire-pulse 兼容）→ 宿主按 PID 捕获。
-fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &str) {
+fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &str, session_marker: &str) {
     // 找到 app_id 的位置（run 之后第一个非选项参数）
     let mut insert_pos = None;
     let mut found_run = false;
@@ -138,6 +272,12 @@ fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &s
         // flatpak bind 宿主 pulse socket（pipewire-pulse 兼容），宿主无音频服务时跳过不影响启动。
         "--socket=pulseaudio".to_string(),
     ];
+
+    // 会话标记进沙箱：flatpak 沙箱内应用同样带 WAYLANDCRAFT_SESSION，
+    // 陈旧检测/收养归属对 flatpak 应用同样成立（否则 flatpak 版微信/QQ 漏网）。
+    if !session_marker.is_empty() {
+        opts.push(format!("--env=WAYLANDCRAFT_SESSION={}", session_marker));
+    }
 
     // DISPLAY 永远指向 xwayland-satellite（窗口回 Minecraft 的保证）；
     // 同时 bind satellite 的单个 X socket 文件，双保险。
@@ -215,12 +355,13 @@ pub fn spawn(
 
     let app_type = detect_app_type(&cmd);
     log(&format!("[detect] type={}", app_type));
-    
+
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/run/user/1000".to_string());
-    
+    let session_marker = session_marker_for(&wayland_display);
+
     let (final_cmd, final_args) = if app_type == "flatpak" {
         let mut flatpak_args = args.clone();
-        inject_flatpak_env(&mut flatpak_args, &wayland_display, &display);
+        inject_flatpak_env(&mut flatpak_args, &wayland_display, &display, &session_marker);
         log(&format!("[flatpak] final args={:?}", flatpak_args));
         (cmd.clone(), flatpak_args)
     } else {
@@ -235,7 +376,7 @@ pub fn spawn(
             log("[snap] universal env injection (ensure snap interfaces wayland/x11/audio-playback are connected)");
         }
         // 非沙箱 / snap: 用 bash -c 包装，强制设置环境变量后 exec
-        let env_list = build_universal_env_list(&wayland_display, &display);
+        let env_list = build_universal_env_list(&wayland_display, &display, &session_marker);
         log(&format!("[env] will set: {:?}", env_list));
         
         // 构建 bash 命令: export VAR=val; exec cmd args...
@@ -289,36 +430,256 @@ pub fn spawn(
         // （flatpak 运行器需要宿主 XDG_RUNTIME_DIR 才能用 --filesystem=xdg-run 构建沙箱）
         .env("WAYLAND_DISPLAY", &wayland_display)
         .env("XDG_RUNTIME_DIR", &runtime_dir)
-        .env("DISPLAY", &display);
+        .env("DISPLAY", &display)
+        // 会话标记对**所有**路径生效（flatpak runner 外层进程也带上，
+        // 沙箱内层经 --env= 注入，见 inject_flatpak_env）
+        .env("WAYLANDCRAFT_SESSION", &session_marker);
 
     // double-fork：子进程立即退出，孙进程被 init 收养，避免僵尸；
-    // 孙进程里直接 exec（不再调用 Command::spawn，避免 fork 后重用 std 的锁/allocator 风险）
+    // 孙进程里直接 exec（不再调用 Command::spawn，避免 fork 后重用 std 的锁/allocator 风险）。
+    // 收养登记：子进程把孙进程 PID 经 pipe 写回父进程（孙进程 exec 后即应用主进程，
+    // 其进程组 = 子进程 setsid 后的 PGID）。没有这个 PID，跨会话孤儿就无从终止。
+    let mut fds = [0 as libc::c_int; 2];
+    let pipe_ok = unsafe { libc::pipe(fds.as_mut_ptr()) } == 0;
+    if !pipe_ok {
+        log("[spawn] pipe() failed - app will spawn untracked (adoption disabled for this launch)");
+    }
+
     match unsafe { libc::fork() } {
         0 => {
+            if pipe_ok {
+                unsafe { libc::close(fds[0]); }
+            }
             unsafe { libc::setsid(); }
             match unsafe { libc::fork() } {
                 0 => {
-                    // 孙进程：exec 替换成目标程序。exec 失败才返回。
+                    // 孙进程：关闭 pipe 端再 exec（fd 绝不能泄进应用）。
+                    // pipe_ok=false 时 fds 是 [0,0]，碰都不许碰（会关掉 stdin）。
+                    if pipe_ok {
+                        unsafe { libc::close(fds[1]); }
+                    }
                     let err = command.exec();
                     log(&format!("[spawn] exec FAILED for '{}': {}", final_cmd, err));
                     eprintln!("[waylandcraft] exec FAILED for '{}': {}", final_cmd, err);
                     unsafe { libc::_exit(127); }
                 }
                 -1 => {
+                    // 第二层 fork 失败：回写 -1，父进程据此返回 Err（不误报启动成功）。
+                    if pipe_ok {
+                        write_pid(fds[1], -1);
+                        unsafe { libc::close(fds[1]); }
+                    }
                     log("[spawn] second fork() failed!");
                     unsafe { libc::_exit(1); }
                 }
-                _ => unsafe { libc::_exit(0); },
+                grandchild => {
+                    if pipe_ok {
+                        write_pid(fds[1], grandchild);
+                        unsafe { libc::close(fds[1]); }
+                    }
+                    unsafe { libc::_exit(0); }
+                }
             }
         }
         -1 => {
+            if pipe_ok {
+                unsafe { libc::close(fds[0]); libc::close(fds[1]); }
+            }
             log("[spawn] fork() failed!");
             return Err(());
         }
-        _ => {}
+        middle => {
+            // 父进程（游戏 JVM 内的 native 线程）：读孙 PID → 收尸中间子进程 → 登记。
+            if pipe_ok {
+                unsafe { libc::close(fds[1]); }
+            }
+            let grandchild = if pipe_ok { read_pid(fds[0]) } else { 0 };
+            if pipe_ok {
+                unsafe { libc::close(fds[0]); }
+            }
+            unsafe { libc::wait(std::ptr::null_mut()); }
+            match grandchild {
+                -1 => {
+                    log("[spawn] second fork failed in child; launch reported as error");
+                    return Err(());
+                }
+                g if g > 0 => record_adopted(g, middle, &cmd),
+                _ => {
+                    // pipe 不可用/读失败：进程可能已正常 spawn，但本会话无法收养它。
+                    log("[spawn] adopted pid unavailable - app running untracked this session");
+                }
+            }
+        }
     }
 
-    unsafe { libc::wait(std::ptr::null_mut()); }
     log(&format!("[spawn] done for cmd={}", cmd));
     Ok(())
+}
+
+fn write_pid(fd: libc::c_int, pid: libc::pid_t) {
+    let bytes = pid.to_ne_bytes();
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let n = unsafe {
+            libc::write(fd, bytes[off..].as_ptr() as *const libc::c_void, bytes.len() - off)
+        };
+        if n <= 0 {
+            return; // 短写：读端拿到残缺数据由 read_pid 的循环长度校验兜住
+        }
+        off += n as usize;
+    }
+}
+
+/// 读满 4 字节返回 PID；读不满（pipe 关闭/损坏）返回 0（视为"无 PID 可收养"）。
+fn read_pid(fd: libc::c_int) -> i32 {
+    let mut buf = [0u8; 4];
+    let mut off = 0usize;
+    while off < buf.len() {
+        let n = unsafe { libc::read(fd, buf[off..].as_mut_ptr() as *mut libc::c_void, buf.len() - off) };
+        if n <= 0 {
+            return 0;
+        }
+        off += n as usize;
+    }
+    i32::from_ne_bytes(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_marker_formula_stable_and_distinct() {
+        // 公式 = "<jvmPid>-<wayland-N>"：同 JVM 同 socket 两次调用一致；
+        // socket 名不同（新旧会话）必然不同——陈旧判定的唯一锚点。
+        let a = session_marker_for("wayland-1");
+        let b = session_marker_for("wayland-1");
+        let c = session_marker_for("wayland-2");
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.contains(&std::process::id().to_string()));
+        assert!(a.ends_with("-wayland-1"));
+    }
+
+    #[test]
+    fn universal_env_carries_session_marker() {
+        let env = build_universal_env_list("wayland-3", ":0", "4242-wayland-3");
+        let hit = env.iter().find(|(k, _)| k == "WAYLANDCRAFT_SESSION");
+        assert_eq!(hit.map(|(_, v)| v.as_str()), Some("4242-wayland-3"));
+        // 空标记（理论不可达，防御）不注入垃圾变量
+        let env2 = build_universal_env_list("wayland-3", ":0", "");
+        assert!(!env2.iter().any(|(k, _)| k == "WAYLANDCRAFT_SESSION"));
+    }
+
+    #[test]
+    fn flatpak_opts_carry_session_marker_before_app_id() {
+        // flatpak run [opts] app-id --args：选项必须在 run 之后 app_id 之前，
+        // 且标记必须进沙箱（否则 flatpak 版单实例应用逃过陈旧检测）。
+        let mut args = vec!["run".to_string(), "--branch=x".to_string(),
+            "com.tencent.WeChat".to_string(), "--foo".to_string()];
+        inject_flatpak_env(&mut args, "wayland-1", ":9", "777-wayland-1");
+        let marker_pos = args.iter().position(|a| a == "--env=WAYLANDCRAFT_SESSION=777-wayland-1")
+            .expect("marker opt missing");
+        let app_pos = args.iter().position(|a| a == "com.tencent.WeChat").unwrap();
+        let run_pos = args.iter().position(|a| a == "run").unwrap();
+        assert!(run_pos < marker_pos && marker_pos < app_pos);
+        assert!(args.iter().any(|a| a == "--env=WAYLAND_DISPLAY=wayland-1"));
+    }
+
+    #[test]
+    fn proc_alive_semantics() {
+        assert!(proc_alive(std::process::id() as i32));
+        assert!(!proc_alive(0));
+        assert!(!proc_alive(-1));
+        // 几乎不可能存在的超界 pid（Linux pid_max <= 4194304）
+        assert!(!proc_alive(4194303));
+    }
+
+    #[test]
+    fn group_kill_guard_rejects_dangerous_ids() {
+        // pgid<=1 与本进程组绝不发信号（-1 = 全体进程，杀到游戏自己就是灾难）。
+        // 用 0 号信号验证守卫不外溢：函数直接返回，不产生任何 EPERM/ESRCH 副作用。
+        let our_pgid = unsafe { libc::getpgid(0) };
+        kill_group(1, 0);
+        kill_group(0, 0);
+        kill_group(-1, 0);
+        kill_group(our_pgid, 0); // 本组被守卫拒绝——绝不误伤 JVM 自身
+        kill_pid(1, 0); // init（pid 1）被 `pid > 1` 守卫排除
+        kill_pid(0, 0); // 0 号同样被拒（kill(0)=发给本组）
+    }
+
+    /// 真机闭环（非沙箱环境手动跑）：spawn → pipe 回读 PID → environ 带会话标记
+    /// → kill_adopted(force) 进程树消亡。验证收养机制的三个关键事实，而不是 mock。
+    /// 运行：cargo test --lib -- --ignored --test-threads=1 adopted_spawn_end_to_end
+    #[test]
+    #[ignore = "fork/exec 真实进程操作，单测并行环境下隔离运行（见 docs/APPS.md 验证节）"]
+    fn adopted_spawn_end_to_end() {
+        let marker_before = session_marker_for("wayland-77");
+        spawn(
+            "/bin/sleep".to_string(),
+            vec!["600".to_string()],
+            vec![],
+            "wayland-77".to_string(),
+            String::new(),
+        )
+        .expect("spawn failed");
+
+        let apps = list_adopted();
+        let me = apps.iter().find(|a| a.cmd == "/bin/sleep").expect("adopted entry missing");
+        let pid = me.pid;
+
+        // /proc/pid/environ 是**最近一次 exec 时刻**的快照：孙进程 fork 后、
+        // Command::exec 完成前读到的是 JVM 的旧环境。轮询等待 exec 落地，
+        // 任何断言失败路径都必须先杀掉进程再 panic（绝不留孤儿测试进程）。
+        let mut marker_found = false;
+        let mut env_str = String::new();
+        for _ in 0..30 {
+            if let Ok(raw) = std::fs::read(format!("/proc/{}/environ", pid)) {
+                env_str = String::from_utf8_lossy(&raw).into_owned();
+                if env_str.contains("WAYLANDCRAFT_SESSION=") {
+                    marker_found = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // 失败路径一律先 SIGKILL 再 panic：真机测试绝不留孤儿进程
+        if !(marker_found && env_str.contains(&marker_before)) {
+            kill_pid(pid, libc::SIGKILL);
+            panic!(
+                "marker absent/wrong in exec'd environ (pid {} killed): {}",
+                pid, &env_str[..env_str.len().min(200)]
+            );
+        }
+
+        // 独立进程组（setsid 生效）：pgid == 登记的中间子 PID
+        // /proc 格式：pid (comm) state ppid pgrp … → 末')'后第 3 个字段（索引 2）是 pgrp
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap_or_default();
+        let pgid_field = stat.rsplit(')').next().unwrap().split_whitespace().nth(2).unwrap_or("");
+        if pgid_field != me.pgid.to_string() {
+            kill_pid(pid, libc::SIGKILL);
+            panic!("child pgid {} != adopted pgid {} (pid killed)", pgid_field, me.pgid);
+        }
+
+        assert!(kill_adopted(pid, true), "kill_adopted rejected tracked pid");
+        for _ in 0..50 {
+            if !proc_alive(pid) {
+                return; // 树已消亡，闭环成立
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        kill_pid(pid, libc::SIGKILL);
+        panic!("adopted pid {} survived force kill", pid);
+    }
+
+    #[test]
+    fn terminate_and_kill_adopted_reject_untracked_pids() {
+        // 未登记的 PID 一律 false（close 路径据此回退提示，绝不盲杀）。
+        assert!(!kill_adopted(std::process::id() as i32, true));
+        assert!(!kill_adopted(4194303, false));
+        // 空表时 terminate_all 早退，不派线程、不 panic。
+        // （注：本测试与登记表共享进程全局状态，但纯单测进程里 spawn 从未发生，表恒空。）
+        terminate_all_adopted();
+        assert!(list_adopted().is_empty());
+    }
 }
