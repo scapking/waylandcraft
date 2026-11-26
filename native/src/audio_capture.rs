@@ -65,11 +65,23 @@ use std::time::{Duration, Instant};
 
 use pipewire as pw;
 
-/// [audio] 日志宏：同时写 stderr 和 audio 日志文件（bridge::audio_log_write）。
+/// [audio] 日志宏（**分级=里程碑/失败行**：start/stop 结果、stage 1-4
+/// 摘要、FALLBACK、watchdog 状态迁移与失败——任何档位都写。分级表见
+/// docs/LOGGING.md）。同时写 stderr 和 audio 日志文件（bridge::audio_log_write）。
 macro_rules! audio_log {
     ($($arg:tt)*) => {
         crate::bridge::audio_log_write(&format!($($arg)*))
     };
+}
+
+/// [audio] 细节级日志（poll 周期行：watchdog round、capture ongoing
+/// 计数、拓扑逐节点 dump）：发布档在判定处短路——不 format、不写。
+macro_rules! audio_log_v {
+    ($($arg:tt)*) => {{
+        if $crate::bridge::verbose_logging() {
+            $crate::bridge::audio_log_write(&format!($($arg)*));
+        }
+    }};
 }
 
 /// 全局捕获会话（native 侧单例，一次只允许一个音频捕获会话）。
@@ -622,15 +634,17 @@ fn try_begin_start(sess_rc: &Rc<RefCell<Session>>, topo_rc: &Rc<RefCell<TopoStat
     let topo = topo_rc.borrow().topo.clone();
     audio_log!("[audio] stage 1/4: registry 同步完成 — {} nodes", topo.nodes.len());
 
+    // 分级=细节（拓扑逐节点 dump，节点数不定）→ verbose 档；上面的
+    // stage 1/4 计数行与下面的 stage 摘要保留（启动摘要级）。
     if pid > 0 {
         for (id, (mc, _npid, name, _)) in topo.nodes.iter().filter(|(_, (_, p, _, _))| *p == pid) {
-            audio_log!("[audio] pid节点: id={} class={} name={}", id, mc, name);
+            audio_log_v!("[audio] pid节点: id={} class={} name={}", id, mc, name);
         }
     }
     for (id, (mc, npid, name, _)) in
         topo.nodes.iter().filter(|(_, (mc, _, _, _))| is_playback_stream_class(mc))
     {
-        audio_log!("[audio] candidate app stream: id={} class={} pid={} name={}", id, mc, npid, name);
+        audio_log_v!("[audio] candidate app stream: id={} class={} pid={} name={}", id, mc, npid, name);
     }
 
     audio_log!("[audio] stage 2/4: 按 pid={} 匹配应用播放流节点（Stream/Input）...", pid);
@@ -774,12 +788,17 @@ fn connect_capture(
                                     // watchdog 的存活依据：收到数据的最新时刻
                                     s.last_data_at = Instant::now();
                                     if s.capture_events == 1 {
+                                        // 分级=里程碑（首包 LIVE 证据，会话一次）：保留。
                                         log_line = Some(format!(
                                             "[audio] FIRST capture — {} bytes (process 回调 LIVE, mode={})",
                                             src.len(),
                                             s.mode.as_str()
                                         ));
-                                    } else if s.capture_events % 2000 == 0 {
+                                    } else if s.capture_events % 2000 == 0
+                                        && crate::bridge::verbose_logging()
+                                    {
+                                        // 分级=细节（process 周期计数行）→ verbose 档，
+                                        // 判定在持锁热路径内联，跳过 format。
                                         log_line = Some(format!(
                                             "[audio] capture ongoing: {} events, {} bytes",
                                             s.capture_events, s.total_bytes
@@ -1274,7 +1293,9 @@ fn watchdog_tick(sess_rc: &Rc<RefCell<Session>>, topo_rc: &Rc<RefCell<TopoState>
             shared.last_promotion_at = now;
         }
 
-        audio_log!(
+        // 分级=细节（poll 周期行，500ms tick 一条）→ verbose 档；同函数
+        // 的状态迁移行（重连/降级/节点消失/升级）全部保留。
+        audio_log_v!(
             "[audio] watchdog: round mode={} stalled={} promote_due={} events={} bytes={}",
             shared.mode.as_str(),
             stalled,
@@ -1681,8 +1702,10 @@ fn find_default_sink(topo: &PwTopology) -> Result<(u32, String), String> {
     }
     sinks.sort();
 
+    // 分级=细节（sink 枚举 dump；本函数在 watchdog 降级/重连路径会被
+    // 周期性调用）→ verbose 档；空集 Err（失败证据）保留。
     for (id, name) in &sinks {
-        audio_log!("[audio] candidate sink: id={} name={}", id, name);
+        audio_log_v!("[audio] candidate sink: id={} name={}", id, name);
     }
 
     if sinks.is_empty() {

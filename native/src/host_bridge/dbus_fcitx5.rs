@@ -130,7 +130,8 @@ impl HostBridge for DbusFcitx5Bridge {
                 let release = matches!(action, crate::seat::KeyboardAction::Release);
                 let state = if release { 1u32 << 30 } else { 0 };
                 if keysym == 0 {
-                    crate::host_bridge::ime_log!(
+                    // 分级=细节（逐键拒绝行）→ verbose 档。
+                    crate::bridge::ime_log_v!(
                         "[waylandcraft][host_bridge][dbus-fcitx5] submit Key keysym=0 拒绝"
                     );
                     return;

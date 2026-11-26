@@ -43,7 +43,9 @@ use std::os::fd::AsFd;
 use std::sync::{Arc, Mutex};
 use xkbcommon::xkb::{self, Keymap};
 
-/// 键盘调试日志：同时写 stderr 和 KB_LOG_FILE（bridge::setKbLogFile 设置）。
+/// 键盘调试日志（**分级=里程碑/失败行**：焦点 enter/leave、NOT ALIVE、
+/// 无焦点 WARN——低频且是"穿透不了窗口"的直接证据，发布档保留）。
+/// 同时写 stderr 和 KB_LOG_FILE（bridge::setKbLogFile 设置）。
 /// 这样用户上传 .minecraft/waylandcraft-kb.log 就能看到 Rust 侧实际行为。
 macro_rules! kb_log {
     ($($arg:tt)*) => {{
@@ -52,6 +54,12 @@ macro_rules! kb_log {
         eprintln!("{msg}");
     }};
 }
+
+// 逐键 [kb-debug] 细节行的分级在 keyboard_key() 内联实现（if verbose
+// 门）：该行的参数含 xkb mods 序列化与 per-keyboard 字符串拼装，
+// 宏式 format 门控无法短路"调用点先算"的部分——内联门是这里唯一
+// 零开销形态。组字/长按 repeat 热路径每键 1-2 行的主要日志量来源
+// 就在这一行。分级规则见 bridge.rs 顶部注释与 docs/LOGGING.md。
 
 pub struct WLCSeatState {
     pub pointers: Vec<WlPointer>,
@@ -766,14 +774,19 @@ impl WLCSeatState {
         let serial = new_serial();
         let state = action.key_state();
         let mut any_focus = false;
+        // 分级=细节（逐键 [kb-debug] 行）→ verbose 档。descs 组装与
+        // mods 序列化读数都只在放行时做（组字热路径零开销）。
+        let verbose = crate::bridge::verbose_logging();
         let mut focus_descs = String::new();
         self.for_all_keyboards(|keyboard, data| {
             if data.focus.is_some() {
                 any_focus = true;
-                focus_descs.push_str(&format!(" kb{}:focused", keyboard.id()));
+                if verbose {
+                    focus_descs.push_str(&format!(" kb{}:focused", keyboard.id()));
+                }
                 keyboard.key(serial, get_time(), wire_key, state);
                 self.send_modifiers(keyboard, serial);
-            } else {
+            } else if verbose {
                 focus_descs.push_str(&format!(" kb{}:NO_FOCUS", keyboard.id()));
             }
         });
@@ -781,13 +794,15 @@ impl WLCSeatState {
         // mods(depressed=X locked=Y)：X/Y 来自 xkb_state —— 按 Caps Lock 后 locked 应变 1
         // （窗口大小写切换靠它）；按 Ctrl/Shift 后 depressed 应变 1/2/4…（快捷键靠它）。
         // 任何键盘有 focus → key 事件已发出；全 NO_FOCUS → 按键被丢弃（Java 侧 focusSurface 没生效）。
-        let depressed = self.xkb_state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
-        let locked = self.xkb_state.serialize_mods(xkb::STATE_MODS_LOCKED);
-        kb_log!(
-            "[kb-debug] keyboard_key: key={} wire={} action={:?} kb_active=true mods(depressed={} locked={}) |{}{}",
-            key, wire_key, action, depressed, locked, focus_descs,
-            if any_focus { " -> SENT" } else { " -> DROPPED(no focus)" }
-        );
+        if verbose {
+            let depressed = self.xkb_state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
+            let locked = self.xkb_state.serialize_mods(xkb::STATE_MODS_LOCKED);
+            kb_log!(
+                "[kb-debug] keyboard_key: key={} wire={} action={:?} kb_active=true mods(depressed={} locked={}) |{}{}",
+                key, wire_key, action, depressed, locked, focus_descs,
+                if any_focus { " -> SENT" } else { " -> DROPPED(no focus)" }
+            );
+        }
         // 诊断：键盘已激活但没有任何 wl_keyboard 有焦点 —— 按键被静默丢弃
         // （"穿透不了窗口"的直接证据）。只 warn 一次避免刷屏。
         if !any_focus && !self.no_focus_warned.get() {

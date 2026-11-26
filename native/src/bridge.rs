@@ -44,8 +44,72 @@ use smithay::{
 };
 use std::ops::DerefMut;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use thiserror::Error;
+
+// ═════════════ 日志分级（单一开关 VERBOSE_LOG）═════════════
+//
+// 用户诉求：**debug 模式全部日志；发布模式只留少量必要日志**。
+//
+// 分级规则（完整分级表见 docs/LOGGING.md）：
+// * **发布档保留（永远打）**：启动摘要（版本/平台/子系统探测结果）、
+//   WARN/ERROR 行、error ring（status::note_error，独立通道不受本门）、
+//   IME nested ⑥ 决策行（spawn/bind/主路径激活/失败回退）、会话
+//   start/stop 结果、崩溃取证行。缓冲日志的"关键行即时 flush"合同
+//   （is_important_line，sync15 性能批）不受分级影响——失败行落盘
+//   时机不因门控变差。
+// * **verbose 门控（发布档在写入点整体跳过）**：kb-debug 逐键盘键行、
+//   popup gate/attach 细节、IME 逐事件（ti3 commit/enable/disable、
+//   apply_ti3_outcome 细节、relay set_app_enabled 每事件、宿主桥
+//   每键/每信号行）、audio 周期性行（process 计数、watchdog 轮次）、
+//   status 采样（metrics 窗口报告）。
+//
+// 机制：调用点**逐处标注分类**——细节行走带门宏（ime_log_v! 定义于
+// 本文件、host_bridge/ime/* 全路径引用；audio_capture.rs audio_log_v!；
+// seat.rs 逐键行因需短路"调用点先算"的 mods 序列化改为内联门），
+// 里程碑行不动。
+// 门控判定发生在 format 之前：发布档下细节行零格式化、零写开销
+// （组字热路径每键省 2-6 次字符串构造）。
+//
+// 开关流转：settings.verboseLogging（dev 环境默认 true）→ Java
+// WcLogging（生效档，-Dwc.verbose 系统属性可覆盖）→
+// setVerboseLoggingNative 启动与变更时各下发一次。默认 true——
+// native 单测/bench 环境（无 Java 下发）保持全开，既有日志断言
+// 行为不漂移。
+pub(crate) static VERBOSE_LOG: AtomicBool = AtomicBool::new(true);
+
+/// 当前档位（relaxed：切换瞬间的可见性窗口只影响个别日志行，
+/// 无正确性依赖——绝不允许业务逻辑读它做判定）。
+#[inline]
+pub fn verbose_logging() -> bool {
+    VERBOSE_LOG.load(Ordering::Relaxed)
+}
+
+/// Java 下发生效档（setVerboseLoggingNative）。档位切换行本身是
+/// 里程碑级：无条件写 ime.log 并立即 flush，跨层对时可追溯切点。
+pub fn set_verbose_logging(v: bool) {
+    let prev = VERBOSE_LOG.swap(v, Ordering::Relaxed);
+    ime_log_write(&format!(
+        "[waylandcraft][logging] 档位切换: verbose {} → {}（发布档只保留里程碑与失败行）",
+        prev, v
+    ));
+    ime_log_flush();
+}
+
+/// 细节级 IME 日志带门宏（全 crate 唯一定义点；host_bridge 亦经此
+/// 路径转发）。发布档（VERBOSE_LOG=false）在判定处短路——**不
+/// format、不写 stderr、不进缓冲**，组字/轮询热路径零开销。
+/// 哪些行算细节见本文件顶部注释与 docs/LOGGING.md 分级表。
+macro_rules! ime_log_v {
+    ($($arg:tt)*) => {{
+        if $crate::bridge::verbose_logging() {
+            $crate::bridge::ime_log_write(&::std::format!($($arg)*));
+        }
+    }};
+}
+
+pub(crate) use ime_log_v;
 
 /// Rust 侧键盘调试日志文件（Java 通过 setKbLogFile 设置路径）。
 /// 所有 [kb-debug] 行同时写 stderr 和这个文件，用户上传即可定位
@@ -325,6 +389,107 @@ mod ime_log_tests {
 #[cfg(test)]
 pub(crate) fn set_ime_log_file_for_test(f: std::fs::File) {
     let _ = IME_LOG_FILE.lock().map(|mut g| *g = Some(ImeLogWriter::new(f)));
+}
+
+/// 日志分级门行为单测（注入式）：VERBOSE 开关决定细节行写/跳，
+/// 里程碑行与档位切换行任何档位都写。内存 sink 注入 IME_LOG_FILE，
+/// 断言按唯一 marker（其他并发测试的行只进 sink 不干扰判定）。
+#[cfg(test)]
+mod verbose_gate_tests {
+    use super::*;
+
+    /// 串行化本模块用例（并发互踩全局档位/全局 writer）；毒锁忽略——
+    /// 上一用例断言失败不该级联炸出后续用例。
+    static GATE_LOCK: Mutex<()> = Mutex::new(());
+
+    struct MarkerSink(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for MarkerSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// RAII：用例结束（含 panic）恢复全局档位并卸下 sink。
+    struct GateGuard {
+        prev: bool,
+    }
+
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            VERBOSE_LOG.store(self.prev, Ordering::Relaxed);
+            let mut g = IME_LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+            *g = None;
+        }
+    }
+
+    /// 装一个无 stderr 污染的内存 sink + 档位还原守卫。返回 (sink, guard)。
+    fn installed() -> (std::sync::Arc<Mutex<Vec<u8>>>, GateGuard) {
+        let shared = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let w = ImeLogWriter {
+            buf: std::io::BufWriter::with_capacity(64 * 1024, Box::new(MarkerSink(shared.clone()))),
+            collapse: crate::ime::metrics::RepeatCollapse::default(),
+            stderr: false,
+        };
+        let mut g = IME_LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+        *g = Some(w);
+        drop(g);
+        let guard = GateGuard { prev: VERBOSE_LOG.load(Ordering::Relaxed) };
+        (shared, guard)
+    }
+
+    fn sink_text(shared: &std::sync::Arc<Mutex<Vec<u8>>>) -> String {
+        ime_log_flush();
+        String::from_utf8(shared.lock().unwrap().clone()).unwrap()
+    }
+
+    #[test]
+    fn verbose_switch_decides_macro_write_or_skip() {
+        let _g = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let (sink, _guard) = installed();
+
+        // 关档（发布档）：带门宏细节行不落盘……
+        set_verbose_logging(false);
+        assert!(!verbose_logging());
+        ime_log_v!("[wc-gate] detail-line-off");
+        // ……非宏路径的细节语义判定同样短路（metrics_tick 同款 inline 门）。
+        if verbose_logging() {
+            ime_log_write("[wc-gate] inline-detail-off");
+        }
+        let text = sink_text(&sink);
+        assert!(!text.contains("[wc-gate] detail-line-off"), "发布档细节行必须被跳过：{text}");
+        assert!(!text.contains("[wc-gate] inline-detail-off"), "发布档内联门细节行必须被跳过：{text}");
+        // 里程碑行（不经门直接 ime_log_write）发布档照常写。
+        ime_log_write("[wc-gate] milestone-line-off");
+        let text = sink_text(&sink);
+        assert!(text.contains("[wc-gate] milestone-line-off"), "发布档里程碑行必须保留：{text}");
+        // 档位切换行本身是里程碑级：无条件写（跨层对时锚点）。
+        assert!(text.contains("[waylandcraft][logging] 档位切换"), "档位切换行必须落盘：{text}");
+
+        // 开档（verbose）：细节行照常写。
+        set_verbose_logging(true);
+        assert!(verbose_logging());
+        ime_log_v!("[wc-gate] detail-line-on");
+        let text = sink_text(&sink);
+        assert!(text.contains("[wc-gate] detail-line-on"), "verbose 档细节行必须写：{text}");
+    }
+
+    #[test]
+    fn toggle_roundtrip_restores_caller_value() {
+        let _g = GATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 全局默认 true：native 单测/bench 环境（无 Java 下发）全开，
+        // 既有日志行为不漂移。
+        assert!(VERBOSE_LOG.load(Ordering::Relaxed), "Rust 默认档必须是 verbose=true");
+        let prev = verbose_logging();
+        set_verbose_logging(!prev);
+        assert_eq!(verbose_logging(), !prev);
+        set_verbose_logging(prev);
+        assert_eq!(verbose_logging(), prev);
+    }
 }
 
 #[allow(clippy::vec_box)]
@@ -648,6 +813,13 @@ bind_java_type! {
             sig = (version: JString),
             name = "setModVersionNative",
             fn = set_mod_version,
+        },
+        // 日志分级：Java 下发生效档（settings/dev 环境/-Dwc.verbose 综合），
+        // 全局开关不依赖 instance（与 setModVersionNative 同型）。
+        static extern fn set_verbose_logging {
+            sig = (verbose: jboolean),
+            name = "setVerboseLoggingNative",
+            fn = set_verbose_logging_jni,
         },
         static extern fn notify_host_focus_gained {
             sig = (instance: jlong),
@@ -1435,11 +1607,14 @@ fn update_surface_data<'local>(
     let surface = match jptr_to_ref::<WlSurface>(handle) {
         Some(s) => s,
         None => {
-            eprintln!(
-                "[waylandcraft][bridge] updateSurfaceData: surface handle={} \
-                 not yet associated with WlSurface（跳过此 surface）",
-                handle
-            );
+            // 分级=细节（轮询期良性竞态：surface 创建中的每帧跳行）→ verbose 档。
+            if verbose_logging() {
+                eprintln!(
+                    "[waylandcraft][bridge] updateSurfaceData: surface handle={} \
+                     not yet associated with WlSurface（跳过此 surface）",
+                    handle
+                );
+            }
             return Ok(());
         }
     };
@@ -1614,10 +1789,13 @@ fn update_surface_tree<'local>(
     let surface = match jptr_to_ref::<WlSurface>(handle) {
         Some(s) => s,
         None => {
-            eprintln!(
-                "[waylandcraft][bridge] updateSurfaceTrees: surface handle=0x{:x} not alive（跳过此 surface，常见于 toplevel 关闭帧）",
-                handle
-            );
+            // 分级=细节（轮询期良性竞态：toplevel 关闭帧每帧一跳）→ verbose 档。
+            if verbose_logging() {
+                eprintln!(
+                    "[waylandcraft][bridge] updateSurfaceTrees: surface handle=0x{:x} not alive（跳过此 surface，常见于 toplevel 关闭帧）",
+                    handle
+                );
+            }
             return Ok(WLCSurface::null());
         }
     };
@@ -1984,9 +2162,10 @@ fn keyboard_input<'local>(
                         .xkb_state
                         .key_get_one_sym(xkbcommon::xkb::Keycode::new(keycode))
                         .raw() as u32;
-                    crate::bridge::ime_log_write(&format!(
+                    // 分级=细节（逐键）：⑧ 路由分布计数不受影响。
+                    ime_log_v!(
                         "[waylandcraft][ime] bridge submit_key scancode={keycode} keysym={keysym:#x} action={action:?}"
-                    ));
+                    );
                     let ke = crate::ime::KeyEvent {
                         keysym,
                         keycode,
@@ -2022,10 +2201,11 @@ fn keyboard_input<'local>(
         } else {
             if raw_needed {
                 instance.state.ime.raw_keys.insert(keycode);
-                crate::bridge::ime_log_write(&format!(
+                // 分级=细节（逐键）→ verbose 档。
+                ime_log_v!(
                     "[waylandcraft][ime] ⑧ raw forward scancode={keycode} key_result={key_result:?} route={}",
                     if nested_live { "nested-no-grab" } else { "host" }
-                ));
+                );
                 instance.state.seat.keyboard_key(keycode, action);
             }
         }
@@ -2142,6 +2322,19 @@ fn set_mod_version<'local>(
 ) -> Result<(), BridgeError> {
     let v: String = version.try_to_string(env).map_err(|e| BridgeError::JniError(e))?;
     crate::status::set_mod_version(&v);
+    Ok(())
+}
+
+/// setVerboseLoggingNative(verbose) —— Java 下发日志生效档（单一开关
+/// verboseLogging：dev 环境/settings/-Dwc.verbose 综合判定）。全局开关
+/// 无需 instance；细节分级规则见文件顶部 VERBOSE_LOG 注释。
+fn set_verbose_logging_jni(
+    _env: &mut Env<'_>,
+    _class: JClass<'_>,
+    verbose: jboolean,
+) -> Result<(), BridgeError> {
+    // jni 0.22 的 jboolean 即 Rust bool（见本文件 pressed 参数同款用法）。
+    set_verbose_logging(verbose);
     Ok(())
 }
 
@@ -2405,9 +2598,12 @@ fn candidate_nav<'local>(
     action: jint,
     _arg: jint,
 ) -> Result<(), BridgeError> {
-    eprintln!(
-        "[waylandcraft][bridge] candidateNav action={action}（C 方案已删此通路，候选由 im2 grab 处理）"
-    );
+    // 分级=细节（已删通路的每调用 stderr 行；Java 导航键可高频触达）→ verbose 档。
+    if verbose_logging() {
+        eprintln!(
+            "[waylandcraft][bridge] candidateNav action={action}（C 方案已删此通路，候选由 im2 grab 处理）"
+        );
+    }
     Ok(())
 }
 

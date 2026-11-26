@@ -291,6 +291,7 @@ impl Dispatch<ZwpTextInputManagerV3, ()> for crate::WLCState {
                     pending: Ti3Pending::default(),
                     commit_count: 0,
                 });
+                // 分级=里程碑（客户端接入生命周期事件，低频）：保留。
                 crate::bridge::ime_log_write(&format!(
                     "[waylandcraft][ime][ti3] client created zwp_text_input_v3 instance"
                 ));
@@ -315,10 +316,11 @@ impl Dispatch<ZwpTextInputV3, ()> for crate::WLCState {
 
         // commit 是唯一触发裁决流程的请求。
         if matches!(request, zwp_text_input_v3::Request::Commit) {
-            crate::bridge::ime_log_write(&format!(
+            // 分级=细节（ti3 逐事件：commit 每敲一键一行）→ verbose 档。
+            crate::bridge::ime_log_v!(
                 "[waylandcraft][ime][ti3] commit_instance obj={} -> apply_ti3_outcome",
                 obj_id
-            ));
+            );
             let outcome = state.ime.ti3.commit_instance(ti);
             super::ImeState::apply_ti3_outcome(state, outcome);
             return;
@@ -328,23 +330,21 @@ impl Dispatch<ZwpTextInputV3, ()> for crate::WLCState {
             return;
         };
         match request {
+            // 分级=细节（ti3 逐事件：enable/disable/周边文本，含用户输入
+            // 内容摘录，隐私上也应只在 verbose 档落盘）→ verbose 档。
             zwp_text_input_v3::Request::Enable => {
-                crate::bridge::ime_log_write(&format!(
-                    "[waylandcraft][ime][ti3] Enable obj={obj_id}"
-                ));
+                crate::bridge::ime_log_v!("[waylandcraft][ime][ti3] Enable obj={obj_id}");
                 inst.pending.enable = Some(true);
             }
             zwp_text_input_v3::Request::Disable => {
-                crate::bridge::ime_log_write(&format!(
-                    "[waylandcraft][ime][ti3] Disable obj={obj_id}"
-                ));
+                crate::bridge::ime_log_v!("[waylandcraft][ime][ti3] Disable obj={obj_id}");
                 inst.pending.enable = Some(false);
             }
             zwp_text_input_v3::Request::SetSurroundingText { text, cursor, anchor } => {
-                crate::bridge::ime_log_write(&format!(
+                crate::bridge::ime_log_v!(
                     "[waylandcraft][ime][ti3] SetSurroundingText obj={obj_id} text=\"{}\" cursor={cursor} anchor={anchor}",
                     text.chars().take(16).collect::<String>()
-                ));
+                );
                 inst.pending.surrounding_text = Some(text);
                 inst.pending.surrounding_cursor = cursor as u32;
                 inst.pending.surrounding_anchor = anchor as u32;
@@ -368,9 +368,10 @@ impl Dispatch<ZwpTextInputV3, ()> for crate::WLCState {
             }
             zwp_text_input_v3::Request::SetCursorRectangle { x, y, width, height } => {
                 // 客户端通过 ti3 上报光标矩形——验证候选窗锚点能否取真实应用光标。
-                crate::bridge::ime_log_write(&format!(
+                // 分级=细节（逐光标移动一行）→ verbose 档。
+                crate::bridge::ime_log_v!(
                     "[waylandcraft][ime][ti3] SetCursorRectangle obj={obj_id} rect=({x},{y},{width},{height})"
-                ));
+                );
                 inst.pending.cursor_rectangle = Some((x, y, width, height));
             }
             zwp_text_input_v3::Request::Destroy => {}
