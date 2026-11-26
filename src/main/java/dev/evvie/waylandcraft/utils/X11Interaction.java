@@ -35,6 +35,11 @@ public class X11Interaction {
 		Pointer XOpenDisplay(String displayName);
 		int XCloseDisplay(Pointer display);
 		int XKeysymToKeycode(Pointer display, long keysym);
+		// P1-8：交互注入前把目标窗口 raise + 设定输入焦点并回读验证
+		int XRaiseWindow(Pointer display, long window);
+		int XSetInputFocus(Pointer display, long focus, int revertTo, long timestamp);
+		int XGetInputFocus(Pointer display, Pointer[] focusReturn, com.sun.jna.ptr.IntByReference revertToReturn);
+		int XSync(Pointer display, boolean discard);
 	}
 
 	private interface Xtst extends Library {
@@ -159,6 +164,46 @@ public class X11Interaction {
 			return true;
 		} catch(Throwable t) {
 			LOGGER.warn("XTestFakeKeyEvent failed", t);
+			return false;
+		}
+	}
+
+	// XSetInputFocus 常量
+	private static final int REVERT_TO_PARENT = 2;   // RevertToParent
+	private static final long CURRENT_TIME = 0L;     // CurrentTime
+
+	/**
+	 * P1-8：把目标窗口提到最前并把 X 输入焦点设定到它，回读验证成功才返回 true。
+	 *
+	 * XTest 的按键事件作用于**输入焦点窗口**而不是任何坐标——不做这一步，
+	 * 授予 INTERACT 就等于把 owner 桌面级的键盘注入权交给了远端玩家
+	 * （owner 正聚焦终端时，远端的按键全部打进终端）。
+	 * 回读 XGetInputFocus 防止 BadMatch（窗口未映射/已销毁）被 Xlib 默认
+	 * 错误处理器吞掉后"看似成功"地继续注入。
+	 */
+	public static boolean raiseAndFocusWindow(String displayName, long xid) {
+		if(X11_LIB == null || xid == 0) {
+			return false;
+		}
+		Pointer display = display(displayName);
+		if(display == null) return false;
+		try {
+			X11_LIB.XRaiseWindow(display, xid);
+			X11_LIB.XSetInputFocus(display, xid, REVERT_TO_PARENT, CURRENT_TIME);
+			X11_LIB.XSync(display, false); // 冲刷请求，使 BadMatch 在回读前生效
+
+			Pointer[] focusOut = new Pointer[1];
+			com.sun.jna.ptr.IntByReference revertOut = new com.sun.jna.ptr.IntByReference();
+			int status = X11_LIB.XGetInputFocus(display, focusOut, revertOut);
+			long got = (status != 0 || focusOut[0] == null) ? -1 : Pointer.nativeValue(focusOut[0]);
+			if(got != xid) {
+				LOGGER.warn("X input focus not on window 0x{} (got 0x{}); key injection rejected",
+					Long.toHexString(xid), Long.toHexString(got));
+				return false;
+			}
+			return true;
+		} catch(Throwable t) {
+			LOGGER.warn("raiseAndFocusWindow(0x{}) failed; key injection rejected", Long.toHexString(xid), t);
 			return false;
 		}
 	}

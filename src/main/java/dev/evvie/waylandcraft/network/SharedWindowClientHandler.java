@@ -436,6 +436,16 @@ public class SharedWindowClientHandler {
 	}
 
 	/**
+	 * P1-8 纯函数（可单测）：把不可信的窗口内坐标钳进 [0, max]。
+	 * NaN/±Infinity → 0；max ≤ 0（尺寸未知的竞态）→ 0，绝不放行窗口外坐标。
+	 */
+	static double clampToWindow(double v, int max) {
+		if(Double.isNaN(v) || Double.isInfinite(v)) return 0;
+		if(max <= 0) return 0;
+		return Math.min(Math.max(v, 0), max);
+	}
+
+	/**
 	 * 窗口所有者侧：把远程玩家对共享窗口的操作注入到真实窗口。
 	 * 当前只支持 X11 窗口（XTest 注入）；wayland 窗口注入后续接入。
 	 *
@@ -460,8 +470,15 @@ public class SharedWindowClientHandler {
 
 		String display = state.x11Display;
 		long xid = state.x11Xid;
-		int rootX = state.x11RootX + (int) Math.round(payload.x());
-		int rootY = state.x11RootY + (int) Math.round(payload.y());
+		// P1-8（坐标钳位）：payload.x/y 是"窗口内像素坐标"，但来源是远端玩家，不可信。
+		// 越界/NaN/负值经 x11RootX+x 直接变成屏幕根坐标——恶意 payload 可以把全局 X
+		// 指针拽到窗口外（其他应用、终端、桌面）再点击。钳进共享窗口矩形内。
+		int winW = state.x11Width;
+		int winH = state.x11Height;
+		double cx = clampToWindow(payload.x(), winW);
+		double cy = clampToWindow(payload.y(), winH);
+		int rootX = state.x11RootX + (int) Math.round(cx);
+		int rootY = state.x11RootY + (int) Math.round(cy);
 
 		switch(payload.interactionType()) {
 			case MOUSE_MOVE -> {
@@ -475,10 +492,17 @@ public class SharedWindowClientHandler {
 				dev.evvie.waylandcraft.utils.X11Interaction.injectButton(display, payload.button(), false);
 			}
 			case KEY_PRESS -> {
-				dev.evvie.waylandcraft.utils.X11Interaction.injectKey(display, payload.key(), true);
+				// P1-8（按键越权）：XTest 键事件落在"当前输入焦点窗口"。注入前必须把
+				// 焦点移到被共享窗口（raise + XSetInputFocus + 回读验证），否则 INTERACT
+				// 等于 owner 桌面级键盘注入（焦点在终端时按键直进终端）。验证失败拒绝注入。
+				if(dev.evvie.waylandcraft.utils.X11Interaction.raiseAndFocusWindow(display, xid)) {
+					dev.evvie.waylandcraft.utils.X11Interaction.injectKey(display, payload.key(), true);
+				}
 			}
 			case KEY_RELEASE -> {
-				dev.evvie.waylandcraft.utils.X11Interaction.injectKey(display, payload.key(), false);
+				if(dev.evvie.waylandcraft.utils.X11Interaction.raiseAndFocusWindow(display, xid)) {
+					dev.evvie.waylandcraft.utils.X11Interaction.injectKey(display, payload.key(), false);
+				}
 			}
 			case SCROLL -> {
 				// 编码：低16位 = scrollX*100（符号位保留），高16位 = scrollY*100
