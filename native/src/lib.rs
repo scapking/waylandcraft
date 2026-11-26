@@ -52,6 +52,10 @@ mod diagnostic;
 mod ddm;
 mod desktop_windows;
 mod portal_capture;
+// Windows 窗口/桌面捕获后端。mod 行不做 cfg 门控：portable 核心（帧槽状态机/
+// 过滤谓词/wire 编码/stop 幂等机）平台无关且需在 Linux cargo test 下可测，
+// 平台实现整体 #[cfg(windows)] 于文件内部门控（无 windows 依赖泄漏到 Linux 构建）。
+mod capture_windows;
 mod audio_capture;
 mod egl;
 // v0.13.4：ime 和 host_bridge 改为 pub 以让集成测试能 import
@@ -150,8 +154,10 @@ impl WLCState {
         let seat = WLCSeatState::new();
         seat.create_globals(&disp);
 
-        let ime = ImeState::default();
+        let mut ime = ImeState::default();
         ime.create_globals(&disp);
+        // 内置拼音词库在 init 阶段解析（内嵌零拷贝，µs~ms 级）——不占游戏 tick。
+        ime.init_builtin_dict();
 
         let data = WLCDataState::new(&disp);
         data.create_global();
@@ -476,7 +482,11 @@ impl<'a> WaylandCraft<'a> {
         // Unconfigured——不会有孤儿进程。
         {
             let st = &mut self.state;
-            st.ime.nested_tick(std::time::Instant::now(), &st.socket);
+            let now = std::time::Instant::now();
+            st.ime.nested_tick(now, &st.socket);
+            // sync15：热路径仪表推进 + 每 10s 一行聚合 debug 日志
+            // （轮询驱动，无定时器；update_rounds 计数即 dispatch 轮次）。
+            st.ime.metrics_tick(now);
         }
 
         // v0.13.6：每帧检查 satellite 是否还活着——死了自动 restart。

@@ -34,6 +34,31 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 wayland-protocols = { version = "0.32", features = ["client"] }
 
+# Windows 平台窗口/桌面捕获后端（capture_windows.rs，Windows.Graphics.Capture）。
+# 只在 windows target 上生效——Linux/Android 构建零影响；windows 0.58 满足
+# IGraphicsCaptureItemInterop 所需的 Win32_System_WinRT_Graphics_Capture 面。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Foundation",
+    "Graphics",
+    "Graphics_Capture",
+    "Graphics_DirectX",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
 [dev-dependencies]
 wayland-client = "0.31"
 # 集成测试的“模拟 fcitx5”客户端需要 im2 的 client 绑定

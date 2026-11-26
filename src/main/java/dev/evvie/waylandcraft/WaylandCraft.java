@@ -228,6 +228,15 @@ public class WaylandCraft implements ClientModInitializer {
 				WaylandCraftCommon.LOGGER.warn("[ime][nested] setImeNested failed: {}", t.toString());
 			}
 		});
+		// 内置引擎来源档 imeSource（auto|fcitx5|builtin）：responder 注册即
+		// 触发启动期同步；Rust 侧校验非法值（不改状态、进 ime.log）。
+		settingsManager.registerResponder(WaylandCraftSettings.IME_SOURCE, (value) -> {
+			try {
+				bridge.setImeSource((String) value);
+			} catch (Throwable t) {
+				WaylandCraftCommon.LOGGER.warn("[ime][source] setImeSource failed: {}", t.toString());
+			}
+		});
 	}
 
 	/* Update bridge and clients. May be called at any state of the game, even outside of a level

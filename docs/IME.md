@@ -488,3 +488,36 @@ raw 直通可用（sync4/5 修复），**中文始终打不出**。这是宿主�
 4. 待用户实测：游戏内（Minecraft 聊天框）打中文、切引擎。
 5. ibus 路预计不 bind im2 → Starting 超时 → Failed 回退（如实上报，非 bug）。
 
+
+## 内置拼音引擎（ime_source，「装 mod 即用中文」零依赖路径）
+
+fcitx5 嵌套 daemon 路线要求宿主机装有 fcitx5/ibus-daemon。为把依赖降到
+「装上 mod 就能打中文」，`ime/builtin/` 提供**纯 Rust 内置拼音引擎**：
+
+- **词库**：`native/assets/ime_builtin_pinyin.bin`（4.14MB，11.4 万词条/
+  420 音节/7.2 万节点的音节 trie），`include_bytes!` 内嵌 cdylib。来源与
+  许可：jieba dict.txt（MIT，词频）+ pypinyin 0.55.0（MIT，单字/短语读音），
+  生成管线与复现步骤见 `tools/ime-dict/README.md`。格式唯一事实源
+  `ime/builtin/dict.rs`（编译工具 `native/tools/ime-dict/dictgen.rs`
+  `#[path]` include 同一份代码）。运行时零拷贝加载（release parse ~0.2ms，
+  在 WLCState::new init 线程完成，不占游戏 tick）。
+- **引擎**：字母流在 trie 上枚举全部切分路径（nihao=ni+hao、xian=xi+an
+  类歧义按词频裁决），完整覆盖候选优先、延长候选 top-k（128）有界堆 +
+  子树最大频率剪枝，每键 13~255µs。键语义与 fcitx5 pinyin 对齐（数字/
+  空格选词、左右移动高亮、PgUp/PgDn/-/= 翻页、退格编辑、回车原样提交、
+  Esc 取消、撇号断句、裸 Shift 切西文、Ctrl/Alt/Super 组合永不消费）。
+  局限：无句级联想/bigram；物理 US 布局假设（非 US 布局走 fcitx5 路线）。
+- **键路由 seam**（`ime/mod.rs::handle_key` 单点）：`ime_source:
+  Auto|Fcitx5|Builtin`（settings 键 `imeSource`，`/wl ime source <mode>`
+  即时切档持久化）。Auto 档**仅当** nested daemon 判死（NoBinary/Failed）
+  才回退内置——fcitx5 在场时行为与既有逐字节一致（回归红线）。内置批次
+  走 relay→emit_ti_batch 既有出口（宿主穿透同族的无条件应用）；无激活
+  ti3 会话不吃键；`/` 前导命令行语境直通。
+- **候选窗**：内置无 wl surface 像素帧，改为**结构化候选文本**交付：JNI
+  `imeBuiltinCandidates()`（仅变化时返回 JSON，空串=无新状态）+
+  `imeBuiltinSelect/Page`。Java 侧 `ImeBuiltinPanel` 原版字体渲染，GUI 形态
+  锚聚焦输入框（复用 positionOverlay/命中钳制），键盘捕获场景走 HUD 形态
+  （屏幕底部居中）；与 fcitx5 像素帧模式互斥（来源档天然决定哪路产数据）。
+- **可观测**：`/wl ime info` 首行 source/effective/词库规模/组合态；
+  `/wl ime eng` 引擎清单（内置=拼音如实）；`status.log` 新增 `ime_builtin`
+  子系统与 `ime_route=builtin` 取值；日志前缀 `[ime][builtin]`。
