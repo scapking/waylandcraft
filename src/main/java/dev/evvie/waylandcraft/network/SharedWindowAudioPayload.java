@@ -1,6 +1,7 @@
 package dev.evvie.waylandcraft.network;
 
 import dev.evvie.waylandcraft.WaylandCraftCommon;
+import net.minecraft.network.SkipPacketDecoderException;
 import net.minecraft.network.RegistryFriendlyByteBuf;
 import net.minecraft.network.codec.StreamCodec;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
@@ -29,6 +30,9 @@ public record SharedWindowAudioPayload(long windowHandle, int seq, int sampleRat
 	public static final Identifier ID = Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "shared_window_audio_v2");
 	
 	public static final CustomPacketPayload.Type<SharedWindowAudioPayload> TYPE = new CustomPacketPayload.Type<>(ID);
+
+	/** P2-2：解码分配上限（合法包 ~30KB，relay 还有 64KB 语义校验） */
+	static final int MAX_DECODE_BYTES = 1024 * 1024;
 	
 	public static final StreamCodec<RegistryFriendlyByteBuf, SharedWindowAudioPayload> CODEC = StreamCodec.of(
 		(buf, payload) -> {
@@ -46,6 +50,11 @@ public record SharedWindowAudioPayload(long windowHandle, int seq, int sampleRat
 			int sampleRate = buf.readVarInt();
 			int channels = buf.readVarInt();
 			int dataLength = buf.readVarInt();
+			// P2-2/P2-3：恶意 VarInt 长度先验证再分配（skip 该包，不崩 netty 线程）。
+			// 语义校验（≤64KB、sampleRate/channels）在 AudioFrameRelay.acceptAudio 入口。
+			if (dataLength < 0 || dataLength > MAX_DECODE_BYTES || dataLength > buf.readableBytes()) {
+				throw new SkipPacketDecoderException("shared_window_audio: invalid pcmData length " + dataLength);
+			}
 			byte[] pcmData = new byte[dataLength];
 			buf.readBytes(pcmData);
 			long captureTimestampMs = buf.readLong();
