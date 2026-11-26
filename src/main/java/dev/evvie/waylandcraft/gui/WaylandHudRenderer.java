@@ -33,9 +33,15 @@ public class WaylandHudRenderer {
 		this.wlc = wlc;
 	}
 	
+	private static final Identifier IME_BUILTIN = Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "ime-builtin-panel");
+
 	public void register() {
 		HudElementRegistry.attachElementAfter(VanillaHudElements.BOSS_BAR, APP_LIST, this::extractAppListRenderState);
 		HudElementRegistry.attachElementAfter(VanillaHudElements.BOSS_BAR, DND_ICON, this::extractDNDIconRenderState);
+		// 内置候选面板 HUD 形态：键盘捕获（screen==null）往应用窗口打字时，
+		// 原版字体文本面板显示在屏幕底部中央（ImeBuiltinPanel 内部再判形态）。
+		HudElementRegistry.attachElementAfter(VanillaHudElements.BOSS_BAR, IME_BUILTIN,
+				(ctx, tracker) -> dev.evvie.waylandcraft.ime.ImeBuiltinPanel.extractHud(ctx));
 	}
 	
 	private void extractAppListRenderState(GuiGraphicsExtractor context, DeltaTracker deltaTracker) {

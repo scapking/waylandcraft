@@ -40,6 +40,64 @@ class ImeCandidateLayoutTest {
 		assertArrayEquals(px, f.argb());
 	}
 
+	// ── 内置候选（结构化文本通道）纯函数 ──
+
+	@Test
+	void builtinDecodeGoldenMatchesNativeContract() {
+		// 与 Rust BuiltinEngine::snapshot_json 的合同样例（golden，双侧锁形）。
+		String json = "{\"visible\":true,\"preedit\":\"nihao\",\"cursor\":0,\"page\":0,\"pages\":2,"
+				+ "\"page_size\":9,\"candidates\":[\"你好\",\"你好吗\"],\"labels\":[\"1\",\"2\"]}";
+		var snap = ImeCandidateLayout.decodeBuiltin(json);
+		assertNotNull(snap);
+		assertTrue(snap.visible());
+		assertEquals("nihao", snap.preedit());
+		assertEquals(0, snap.cursor());
+		assertEquals(2, snap.pages());
+		assertEquals(9, snap.pageSize());
+		assertArrayEquals(new String[] {"你好", "你好吗"}, snap.candidates());
+		assertArrayEquals(new String[] {"1", "2"}, snap.labels());
+	}
+
+	@Test
+	void builtinDecodeRejectsGarbage() {
+		assertNull(ImeCandidateLayout.decodeBuiltin(null));
+		assertNull(ImeCandidateLayout.decodeBuiltin(""));
+		assertNull(ImeCandidateLayout.decodeBuiltin("{oops"));
+		assertNull(ImeCandidateLayout.decodeBuiltin("{\"visible\":true}")); // 缺字段
+		// labels/candidates 长度不符 = 合同破坏 → null
+		assertNull(ImeCandidateLayout.decodeBuiltin(
+				"{\"visible\":true,\"preedit\":\"a\",\"cursor\":0,\"page\":0,\"pages\":1,"
+						+ "\"page_size\":9,\"candidates\":[\"啊\"],\"labels\":[]}"));
+	}
+
+	@Test
+	void builtinCellsAndHitMap() {
+		// 三单元宽 [10, 14, 8]，x0=5, gap=4 → 左边界 [5,19,37]，右限=45+… 定右限 60。
+		int[] lefts = ImeCandidateLayout.builtinCellLefts(5, 4, new int[] {10, 14, 8});
+		assertArrayEquals(new int[] {5, 19, 37}, lefts);
+		assertEquals(0, ImeCandidateLayout.hitBuiltinCell(lefts, new int[] {10, 14, 8}, 60, 9.5));
+		assertEquals(1, ImeCandidateLayout.hitBuiltinCell(lefts, new int[] {10, 14, 8}, 60, 20));
+		assertEquals(2, ImeCandidateLayout.hitBuiltinCell(lefts, new int[] {10, 14, 8}, 60, 44));
+		// gap 区按"下一格起点前"归当前格（末格含右限）
+		assertEquals(-1, ImeCandidateLayout.hitBuiltinCell(lefts, new int[] {10, 14, 8}, 60, 70));
+		assertEquals(-1, ImeCandidateLayout.hitBuiltinCell(lefts, new int[] {10, 14, 8}, 60, 2));
+	}
+
+	@Test
+	void builtinShowingStateMachine() {
+		var vis = ImeCandidateLayout.decodeBuiltin(
+				"{\"visible\":true,\"preedit\":\"ni\",\"cursor\":0,\"page\":0,\"pages\":1,"
+						+ "\"page_size\":9,\"candidates\":[\"你\"],\"labels\":[\"1\"]}");
+		var hid = ImeCandidateLayout.decodeBuiltin(
+				"{\"visible\":false,\"preedit\":\"\",\"cursor\":0,\"page\":0,\"pages\":0,"
+						+ "\"page_size\":9,\"candidates\":[],\"labels\":[]}");
+		// 无快照 → 维持；有快照 → 跟 visible；语境不允许（无框/无场景）→ 强制隐藏
+		assertTrue(ImeCandidateLayout.decideShowingBuiltin(false, vis, true));
+		assertTrue(ImeCandidateLayout.decideShowingBuiltin(true, null, true));
+		assertFalse(ImeCandidateLayout.decideShowingBuiltin(true, hid, true));
+		assertFalse(ImeCandidateLayout.decideShowingBuiltin(true, vis, false));
+	}
+
 	@Test
 	void decodeInvisibleFrameHasNoPixels() {
 		Frame f = ImeCandidateLayout.decode(ImeCandidateLayout.encode(0, 0, 3, false, null));

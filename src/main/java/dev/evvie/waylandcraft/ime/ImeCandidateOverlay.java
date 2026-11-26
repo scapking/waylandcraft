@@ -146,6 +146,9 @@ public final class ImeCandidateOverlay {
 		}
 		applyTransition(f, box != null, mc);
 		logStateTransition(raw != null, box != null);
+		// 内置候选面板（结构化文本通道）顺路驱动：与像素帧轮询同节拍、
+		// 互不干扰；来源档决定哪路有数据，另一路恒 null/""（天然互斥）。
+		ImeBuiltinPanel.tick();
 	}
 
 	/** 状态转移 + 纹理更新（客户端 tick 线程）。 */
@@ -183,6 +186,12 @@ public final class ImeCandidateOverlay {
 	/** Screen render hook（ScreenRenderMixin → extractRenderStateWithTooltipAndSubtitles RETURN）。 */
 	public static void extract(GuiGraphicsExtractor ctx) {
 		extractHits++;
+		// 内置候选面板优先（与像素帧模式互斥：同时在场时文本面板是权威源）。
+		if(ImeBuiltinPanel.isShowing()) {
+			Minecraft mcB = Minecraft.getInstance();
+			ImeBuiltinPanel.extractGui(ctx, focusedEditBox(mcB), mcB);
+			return;
+		}
 		if(!extractHitLogged) {
 			// 注入证明（观测层）：本行出现 = ScreenRenderMixin 目标方法在运行时
 			// 真实命中。若 latest.log 没有它而五元组正常翻转 → 渲染钩子断了
@@ -276,6 +285,8 @@ public final class ImeCandidateOverlay {
 	 * 返回 true = 事件已消费（overlay 在场且点在区域内——游戏/聊天不得处理）。
 	 */
 	public static boolean handleClick(double mx, double my, int button, boolean pressed) {
+		// 内置面板命中优先（同坐标系：imeMouseX/Y 缩放 GUI 坐标）。
+		if(ImeBuiltinPanel.handleClick(mx, my, pressed)) return true;
 		Rect r = hitRect();
 		if(r == null || !r.contains(mx, my)) return false;
 		int[] local = popupLocalCoords(mx, my, r);
@@ -291,6 +302,8 @@ public final class ImeCandidateOverlay {
 
 	/** 候选窗区域滚轮 → native wl_pointer axis（fcitx5 翻页）。dy = GLFW 语义。 */
 	public static boolean handleScroll(double mx, double my, double dy) {
+		// 内置面板区域滚轮翻页优先。
+		if(ImeBuiltinPanel.handleScroll(mx, my, dy)) return true;
 		Rect r = hitRect();
 		if(r == null || !r.contains(mx, my)) return false;
 		int[] local = popupLocalCoords(mx, my, r);
