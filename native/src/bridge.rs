@@ -934,6 +934,32 @@ bind_java_type! {
             sig = (instance: jlong, app_id: JString) -> jboolean,
             fn = exec_app,
         },
+        // fix/app-launcher-lifecycle：单实例应用生命周期（收养登记/精确终止/会话标记）
+        static extern fn get_adopted_apps {
+            sig = () -> JString[],
+            name = "getAdoptedAppsNative",
+            fn = get_adopted_apps,
+        },
+        static extern fn kill_adopted {
+            sig = (pid: jint, force: jboolean) -> jboolean,
+            name = "killAdoptedNative",
+            fn = kill_adopted,
+        },
+        static extern fn terminate_adopted_all {
+            sig = (),
+            name = "terminateAdoptedAllNative",
+            fn = terminate_adopted_all,
+        },
+        static extern fn session_marker {
+            sig = (instance: jlong) -> JString,
+            name = "sessionMarkerNative",
+            fn = session_marker,
+        },
+        static extern fn note_error {
+            sig = (level: JString, msg: JString),
+            name = "noteErrorNative",
+            fn = note_error_jni,
+        },
         // upstream f23fdcb: 设置首选终端（Terminal=true 的 desktop entry 直启）
         static extern fn set_preferred_terminal {
             sig = (instance: jlong, cmd: JString),
@@ -3375,6 +3401,68 @@ fn exec_app<'local>(
     }
 
     Ok(instance.xdg.exec_app(app_id, env_vars))
+}
+
+// ═══ fix/app-launcher-lifecycle：应用收养接口（实现见 crate::process）═══
+//
+// 登记表是进程级全局（一个 JVM 只有一个合成器实例，与 RECENT_ERRORS 同型），
+// 因此 get/kill/terminate 均为 static native，不依赖 instance。
+
+fn get_adopted_apps<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+) -> Result<JObjectArray<'local, JString<'local>>, BridgeError> {
+    let apps = crate::process::list_adopted();
+    let array = JObjectArray::<JString>::new(env, apps.len(), &JString::null())?;
+    for (i, a) in apps.iter().enumerate() {
+        // "pid|pgid|cmd|appId"：cmd/appId 含 '|' 的现实概率≈0，
+        // Java 侧 split 限 4 段（尾段整体保留）双保险。
+        let jstr = env.new_string(format!("{}|{}|{}|{}", a.pid, a.pgid, a.cmd, a.app_id))?;
+        array.set_element(env, i, &jstr)?;
+    }
+    Ok(array)
+}
+
+fn kill_adopted(
+    _env: &mut Env<'_>,
+    _class: JClass<'_>,
+    pid: jint,
+    force: jboolean,
+) -> Result<jboolean, BridgeError> {
+    // force（jboolean）在 jni 0.22 即 Rust bool（set_verbose_logging_jni 同款用法）。
+    Ok(crate::process::kill_adopted(pid, force))
+}
+
+fn terminate_adopted_all(
+    _env: &mut Env<'_>,
+    _class: JClass<'_>,
+) -> Result<(), BridgeError> {
+    crate::process::terminate_all_adopted();
+    Ok(())
+}
+
+fn session_marker<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "sessionMarker")?;
+    let socket = instance.state.socket.to_string_lossy().into_owned();
+    Ok(env.new_string(crate::process::session_marker_for(&socket))?)
+}
+
+fn note_error_jni<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    level: JString<'local>,
+    msg: JString<'local>,
+) -> Result<(), BridgeError> {
+    let level = level.try_to_string(env)?;
+    let msg = msg.try_to_string(env)?;
+    // Java 侧诊断（如单实例交接失败）进与 status.log 同源的 error ring，
+    // /wl status 的 errors 行即可见——此前 error ring 只有 Rust 生产者。
+    crate::status::note_error(&level, &msg);
+    Ok(())
 }
 
 // upstream f23fdcb: Java 侧下发首选终端命令

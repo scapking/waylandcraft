@@ -1,8 +1,10 @@
 package dev.evvie.waylandcraft.command;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
@@ -120,11 +122,15 @@ public class WaylandCraftCommand {
 						.executes(WaylandCraftCommand::unpinWindow)
 					)
 				)
-				.then(ClientCommands.literal("close")
-					.then(ClientCommands.argument("handle", StringArgumentType.word())
-						.executes(WaylandCraftCommand::closeWindow)
+					.then(ClientCommands.literal("close")
+						.then(ClientCommands.argument("handle", StringArgumentType.word())
+							.executes(WaylandCraftCommand::closeWindow)
+							// 未收养窗口（宿主/capture 来路）需显式 force 才回退旧 pkill 模式杀
+							.then(ClientCommands.literal("force")
+								.executes(WaylandCraftCommand::closeWindowForce)
+							)
+						)
 					)
-				)
 				.then(ClientCommands.literal("resize")
 					.then(ClientCommands.argument("handle", StringArgumentType.word())
 						.then(ClientCommands.argument("width", IntegerArgumentType.integer(1, 10000))
@@ -541,7 +547,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §e/wl hide <handle|all>§7 — 从世界中隐藏窗口显示（all 一键全部）§r"));
 		source.sendFeedback(Component.literal(" §e/wl pin <handle>§7  — 钉住窗口（世界中保持显示，不受隐藏/最小化影响）§r"));
 		source.sendFeedback(Component.literal(" §e/wl unpin <handle>§7— 解除钉住§r"));
-		source.sendFeedback(Component.literal(" §e/wl close <handle>§7— 终止应用进程（关闭窗口）§r"));
+		source.sendFeedback(Component.literal(" §e/wl close <handle> [force]§7— 终止应用进程树（force=旧 pkill 兜底）§r"));
 		source.sendFeedback(Component.literal(" §e/wl resize <handle> <w> <h>§7 — 调整窗口分辨率§r"));
 		source.sendFeedback(Component.literal(" §e/wl settings list|set <key> <value>§7 — 查看/修改设置§r"));
 		source.sendFeedback(Component.literal(" §e/wl localitems [auto|items|display]§7 — 显示档：auto=无 mod 服本地直显（默认）；items=可信无 mod 服客户端自维护物品（§c反作弊服可能判定刷物品§c）；display=强制直显；世界内设置按服务器记忆§r"));
@@ -791,6 +797,27 @@ public class WaylandCraftCommand {
 
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
 		source.sendFeedback(Component.literal(" §7" + launchable + "/" + visible.size() + " 可启动 · Use §e/wl launch <name|alias>§7 to launch§r"));
+
+		// fix/app-launcher-lifecycle：本会话收养的进程一目了然（断开时自动终止；
+		// 孤儿实例吞交接是"launch 成功但 mapped=0"的根因，见 docs/APPS.md）
+		List<dev.evvie.waylandcraft.appsession.AppLifecycleLogic.Adopted> adoptedApps =
+				wlc.appLifecycle.adopted();
+		if(adoptedApps.isEmpty()) {
+			source.sendFeedback(Component.literal(" §7本会话收养应用进程: 0§r"));
+		} else {
+			StringBuilder sb = new StringBuilder(" §7本会话收养应用进程: §f" + adoptedApps.size() + " §7(");
+			for(int i = 0; i < adoptedApps.size(); i++) {
+				dev.evvie.waylandcraft.appsession.AppLifecycleLogic.Adopted a = adoptedApps.get(i);
+				if(i > 0) sb.append(", ");
+				// flatpak 的 argv0 只是运行器，来路标签优先用登记的 appId
+				String label = a.appId().isEmpty()
+						? dev.evvie.waylandcraft.appsession.AppLifecycleLogic.basename(a.cmd())
+						: a.appId();
+				sb.append(label).append("#").append(a.pid());
+			}
+			sb.append(")§r");
+			source.sendFeedback(Component.literal(sb.toString()));
+		}
 		return 1;
 	}
 
@@ -877,9 +904,36 @@ public class WaylandCraftCommand {
 		}
 
 		DesktopEntry entry = matches.get(0);
+		String displayName = entry.name != null ? entry.name : entry.appId;
+
+		// fix/app-launcher-lifecycle（缺陷根因面）：单实例应用（code/firefox/Discord/
+		// 微信类）的 CLI 把启动请求经 socket 锁交接给**同名已存进程**。若那是上一个
+		// 游戏会话遗留的孤儿（绑在已死合成器 socket 上），窗口永远出不来——launch 表面
+		// 成功、mapped 恒 0。启动前扫同名进程：确证绑定死会话 → 清理；宿主/活会话实例
+		// 绝不触碰（判定纯函数与红线见 AppLifecycleLogic.classify）。
+		dev.evvie.waylandcraft.appsession.AppLifecycle.CleanupResult cleanup =
+				wlc.appLifecycle.cleanupStaleBeforeLaunch(entry.exec, entry.appId);
+		if(cleanup.staleCleaned() > 0) {
+			source.sendFeedback(Component.literal("§e⟳ 已清理 " + cleanup.staleCleaned() + " 个"
+					+ "绑定已死 Wayland 会话的残留 " + displayName + " 实例（否则单实例交接会被它们吞掉）§r"));
+		}
+		if(cleanup.foreignAlive() > 0) {
+			source.sendFeedback(Component.literal(" §7提示：检测到宿主桌面/另一活跃会话的同名实例——"
+					+ "单实例应用可能把窗口交给它（出现在桌面而非本会话）§r"));
+		}
+
+		Set<Integer> adoptedBefore = new HashSet<Integer>();
+		for(dev.evvie.waylandcraft.appsession.AppLifecycleLogic.Adopted a : wlc.appLifecycle.adopted()) {
+			adoptedBefore.add(a.pid());
+		}
+		int toplevelsBefore = wlc.bridge.getToplevels().length;
+
 		boolean launched = launchApp(wlc, entry);
 		if(launched) {
-			source.sendFeedback(Component.literal("§a✔ Launched: §f" + (entry.name != null ? entry.name : entry.appId) + "§r"));
+			source.sendFeedback(Component.literal("§a✔ Launched: §f" + displayName + "§r"));
+			// ③ 交接失败诊断：10s 后无新 toplevel 且本次 spawn 的进程已退出 → 提示+ring
+			wlc.appLifecycle.armLaunchWatch(displayName, adoptedBefore, toplevelsBefore,
+					entry.exec, entry.appId);
 			// 反馈按实际显示模式分流：本地直显不发放物品，旧文案在 vanilla 服上是误导
 			WaylandCraft wl = WaylandCraft.instance;
 			if(wl != null && wl.effectiveDisplayMode() == WindowDisplayMode.LOCAL_DIRECT) {
@@ -1677,25 +1731,69 @@ public class WaylandCraftCommand {
 	}
 
 	private static int closeWindow(CommandContext<FabricClientCommandSource> context) {
+		return closeWindowImpl(context, false);
+	}
+
+	private static int closeWindowForce(CommandContext<FabricClientCommandSource> context) {
+		return closeWindowImpl(context, true);
+	}
+
+	/**
+	 * 终止窗口背后的应用进程。
+	 *
+	 * <p>旧实现是 {@code pkill -f <appID>} 模式杀：既会误伤宿主桌面的同名应用，
+	 * 又杀不干净（helper 进程存活导致下次 launch 交接给半死实例）——CLI 重构已知债。
+	 * 现在优先走收养登记：toplevel 凭据 PID（native 从客户端 socket 取得）映射到
+	 * 本会话 spawn 的进程树（精确 PID，或同 PGID 组归属），SIGTERM→限时→SIGKILL。
+	 * 未收养的窗口（宿主/capture 来路）默认拒绝模式杀，只有显式 force 才回退旧
+	 * pkill 兜底——误杀宿主应用的口子就此收紧。
+	 */
+	private static int closeWindowImpl(CommandContext<FabricClientCommandSource> context, boolean force) {
 		FabricClientCommandSource source = context.getSource();
 		String handleStr = StringArgumentType.getString(context, "handle");
 
 		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
 		if(toplevel == null) return 0;
 
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
 		String displayName = getWindowDisplayName(toplevel);
-		if(toplevel.appID != null && !toplevel.appID.isEmpty()) {
+
+		// ① 收养树精确终止（本会话 launch 的应用走这条；X11 via satellite 的窗口
+		//    凭据 PID 不是收养进程，AppLifecycle.adoptedForToplevel 内按 appId 兜底）
+		dev.evvie.waylandcraft.appsession.AppLifecycleLogic.Adopted adopted =
+				wlc.appLifecycle.adoptedForToplevel(toplevel.pid, toplevel.appID);
+		if(adopted != null && wlc.bridge != null && wlc.bridge.killAdopted(adopted.pid(), force)) {
+			source.sendFeedback(Component.literal("§a✔ Closed: §f" + displayName
+					+ " §7(收养进程树 pid=" + adopted.pid() + " pgid=" + adopted.pgid()
+					+ (force ? " · SIGKILL" : " · SIGTERM→限时→SIGKILL") + ")§r"));
+			return 1;
+		}
+
+		// ② 未收养 / PID 未知：force 显式兜底（旧 pkill -f 语义，保留但不默认）
+		if(force) {
+			if(toplevel.appID == null || toplevel.appID.isEmpty()) {
+				source.sendError(Component.literal("§c✘ No app ID available for force close§r"));
+				return 0;
+			}
 			try {
 				ProcessBuilder pb = new ProcessBuilder("pkill", "-f", toplevel.appID);
 				pb.start();
-				source.sendFeedback(Component.literal("§a✔ Closed: §f" + displayName + "§r"));
+				source.sendFeedback(Component.literal("§e⚠ Force closed §f" + displayName
+						+ " §7(pkill -f " + toplevel.appID + " — 模式杀，宿主同名进程可能被波及)§r"));
 				return 1;
 			} catch(Exception e) {
 				source.sendError(Component.literal("§c✘ Failed: " + e.getMessage() + "§r"));
 				return 0;
 			}
 		}
-		source.sendError(Component.literal("§c✘ No app ID available§r"));
+
+		source.sendError(Component.literal("§c✘ 该窗口未由本会话 spawn（宿主/capture 来路或 PID 不可得），"
+				+ "不做模式误杀；确认可接受误伤风险后用 §e/wl close " + handleStr + " force§r"));
 		return 0;
 	}
 
@@ -3035,6 +3133,8 @@ public class WaylandCraftCommand {
 		// ⑩ 显示链路诊断（缺陷 C 排错入口）：toplevel/mapped/display 三个计数一眼
 		// 定位断点——native 有窗口但 Java 列表空=事件同步断；mapped=0 但 display>0=
 		// attach 信号丢（已兜底）；mode 与 serverMod 不一致=探测/档位/覆盖在起作用。
+		// adopted：本会话 spawn 且存活的进程树数——launch 后 adopted>0 而 toplevel=0
+		// 即"交接给了会话外陈旧实例"的典型形态（fix/app-launcher-lifecycle）。
 		WindowDisplayMode statusMode = wlc.effectiveDisplayMode();
 		int statusToplevels = wlc.bridge != null ? wlc.bridge.getToplevels().length : 0;
 		int statusMapped = wlc.bridge != null ? wlc.bridge.getMappedToplevels().length : 0;
@@ -3042,7 +3142,8 @@ public class WaylandCraftCommand {
 			+ " §7| localItems: §f" + wlc.effectiveLocalItems()
 			+ " §7| toplevels: §f" + statusToplevels
 			+ " §7mapped: §f" + statusMapped
-			+ " §7displays: §f" + wlc.displays.size() + "§r"));
+			+ " §7displays: §f" + wlc.displays.size()
+			+ " §7| adopted: §f" + wlc.appLifecycle.adoptedCount() + "§r"));
 
 		// ⑦ viewer 侧 playout 缓冲概览（无观众窗口时跳过）
 		if(wlc.remoteWindowRenderer != null) {
