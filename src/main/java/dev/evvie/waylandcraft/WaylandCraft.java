@@ -135,6 +135,10 @@ public class WaylandCraft implements ClientModInitializer {
 	public WaylandHudRenderer hudRenderer = new WaylandHudRenderer(this);
 	
 	public PointerGrabMap pointerGrabs = new PointerGrabMap(this);
+
+	// fix/app-launcher-lifecycle：单实例应用生命周期（陈旧检测/交接诊断/收养终止）
+	public final dev.evvie.waylandcraft.appsession.AppLifecycle appLifecycle =
+			new dev.evvie.waylandcraft.appsession.AppLifecycle(this);
 	
 	// HitResult of currently hovered WindowDisplay
 	// Only non-null, when no exclusive pointer grabs are currently active
@@ -273,6 +277,9 @@ public class WaylandCraft implements ClientModInitializer {
 				}
 				bridge = WaylandCraftBridge.start();
 				waylandSocket = bridge.getSocket();
+				// 进程退出也要终止本会话收养的应用树（hook 只装一次；native 升级 kill
+				// 在 hook 线程内完成，防止 JVM 先死导致 SIGTERM 无后续）
+				dev.evvie.waylandcraft.appsession.AppLifecycle.installShutdownHookOnce();
 				// Rust 侧 [kb-debug] 日志写入独立文件（eprintln 只进 stderr，latest.log 看不到）。
 				// 用户上传 waylandcraft-kb.log 即可定位 Rust 键盘链路（收到/焦点/发出）。
 				try {
@@ -798,6 +805,7 @@ public class WaylandCraft implements ClientModInitializer {
 		if(minecraft.player == null) return;
 		updateServerModCapability();
 		tickGiveVerification();
+		appLifecycle.tick();
 		checkKeybinds(minecraft);
 	}
 	
@@ -1062,6 +1070,10 @@ public class WaylandCraft implements ClientModInitializer {
 		// 清掉仅对当前连接有效的运行期状态（隐藏集合/直显覆盖按服重建）
 		localHiddenHandles.clear();
 		localDisplayOverride = false;
+		// fix/app-launcher-lifecycle：断开即本会话结束——主动终止本会话 spawn 的
+		// 全部应用进程树（SIGTERM→限时→SIGKILL），从源头杜绝跨会话孤儿吞掉下次启动。
+		// 非阻塞：升级 kill 在 native 后台线程，不拖断线收尾。
+		appLifecycle.onSessionEnd();
 	}
 	
 	@Nullable

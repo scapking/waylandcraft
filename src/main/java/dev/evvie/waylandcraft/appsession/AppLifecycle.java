@@ -1,12 +1,8 @@
 package dev.evvie.waylandcraft.appsession;
 
 import java.io.IOException;
-import java.net.ConnectException;
-import java.net.UnixDomainSocketAddress;
-import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -196,48 +192,10 @@ public final class AppLifecycle {
 		}
 	}
 
-	/**
-	 * Unix socket 连通性探测（陈旧判定的关键 IO）。非阻塞 connect + 200ms 完成窗：
-	 * 活合成器秒回 CONNECTED；无监听 ConnectException → REFUSED；无文件 → MISSING；
-	 * 200ms 内不终结（backlog 异常等）→ UNKNOWN——**超时按"不可确证"处理，绝不误杀**。
-	 */
+	// socket 探测抽到 AppSocketProbe（无 Minecraft 依赖，可被真机单测直接验证三条
+	// 真实失败路径；JDK 非阻塞 unix connect 的异常形态以该类的实测为准）。
 	private static DisplayProbe probeSocket(String path) {
-		if (path == null) return DisplayProbe.UNKNOWN;
-		UnixDomainSocketAddress addr;
-		try {
-			addr = UnixDomainSocketAddress.of(path);
-		} catch (RuntimeException e) { // InvalidPathException 是 RuntimeException 子类
-			return DisplayProbe.UNKNOWN;
-		}
-		try (SocketChannel ch = SocketChannel.open()) {
-			ch.configureBlocking(false);
-			boolean connectedNow;
-			try {
-				connectedNow = ch.connect(addr);
-			} catch (ConnectException e) {
-				return DisplayProbe.REFUSED; // 文件残留在但无人监听：会话已死
-			}
-			if (connectedNow) return DisplayProbe.CONNECTED;
-			long deadline = System.currentTimeMillis() + 200;
-			while (System.currentTimeMillis() < deadline) {
-				try {
-					if (ch.finishConnect()) return DisplayProbe.CONNECTED;
-				} catch (ConnectException e) {
-					return DisplayProbe.REFUSED;
-				} catch (IOException e) {
-					return DisplayProbe.UNKNOWN;
-				}
-				try { Thread.sleep(20); } catch (InterruptedException e) {
-					Thread.currentThread().interrupt();
-					return DisplayProbe.UNKNOWN;
-				}
-			}
-			return DisplayProbe.UNKNOWN;
-		} catch (NoSuchFileException e) {
-			return DisplayProbe.MISSING;
-		} catch (IOException e) {
-			return DisplayProbe.UNKNOWN;
-		}
+		return AppSocketProbe.probe(path);
 	}
 
 	// ═══ ③ 交接失败诊断 ═══
