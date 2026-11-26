@@ -3415,9 +3415,9 @@ fn get_adopted_apps<'local>(
     let apps = crate::process::list_adopted();
     let array = JObjectArray::<JString>::new(env, apps.len(), &JString::null())?;
     for (i, a) in apps.iter().enumerate() {
-        // "pid|pgid|cmd"：cmd 可能含 '|'？argv0 含竖线的现实概率≈0，
-        // Java 侧 split 限 3 段（尾段整体保留）双保险。
-        let jstr = env.new_string(format!("{}|{}|{}", a.pid, a.pgid, a.cmd))?;
+        // "pid|pgid|cmd|appId"：cmd/appId 含 '|' 的现实概率≈0，
+        // Java 侧 split 限 4 段（尾段整体保留）双保险。
+        let jstr = env.new_string(format!("{}|{}|{}|{}", a.pid, a.pgid, a.cmd, a.app_id))?;
         array.set_element(env, i, &jstr)?;
     }
     Ok(array)

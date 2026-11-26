@@ -39,6 +39,9 @@ pub struct AdoptedApp {
     pub pgid: i32,
     /// 启动命令 argv0（展示与排错用）
     pub cmd: String,
+    /// desktop entry 的 appId（flatpak 应用 argv0 是运行器，只有这个能认来路；
+    /// /wl close 对 X11-via-satellite 窗口的归属兜底也靠它）
+    pub app_id: String,
 }
 
 static ADOPTED: LazyLock<Mutex<Vec<AdoptedApp>>> = LazyLock::new(|| Mutex::new(Vec::new()));
@@ -70,10 +73,10 @@ pub fn list_adopted() -> Vec<AdoptedApp> {
     reg.iter().cloned().collect()
 }
 
-fn record_adopted(pid: i32, pgid: i32, cmd: &str) {
+fn record_adopted(pid: i32, pgid: i32, cmd: &str, app_id: &str) {
     let Ok(mut reg) = ADOPTED.lock() else { return };
-    reg.push(AdoptedApp { pid, pgid, cmd: cmd.to_string() });
-    log(&format!("[adopt] tracked pid={} pgid={} cmd={}", pid, pgid, cmd));
+    reg.push(AdoptedApp { pid, pgid, cmd: cmd.to_string(), app_id: app_id.to_string() });
+    log(&format!("[adopt] tracked pid={} pgid={} cmd={} app_id={}", pid, pgid, cmd, app_id));
 }
 
 fn kill_pid(pid: i32, sig: i32) {
@@ -89,46 +92,53 @@ fn kill_group(pgid: i32, sig: i32) {
     }
 }
 
-/// 后台升级线程：force=直接 SIGKILL；否则 SIGTERM→宽限（默认 4s 轮询）→SIGKILL。
-/// 结束（或发起时即目标全灭）后移除登记，避免陈旧条目污染 list/status。
+/// SIGTERM→宽限（4s 轮询）→SIGKILL 的升级过程。**只在调用线程上跑**：
+/// force 路径必须同步完成——shutdown hook 里 JVM 一退后台线程陪葬，
+/// spawn 出去再 kill 等于没 kill。优雅路径由 terminate 入口自行派线程。
 fn escalate_kill(pid: i32, pgid: i32, force: bool) {
-    std::thread::spawn(move || {
-        if force {
+    if force {
+        kill_group(pgid, libc::SIGKILL);
+        kill_pid(pid, libc::SIGKILL);
+    } else {
+        kill_group(pgid, libc::SIGTERM);
+        kill_pid(pid, libc::SIGTERM);
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if !proc_alive(pid) && !group_alive(pgid) {
+                break;
+            }
+        }
+        if proc_alive(pid) || group_alive(pgid) {
+            log(&format!("[adopt] pid={} pgid={} ignored SIGTERM, escalating SIGKILL", pid, pgid));
             kill_group(pgid, libc::SIGKILL);
             kill_pid(pid, libc::SIGKILL);
-        } else {
-            kill_group(pgid, libc::SIGTERM);
-            kill_pid(pid, libc::SIGTERM);
-            for _ in 0..40 {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                if !proc_alive(pid) && !group_alive(pgid) {
-                    break;
-                }
-            }
-            if proc_alive(pid) || group_alive(pgid) {
-                log(&format!("[adopt] pid={} pgid={} ignored SIGTERM, escalating SIGKILL", pid, pgid));
-                kill_group(pgid, libc::SIGKILL);
-                kill_pid(pid, libc::SIGKILL);
-            }
         }
-        if let Ok(mut reg) = ADOPTED.lock() {
-            reg.retain(|a| a.pid != pid);
-        }
-    });
+    }
+    if let Ok(mut reg) = ADOPTED.lock() {
+        reg.retain(|a| a.pid != pid);
+    }
 }
 
 /// 按收养登记精确终止单个应用进程树。pid 不在登记表 → false（调用方决定兜底）。
+/// force=true 同步 SIGKILL（关机路径依赖此确定性）；false 同步走 TERM→宽限→KILL，
+/// 由调用方决定是否放后台线程（bridge killAdopted 为命令线程不陪跑 4s，派线程执行）。
 pub fn kill_adopted(pid: i32, force: bool) -> bool {
     let entry = list_adopted().into_iter().find(|a| a.pid == pid);
     let Some(entry) = entry else {
         return false;
     };
-    escalate_kill(entry.pid, entry.pgid, force);
+    if force {
+        escalate_kill(entry.pid, entry.pgid, true);
+    } else {
+        std::thread::spawn(move || escalate_kill(entry.pid, entry.pgid, false));
+    }
     true
 }
 
-/// 游戏断开/退出：终止**全部**本会话收养的进程树（SIGTERM→限时→SIGKILL）。
-/// 立即返回（升级在后台线程完成），不阻塞客户端 tick 线程。
+/// 游戏断开/退出：请求终止**全部**本会话收养的进程树（SIGTERM→限时→SIGKILL）。
+/// 立即返回（每棵树的升级在独立后台线程），不阻塞客户端 tick 线程。
+/// 注意：JVM 真正退出时这些线程陪葬——关机钩子路径由 Java 侧轮询登记表现场，
+/// 对超时未亡者调 kill_adopted(force=true) **同步** SIGKILL（见 AppLifecycle）。
 pub fn terminate_all_adopted() {
     let entries = list_adopted();
     if entries.is_empty() {
@@ -136,7 +146,7 @@ pub fn terminate_all_adopted() {
     }
     log(&format!("[adopt] session ending: terminating {} adopted app(s)", entries.len()));
     for e in entries {
-        escalate_kill(e.pid, e.pgid, false);
+        std::thread::spawn(move || escalate_kill(e.pid, e.pgid, false));
     }
 }
 
@@ -337,6 +347,7 @@ pub fn spawn(
     env: Vec<(OsString, OsString)>,
     wayland_display: String,
     _runtime_dir: String,
+    app_id: String,
 ) -> Result<(), ()> {
     log("========================================");
     log(&format!("[spawn] cmd={}", cmd));
@@ -503,7 +514,7 @@ pub fn spawn(
                     log("[spawn] second fork failed in child; launch reported as error");
                     return Err(());
                 }
-                g if g > 0 => record_adopted(g, middle, &cmd),
+                g if g > 0 => record_adopted(g, middle, &cmd, &app_id),
                 _ => {
                     // pipe 不可用/读失败：进程可能已正常 spawn，但本会话无法收养它。
                     log("[spawn] adopted pid unavailable - app running untracked this session");
@@ -621,11 +632,13 @@ mod tests {
             vec![],
             "wayland-77".to_string(),
             String::new(),
+            "org.test.Sleep".to_string(),
         )
         .expect("spawn failed");
 
         let apps = list_adopted();
         let me = apps.iter().find(|a| a.cmd == "/bin/sleep").expect("adopted entry missing");
+        assert_eq!(me.app_id, "org.test.Sleep", "app_id label must reach the registry");
         let pid = me.pid;
 
         // /proc/pid/environ 是**最近一次 exec 时刻**的快照：孙进程 fork 后、

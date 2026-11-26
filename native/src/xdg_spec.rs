@@ -171,7 +171,10 @@ impl XDGSpecHelper {
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
             .unwrap_or_else(|_| "/run/user/1000".to_string());
 
-        spawn(cmd, args, env, wayland_display, runtime_dir).ok()?;
+        // app_id 随条目一同登记（flatpak 应用 argv0 只有"flatpak"，来路识别靠 appId；
+        // /wl close 对 satellite 接入窗口的归属兜底同此）
+        let app_label = app_id.clone();
+        spawn(cmd, args, env, wayland_display, runtime_dir, app_label).ok()?;
 
         Some(())
     }
