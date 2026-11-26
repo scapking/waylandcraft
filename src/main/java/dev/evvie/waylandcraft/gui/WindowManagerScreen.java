@@ -2,6 +2,7 @@ package dev.evvie.waylandcraft.gui;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 
 import org.joml.Matrix3x2fStack;
 import org.lwjgl.glfw.GLFW;
@@ -12,7 +13,9 @@ import dev.evvie.waylandcraft.bridge.WLCPopup;
 import dev.evvie.waylandcraft.bridge.WLCSurface;
 import dev.evvie.waylandcraft.bridge.WLCToplevel;
 import dev.evvie.waylandcraft.bridge.WaylandCraftBridge;
-import dev.evvie.waylandcraft.bridge.WaylandCraftBridge.Size;
+import dev.evvie.waylandcraft.gui.WindowSelectionLogic.Candidate;
+import dev.evvie.waylandcraft.gui.WindowSelectionLogic.Decision;
+import dev.evvie.waylandcraft.gui.WindowSelectionLogic.Mode;
 import dev.evvie.waylandcraft.render.RenderUtils;
 import dev.evvie.waylandcraft.render.WindowFramebuffer;
 import net.minecraft.client.Minecraft;
@@ -51,6 +54,24 @@ public class WindowManagerScreen extends Screen {
 	
 	private WLCToplevel focused = null;
 	private WLCToplevel lastFocused = null;
+
+	// ===== 本地直显兜底（缺陷 1：B 屏空白）=====
+	// 选择/排序/回退逻辑本体是 WindowSelectionLogic 纯函数（有单测）；这里只做
+	// bridge 数据适配与绘制。空白根因：旧实现无条件取 getMostRecentFocus() 并直接
+	// 渲染其表面树——bridge 无 toplevel 时它是 null，而焦点序列表为空时会把**所有**
+	// toplevel 按创建顺序兜底种入（非 null），其中最后一个是未映射/零尺寸辅助窗口
+	// 时同样整屏画不出任何东西，且键盘焦点被抢给废窗口。两条路径都表现为"按 B 全空"。
+
+	/** 用户在本屏手动选中的窗口（0=无）；选中即 focusSurface，进入既有表面树视图。 */
+	private long manualSelectionHandle = 0;
+	/** TAB 唤出的强制列表页（绘制一帧后消费复位）。 */
+	private boolean forceListView = false;
+	/** 上一渲染帧的决策模式（供 keyPressed/mouseClicked 判定当前处于列表/指引页）。 */
+	private Mode lastMode = Mode.GUIDE;
+	/** 上一渲染帧的卡片矩形（GUI 像素），点击命中用。 */
+	private final ArrayList<SelectionCard> cards = new ArrayList<SelectionCard>();
+
+	private record SelectionCard(long handle, int x0, int y0, int x1, int y1) {}
 	
 	// All window elements currently displayed, sorted by depth from bottom-most (root) to top-most (last leaf)
 	public ArrayList<WindowElement> windows = new ArrayList<WindowElement>();
@@ -84,12 +105,27 @@ public class WindowManagerScreen extends Screen {
 		
 		WLCToplevel renderToplevel = null;
 		lastFocused = focused;
-		
-		// Update focus to toplevel that has highest focus priority
-		focused = wlc.bridge.getMostRecentFocus();
-		wlc.bridge.focusSurface(focused);
+
+		// 焦点选择：可用焦点 → 既有表面树视图；焦点为 null 或指向不可渲染的辅助
+		// 窗口（本地直显从未真正建立键盘焦点的两种空白路径）→ 卡片列表兜底；
+		// 无任何可渲染窗口 → 指引文案。判定本体见 WindowSelectionLogic.decide（纯函数）。
+		WLCToplevel focusToplevel = wlc.bridge.getMostRecentFocus();
+		List<Candidate> allCandidates = buildCandidates();
+		List<Candidate> usable = WindowSelectionLogic.usableCandidates(allCandidates);
+		Decision decision = WindowSelectionLogic.decide(forceListView, manualSelectionHandle,
+				focusToplevel != null ? focusToplevel.getHandle() : 0, usable);
+		lastMode = decision.mode();
+		forceListView = false; // TAB 请求消费一次
+
+		focused = null;
+		if(decision.mode() == Mode.TREE) {
+			focused = wlc.bridge.getToplevel(decision.handle());
+		}
+		wlc.bridge.focusSurface(focused); // LIST/GUIDE 下 focused=null：清焦点，按键不会漏进废窗口
 		renderToplevel = focused;
-		
+
+		cards.clear();
+
 		windows.clear();
 		
 		float guiScaleF = (float) Minecraft.getInstance().getWindow().getGuiScale();
@@ -123,8 +159,84 @@ public class WindowManagerScreen extends Screen {
 		}
 		
 		poseStack.popMatrix();
-		
+
+		if(decision.mode() == Mode.LIST) drawCardList(context, usable);
+		else if(decision.mode() == Mode.GUIDE) drawGuide(context, allCandidates.isEmpty());
+
 		super.extractRenderState(context, i, j, f);
+	}
+
+	/** bridge 枚举 → 候选描述；renderable=画得出内容（有非零尺寸 framebuffer）。 */
+	private List<Candidate> buildCandidates() {
+		List<Candidate> out = new ArrayList<Candidate>();
+		for(WLCToplevel t : wlc.bridge.getToplevels()) {
+			int w = t.geometry != null ? t.geometry.width() : 0;
+			int h = t.geometry != null ? t.geometry.height() : 0;
+			boolean renderable = t.isAlive() && t.framebuffer != null && t.geometry != null && w > 0 && h > 0;
+			out.add(new Candidate(t.getHandle(), WaylandCraft.getWindowName(t), w, h, renderable));
+		}
+		return out;
+	}
+
+	/** 可渲染窗口列表页：数字键或点击选中 → focusSurface 进入既有表面树视图。 */
+	private void drawCardList(GuiGraphicsExtractor context, List<Candidate> usable) {
+		List<Candidate> shown = WindowSelectionLogic.visibleCards(usable);
+
+		int rowH = font.lineHeight + 8;
+		int cardW = Math.min(280, width - 40);
+		int x0 = (width - cardW) / 2;
+		int y0 = height / 2 - (shown.size() * rowH) / 2 - 12;
+
+		context.text(font, "选择窗口（数字键 1-9 或点击；TAB 返回）", x0, y0 - 14, 0xFFFFAA00, false);
+
+		for(int idx = 0; idx < shown.size(); idx++) {
+			Candidate c = shown.get(idx);
+			int top = y0 + idx * rowH;
+
+			context.fill(x0, top, x0 + cardW, top + rowH - 2, 0xFF1A1A1A);
+			context.fill(x0, top, x0 + cardW, top + 1, BORDER_UNFOCUSED);
+			context.fill(x0, top + rowH - 3, x0 + cardW, top + rowH - 2, BORDER_UNFOCUSED);
+			context.fill(x0, top, x0 + 1, top + rowH - 2, BORDER_UNFOCUSED);
+			context.fill(x0 + cardW - 1, top, x0 + cardW, top + rowH - 2, BORDER_UNFOCUSED);
+
+			String title = font.plainSubstrByWidth(c.title(), cardW - 150);
+			String line = (idx + 1) + ". " + title + "   " + c.width() + "x" + c.height()
+					+ "   0x" + Long.toHexString(c.handle() & 0xFFFF);
+			context.text(font, line, x0 + 8, top + 4, 0xFFFFFFFF, false);
+
+			cards.add(new SelectionCard(c.handle(), x0, top, x0 + cardW, top + rowH - 2));
+		}
+
+		if(usable.size() > shown.size()) {
+			context.text(font, "…更多窗口请用 /wl list windows", x0, y0 + shown.size() * rowH + 2, 0xFF999999, false);
+		}
+	}
+
+	/** 空列表指引页：明确告诉用户下一步做什么，绝不再画空白屏。
+	 *  emptyBridge=true 桥接器完全无窗口（先 launch/capture）；
+	 *  否则窗口存在但还没有可渲染内容（提示等待首帧/place 兜底）。 */
+	private void drawGuide(GuiGraphicsExtractor context, boolean emptyBridge) {
+		String l1 = "WaylandCraft 本地直显：还没有窗口";
+		String l2 = "先运行 /wl launch <应用> 或 /wl capture 捕获桌面窗口";
+		String l3 = "之后按 B 回到这里选择窗口；/wl place <handle> 摆位到面前";
+		if(!emptyBridge) {
+			l1 = "窗口已存在，但还没有可显示的内容（等待应用首帧）";
+			l2 = "列表为空时可直接 /wl place <handle> 强制建显示";
+			l3 = "仍空白请查看 /wl status 的 toplevels/mapped/displays 计数";
+		}
+		int y = height / 2 - 24;
+		for(String line : new String[] {l1, l2, l3}) {
+			context.text(font, line, width / 2 - font.width(line) / 2, y, 0xFFCCCCCC, false);
+			y += 12;
+		}
+	}
+
+	/** 选中卡片：focusSurface 后既有决策链直接进表面树视图。 */
+	private void selectWindow(long handle) {
+		manualSelectionHandle = handle;
+		forceListView = false;
+		WLCToplevel t = wlc.bridge.getToplevel(handle);
+		if(t != null) wlc.bridge.focusSurface(t);
 	}
 	
 	@Override
@@ -193,7 +305,18 @@ public class WindowManagerScreen extends Screen {
 	@Override
 	public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
 		if(super.mouseClicked(event, doubleClick)) return true;
-		
+
+		// 列表页/指引页优先命中卡片（GUI 单位坐标，与 drawCardList 记录的一致）
+		if(lastMode == Mode.LIST) {
+			for(SelectionCard c : cards) {
+				if(event.x() >= c.x0() && event.x() < c.x1() && event.y() >= c.y0() && event.y() < c.y1()) {
+					selectWindow(c.handle());
+					return true;
+				}
+			}
+			// 列表页不吃世界表面点击（此时 windows 为空，逻辑上也命中不到）
+		}
+
 		double x = event.x() * guiScale;
 		double y = event.y() * guiScale;
 		
@@ -239,7 +362,22 @@ public class WindowManagerScreen extends Screen {
 			captureModeEnabled = !captureModeEnabled;
 			return true;
 		}
-		
+
+		// TAB：在树视图/列表页之间切换（树视图下单向唤出列表；列表页下收起回焦点视图）
+		if(event.key() == GLFW.GLFW_KEY_TAB) {
+			forceListView = lastMode != Mode.LIST;
+			return true;
+		}
+
+		// 列表页：数字键 1-9 选中卡片 → focusSurface 进入表面树视图
+		if(lastMode == Mode.LIST) {
+			int idx = WindowSelectionLogic.cardIndexForNumberKey(event.key(), cards.size());
+			if(idx >= 0) {
+				selectWindow(cards.get(idx).handle());
+				return true;
+			}
+		}
+
 		// Forward key press to current window
 		if(focused != null) {
 			int scancode = WaylandCraft.correctScancode(event.scancode());
