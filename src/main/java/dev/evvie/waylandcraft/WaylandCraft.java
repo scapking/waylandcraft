@@ -275,6 +275,11 @@ public class WaylandCraft implements ClientModInitializer {
 			} catch (Throwable t) {
 				// Native library unavailable (e.g. Android launcher with a bionic
 				// runtime): disable the mod instead of crashing the game.
+				// P2-11：start() 成功但后续步骤（getSocket/setXxxLogFile/XDG 初始化）
+				// 抛异常时必须把 bridge 置回 null——否则进入"bridge 非 null 但
+				// nativeDisabled=true"的半死状态：update() 每 tick 继续对可能只初始化
+				// 了一半的 native 实例调 bridge.update()，其他 null 检查路径全部失真。
+				bridge = null;
 				nativeDisabled = true;
 				WaylandCraftCommon.LOGGER.error("WaylandCraft native is unavailable, disabling mod: {}", t.toString());
 				return;
@@ -387,6 +392,20 @@ public class WaylandCraft implements ClientModInitializer {
 		dev.evvie.waylandcraft.ime.ImeCandidateWorld.render(ctx);
 	}
 	
+	// P2-12：本 tick 的 toplevel 列表快照（updateWorld 帧首失效，帧内复用）
+	private WLCToplevel[] tickToplevels = null;
+	private WLCToplevel[] tickMappedToplevels = null;
+
+	private WLCToplevel[] toplevelsThisTick() {
+		if(tickToplevels == null) tickToplevels = bridge.getToplevels();
+		return tickToplevels;
+	}
+
+	private WLCToplevel[] mappedToplevelsThisTick() {
+		if(tickMappedToplevels == null) tickMappedToplevels = bridge.getMappedToplevels();
+		return tickMappedToplevels;
+	}
+
 	public void updateWorld(LevelExtractionContext ctx) {
 		Camera camera = ctx.camera();
 		// 共享窗口 hover/交互检测：不依赖 bridge —— 手机端 viewer-only（bridge==null）
@@ -394,6 +413,11 @@ public class WaylandCraft implements ClientModInitializer {
 		processPointerMotion(camera);
 		
 		if(bridge == null) return; // native disabled (e.g. Android launcher): stay inert, never crash
+		// P2-12：tick 级快照失效点。updateWorld → updateDisplayRequests → giveItemsIfMissing
+		// 一帧内多处 getToplevels()/getMappedToplevels()——后者对**每个** toplevel 调一次
+		// isMapped()（JNI 跨界×N×多次/tick）。帧首失效、本帧首次使用时建立，之后复用。
+		tickToplevels = null;
+		tickMappedToplevels = null;
 		for(WLCPopup popup : bridge.getMappedPopups()) {
 			WLCAbstractWindow root = popup;
 			while((root = ((WLCPopup) root).getParent()) instanceof WLCPopup);
@@ -417,7 +441,7 @@ public class WaylandCraft implements ClientModInitializer {
 		
 		// 维护窗口实例别名（清理已消失窗口，为新窗口分配随机别名）
 		HashSet<Long> aliveHandles = new HashSet<>();
-		for(WLCToplevel t : bridge.getToplevels()) {
+		for(WLCToplevel t : toplevelsThisTick()) {
 			aliveHandles.add(t.getHandle());
 			windowAliases.getOrCreate(t.getHandle());
 		}
@@ -442,10 +466,10 @@ public class WaylandCraft implements ClientModInitializer {
 		// 不再依赖"手持物品"路径，为新 toplevel 直接建 display 并以初始姿态摆放，
 		// 窗口照样可见/可点/可拖（拖拽走 PointerGrabMap 世界射线，本就纯客户端）。
 		if(serverHasMod) {
-			itemManager.giveItemsIfMissing(bridge.getMappedToplevels());
+			itemManager.giveItemsIfMissing(mappedToplevelsThisTick());
 		}
 		else {
-			for(WLCToplevel t : bridge.getMappedToplevels()) {
+			for(WLCToplevel t : mappedToplevelsThisTick()) {
 				if(hasDisplayFor(t)) continue;
 				WindowDisplay d = getOrCreateDisplay(t);
 				d.anchorDistance = 2.0;
@@ -815,10 +839,10 @@ public class WaylandCraft implements ClientModInitializer {
 		// Hide all windows that were minimized and unset minimize requested state
 		// 钉住的窗口（pinnedToplevel）不受 minimize 影响，保持在世界中显示
 		displays.removeIf((w) -> w.window instanceof WLCToplevel && ((WLCToplevel) w.window) != pinnedToplevel && ((WLCToplevel) w.window).requests.minimize);
-		Stream.of(bridge.getToplevels()).forEach((t) -> t.requests.minimize = false);
-		
+		Stream.of(toplevelsThisTick()).forEach((t) -> t.requests.minimize = false);
+
 		// Handle any maximize or unmaximize requests
-		for(WLCToplevel toplevel : bridge.getMappedToplevels()) {
+		for(WLCToplevel toplevel : mappedToplevelsThisTick()) {
 			if(toplevel.requests.maximize && toplevel.requests.unmaximize) {
 				// Both requests shouldn't happen at the same time
 				toplevel.restoreGeometry = null;
@@ -842,7 +866,7 @@ public class WaylandCraft implements ClientModInitializer {
 		}
 		
 		// Handle any fullscreen or unfullscreen requests
-		for(WLCToplevel toplevel : bridge.getToplevels()) {
+		for(WLCToplevel toplevel : toplevelsThisTick()) {
 			if(toplevel.requests.fullscreen && toplevel.requests.unfullscreen) {
 				// Both requests shouldn't happen at the same time
 				toplevel.restoreGeometry = null;
@@ -1520,8 +1544,8 @@ public class WaylandCraft implements ClientModInitializer {
 		// 后按键被 Rust 丢弃——这是"键盘输入不能穿透窗口"的最后一道保险）。
 		ensureKeyboardFocus("onKeyPress");
 
-		// [kb-debug] 本地转发：每次转发都打（确认 Java 侧真正调了 bridge）
-		WaylandCraftCommon.LOGGER.info("[kb-debug] 本地转发 key={} scancode={} action={} ({} -> bridge)",
+		// [kb-debug] 本地转发：P2-13 每键刷屏 → debug（诊断时 -Dwaylandcraft.debug 或 log4j 配置开）
+		WaylandCraftCommon.LOGGER.debug("[kb-debug] 本地转发 key={} scancode={} action={} ({} -> bridge)",
 			key, scancode, action,
 			action == GLFW.GLFW_PRESS ? "pressKey" : action == GLFW.GLFW_RELEASE ? "releaseKey" : "repeatKey");
 
