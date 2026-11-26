@@ -44,12 +44,17 @@ public class InteractionForwarder {
 			return;
 		}
 
-		// 检查交互权限
-		if(!entry.hasPermission(senderUUID, WindowPermission.INTERACT)) {
+		// ACL-3：交互权限走合成判定（黑名单/过期记录即刻失效；owner 恒可交互自己的窗口）。
+		// 原 entry.hasPermission 快查在"记录未及 sweep"的窗口里会让过期授权多活最多 1s。
+		if(!manager.effectivePermission(entry, senderUUID, System.currentTimeMillis()).hasPermission(WindowPermission.INTERACT)) {
 			if (ServerWarnThrottle.allow("interact-denied:" + senderUUID, DENY_WARN_INTERVAL_MS)) {
 				LOGGER.warn("Player {} denied interaction with window 0x{}",
 					senderUUID, Long.toHexString(payload.windowHandle()));
+				// 审计行与 WARN 同节流（否则恶意刷包把 P1-6 日志洪泛修复打回原形）；
+				// 计数不受节流影响，保持可观测。
+				dev.evvie.waylandcraft.shared.ShareAclAudit.logDeny("interact", payload.windowHandle(), senderUUID);
 			}
+			dev.evvie.waylandcraft.shared.ShareAclAudit.deniedInteract.incrementAndGet();
 			return;
 		}
 

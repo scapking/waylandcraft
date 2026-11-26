@@ -239,7 +239,8 @@ public class AudioFrameRelay {
 		for (ServerPlayer player : capable) {
 			UUID uuid = player.getUUID();
 			if (uuid.equals(senderUUID)) continue;
-			if (!entry.hasPermission(uuid, WindowPermission.VIEW)) continue;
+			// ACL-3：同帧中继——VIEW 门走合成判定（黑白名单/过期即刻生效）
+			if (!manager.effectivePermission(entry, uuid, now).hasPermission(WindowPermission.VIEW)) continue;
 
 			// P1-2 背压：不可写跳包（音频丢包可听感无损，保实时不保完整）
 			if (!RelaySinks.isChannelWritable(player)) {

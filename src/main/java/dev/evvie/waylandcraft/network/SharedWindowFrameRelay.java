@@ -261,7 +261,9 @@ public class SharedWindowFrameRelay {
 		for (ServerPlayer player : capable) {
 			UUID uuid = player.getUUID();
 			if (uuid.equals(senderUUID)) continue;
-			if (!entry.hasPermission(uuid, WindowPermission.VIEW)) continue;
+			// ACL-3：VIEW 门走合成判定（owner 恒可、黑名单/过期即刻失效）。
+			// 转发线程读 PermissionManager 的并发表（ConcurrentHashMap/volatile），无锁安全。
+			if (!manager.effectivePermission(entry, uuid, now).hasPermission(WindowPermission.VIEW)) continue;
 
 			// P1-2 背压：channel 不可写（发送队列超水位）跳帧，不让视频流拖垮连接/堆
 			if (!RelaySinks.isChannelWritable(player)) {

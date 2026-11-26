@@ -10,12 +10,17 @@ import org.slf4j.LoggerFactory;
 import net.minecraft.server.level.ServerPlayer;
 
 public class PermissionManager {
-	
+
 	private static final Logger LOGGER = LoggerFactory.getLogger("waylandcraft-permissions");
-	
-	// 默认权限设置
-	private WindowPermission defaultPermission = WindowPermission.VIEW;
-	
+
+	// 默认权限设置（ACL-2：现在有真实消费者——新观众 DEFAULT 派生授权的级别，
+	// 见 SharedWindowManager.applyDefaultPolicy；不再是"无消费者权威表"）
+	private volatile WindowPermission defaultPermission = WindowPermission.VIEW;
+
+	// ACL-2：新观众默认策略。默认 ALLOW = 保持历史行为（公开共享自动放行 VIEW），
+	// 部署方可用 /wl share default ask|deny 主动收紧（兼容性见 docs）。
+	private volatile ShareAcl.NewViewerPolicy newViewerPolicy = ShareAcl.NewViewerPolicy.ALLOW;
+
 	// 玩家全局权限覆盖: playerUUID -> WindowPermission
 	private final Map<UUID, WindowPermission> globalOverrides = new ConcurrentHashMap<>();
 	
@@ -42,6 +47,26 @@ public class PermissionManager {
 	 */
 	public WindowPermission getDefaultPermission() {
 		return defaultPermission;
+	}
+
+	/**
+	 * ACL-2：设置新观众默认策略（ask/allow/deny）。
+	 * 策略本身不回改既有授权记录——切到 ALLOW 时由调用方
+	 * （SharedWindowServerHandler）触发一次 applyDefaultPolicyAll 回放补授，
+	 * 切到 ASK/DENY 只影响之后的 join/register。
+	 */
+	public void setNewViewerPolicy(ShareAcl.NewViewerPolicy policy) {
+		this.newViewerPolicy = policy;
+		LOGGER.info("New viewer policy set to: {}", policy);
+	}
+
+	public ShareAcl.NewViewerPolicy getNewViewerPolicy() {
+		return newViewerPolicy;
+	}
+
+	/** 白名单级别查询（合成判定用；未命中返回 null） */
+	public @org.jetbrains.annotations.Nullable WindowPermission whitelistLevelOf(java.util.UUID playerUUID) {
+		return whitelist.get(playerUUID);
 	}
 	
 	/**

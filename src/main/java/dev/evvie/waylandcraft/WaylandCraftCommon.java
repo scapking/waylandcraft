@@ -25,9 +25,10 @@ public class WaylandCraftCommon implements ModInitializer {
 	public @Nullable WindowItemInteractionProvider windowItemInteractionProvider = null;
 	public ServerItemManager serverItemManager = new ServerItemManager();
 	
-	// 多人显示功能
-	public SharedWindowManager sharedWindowManager = new SharedWindowManager();
+	// 多人显示功能（ACL-3：permissionManager 先建并绑定给 sharedWindowManager，
+	// 权威合成判定才能消费黑白名单/default 表）
 	public PermissionManager permissionManager = new PermissionManager();
+	public SharedWindowManager sharedWindowManager = new SharedWindowManager(permissionManager);
 	public @Nullable MinecraftServer server = null;
 	
 	@Override
