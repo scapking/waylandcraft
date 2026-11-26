@@ -34,6 +34,31 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 wayland-protocols = { version = "0.32", features = ["client"] }
 
+# macOS ScreenCaptureKit 捕获后端（capture_macos.rs）。绑定 crate 均为
+# objc2 生态生成绑定，无宿主工具依赖（见 docs/CAPTURE_MACOS.md 维护点）。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", features = ["std", "NSArray", "NSError", "NSString"] }
+objc2-core-foundation = { version = "0.3.2", features = [
+    "std",
+    "CFArray",
+    "CFData",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+    "CFCGTypes",
+] }
+objc2-core-graphics = { version = "0.3.2", features = [
+    "std",
+    "CGWindow",
+    "CGImage",
+    "CGDataProvider",
+    "CGDirectDisplay",
+    "CGError",
+] }
+block2 = "0.6.2"
+objc2-screen-capture-kit = { version = "0.3.2", default-features = true }
+
 [dev-dependencies]
 wayland-client = "0.31"
 # 集成测试的“模拟 fcitx5”客户端需要 im2 的 client 绑定

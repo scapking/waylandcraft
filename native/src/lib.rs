@@ -51,8 +51,21 @@ mod bridge;
 mod diagnostic;
 mod ddm;
 mod desktop_windows;
+// Portal/PipeWire 捕获只在 Linux/Android 编译：darwin 上 libc::eventfd 与
+// pipewire 不存在，整模块按 target_os 在真实实现与 stub 间二选一
+// （bridge.rs/status.rs 调用点因此零改动）。macOS 的捕获在 capture_macos。
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod portal_capture;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[path = "portal_capture_stub.rs"]
+mod portal_capture;
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod audio_capture;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[path = "audio_capture_stub.rs"]
+mod audio_capture;
+// macOS ScreenCaptureKit 捕获后端（纯逻辑区 cfg 无关可单测，FFI 区 macos-only）。
+mod capture_macos;
 mod egl;
 // v0.13.4：ime 和 host_bridge 改为 pub 以让集成测试能 import
 // （测试是 waylandcraft/native/tests/ime_integration.rs）。
