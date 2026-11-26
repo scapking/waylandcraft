@@ -420,10 +420,14 @@ public class SharedWindowClientHandler {
 	}
 
 	/**
-	 * 发送交互事件
+	 * 发送交互事件。
+	 * P1-2：必须在 play 连接存在时发送——断线清理/重连间隙调用时
+	 * ClientPlayNetworking.send 会抛 IllegalStateException（未注册通道的包在
+	 * Fabric 0.11x 后对 null connection 直接抛错），这里以 no-op 方式安全丢弃。
 	 */
 	public static void sendInteraction(long windowHandle, SharedWindowInteractionPayload.InteractionType type,
 			double x, double y, int button, int key) {
+		if(Minecraft.getInstance().getConnection() == null) return;
 		UUID senderUUID = Minecraft.getInstance().player != null ? Minecraft.getInstance().player.getUUID() : null;
 		SharedWindowInteractionPayload payload = new SharedWindowInteractionPayload(
 			windowHandle, type, x, y, button, key, senderUUID

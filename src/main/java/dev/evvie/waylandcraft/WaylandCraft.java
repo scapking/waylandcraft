@@ -770,6 +770,16 @@ public class WaylandCraft implements ClientModInitializer {
 	
 	private void onClientDisconnect(ClientPacketListener listener, Minecraft minecraft) {
 		displays.clear();
+		// P1-2：断线必须彻底退出键盘/指针捕获。旧实现只清 displays——
+		// keyboardCaptureMode/sharedKeyboardCapture/sharedPointerCapture/hovered* 全部残留，
+		// 回到标题界面后按键仍被捕获分支吞掉（角色失控、WASD 失灵），且交互事件
+		// 持续发往已关闭连接。disableKeyboardCapture() 统一完成：
+		// releaseAllForwardedKeys（补发 release，防远端卡键）→ 清空 mode/shared* 绑定字段
+		// → deactivateKeyboard + disablePointerCapture。sendInteraction 在无连接时
+		// 为安全 no-op（见 SharedWindowClientHandler.sendInteraction 的连接守卫）。
+		disableKeyboardCapture();
+		hoveredDisplay = null;
+		hoveredSharedDisplay = null;
 		itemManager.reset();
 	}
 	
@@ -1400,10 +1410,22 @@ public class WaylandCraft implements ClientModInitializer {
 	 * is also the correct matching Wayland scancode for the default XKBConfig.
 	 * For X11 and Wayland hosts, this is a huge hack but should mostly work for now
 	 */
+	/**
+	 * P1-1 纯函数（可单测）：J 键事件是否被绑定逻辑**本地消费**（true = 不转发给窗口）。
+	 * 语义矩阵（与 onKeyPress 的 J 分支一致）：
+	 *  - NONE：press 触发绑定（消费），release/repeat 对应的 press 从未转发 → 全部本地消费；
+	 *  - HARD_CAPTURE：J 是控制键（绑定已建立），press 提示、repeat/release 静默 → 全部本地消费；
+	 *  - CAPTURE（G 模式）：J 是窗口普通键——press 会被转发，因此 release **必须**同样转发，
+	 *    否则远端窗口维持"J 一直按住"（卡键）。返回 false 交给统一转发路径。
+	 */
+	static boolean consumeJKeyLocally(KeyboardCaptureMode mode, int action) {
+		return mode != KeyboardCaptureMode.CAPTURE;
+	}
+
 	// Ctrl + 方向键：调整面前的窗口（优先 hover 的窗口，否则视线中心最近的窗口）
 	public boolean onKeyPress(long windowHandle, int key, int scancode, int action, int modifiers) {
-		// [kb-debug] onKeyPress 入口：确认按键到达这里 + 当前捕获模式
-		WaylandCraftCommon.LOGGER.info("[kb-debug] onKeyPress 入口 key={} scancode={} action={} mode={} bridge={} sharedCap={} hoveredLocal={} hoveredShared={}",
+		// [kb-debug] onKeyPress 入口：P2-13 每键刷屏 → debug（发布模式默认 INFO 不再逐键打）
+		WaylandCraftCommon.LOGGER.debug("[kb-debug] onKeyPress 入口 key={} scancode={} action={} mode={} bridge={} sharedCap={} hoveredLocal={} hoveredShared={}",
 			key, scancode, action, keyboardCaptureMode,
 			bridge != null ? "yes" : "no",
 			sharedKeyboardCapture != null ? "yes" : "no",
@@ -1412,28 +1434,32 @@ public class WaylandCraft implements ClientModInitializer {
 
 		// J 键：进入"游戏模式"（绑定键盘+鼠标，鼠标事件全部进窗口、隐藏鼠标）。
 		// 用户需求：J 默认进入绑定，**按 ESC 之前不退出**——已在绑定中时再按 J 不解除。
-		// 修复：G 纯键盘绑定（CAPTURE）下按 J **作为普通键转发给窗口**（G 模式按键全部
+		// G 纯键盘绑定（CAPTURE）下按 J **作为普通键转发给窗口**（G 模式按键全部
 		// 归窗口，J 也不例外），绝不触发/升级绑定；仅 HARD_CAPTURE 下按 J 提示一次。
+		// P1-1 修复：旧实现 `action == 0 return true` 在**所有**模式吞掉 J 的 RELEASE——
+		// CAPTURE 模式下 press 已转发进窗口而 release 被吞，远端窗口永远维持 J 按住（卡键）。
+		// 现在"本地消费"（含吞 release）只适用于 press 确实被绑定逻辑消费的
+		// NONE（press→绑定）与 HARD_CAPTURE（J 为控制键）；CAPTURE 下 press/release/repeat
+		// 全部落入下方统一转发路径，保持配对。
 		if(key == GLFW.GLFW_KEY_J) {
-			if(action == 0) return true;
-
-			if(keyboardCaptureMode == KeyboardCaptureMode.NONE) {
-				if(bridge == null && hoveredSharedDisplay == null) {
-					Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 没有可捕获的窗口（对准一个窗口再按 J）"), false);
-					return true;
-				}
-				enableKeyboardCapture(true);
-				return true;
-			}
-
-			// 已绑定：仅 HARD_CAPTURE（J 模式）提示"按 ESC 退出"（仅 PRESS 一次，REPEAT 静默）；
-			// CAPTURE（G 模式）不拦截、不提示，J 键落入下方转发路径 → 作为普通键进窗口。
-			if(keyboardCaptureMode == KeyboardCaptureMode.HARD_CAPTURE) {
+			if(consumeJKeyLocally(keyboardCaptureMode, action)) {
+				// PRESS 才触发绑定/提示（REPEAT 与 RELEASE 静默消费，与原语义一致）
 				if(action == GLFW.GLFW_PRESS) {
-					Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 已在绑定模式，按 ESC 退出"), false);
+					if(keyboardCaptureMode == KeyboardCaptureMode.NONE) {
+						if(bridge == null && hoveredSharedDisplay == null) {
+							Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 没有可捕获的窗口（对准一个窗口再按 J）"), false);
+							return true;
+						}
+						enableKeyboardCapture(true);
+						return true;
+					}
+					if(keyboardCaptureMode == KeyboardCaptureMode.HARD_CAPTURE) {
+						Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("WaylandCraft: 已在绑定模式，按 ESC 退出"), false);
+					}
 				}
 				return true;
 			}
+			// CAPTURE（G 模式）：不拦截，继续向下走统一转发路径
 		}
 
 		// ESC：任何捕获模式下都退出绑定（键盘+鼠标全部解绑），
