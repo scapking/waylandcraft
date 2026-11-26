@@ -227,4 +227,19 @@ class ImeCandidateLayoutTest {
 		assertFalse(r.contains(110, 20));
 		assertFalse(r.contains(9.9, 20));
 	}
+
+	@Test
+	void transferArgbMatchesLegacyPerPixelMemPutIntBytes() {
+		// sync15 修复 D 等价性锁定：批量转码输出字节 == 旧逐像素
+		// memPutInt(ptr + 4i, (A<<24)|(B<<16)|(G<<8)|R) 的小端落盘字节。
+		byte[] wire = { 0x33, 0x22, 0x11, (byte) 0xFF, (byte) 0xCC, (byte) 0xAA, (byte) 0xBB, (byte) 0x80 };
+		java.nio.ByteBuffer dst = java.nio.ByteBuffer.allocate(wire.length);
+		ImeCandidateLayout.transferArgb(wire, 2, dst);
+		byte[] expect = { 0x11, 0x22, 0x33, (byte) 0xFF, (byte) 0xBB, (byte) 0xAA, (byte) 0xCC, (byte) 0x80 };
+		assertArrayEquals(expect, dst.array());
+		// 半程 2：大端 order 输入被函数强制翻回小端（平台无关合同）。
+		java.nio.ByteBuffer be = java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.BIG_ENDIAN);
+		ImeCandidateLayout.transferArgb(wire, 2, be);
+		assertArrayEquals(expect, be.array());
+	}
 }

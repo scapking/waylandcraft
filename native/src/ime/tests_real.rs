@@ -973,3 +973,230 @@ fn real_fcitx5_seed_v2_all_engines_switchable() {
     assert_eq!(pg[0].items.len(), groups[0].items.len(), "重写后条目数必须不变");
     eprintln!("=== [v2] base dir kept for forensics: {}", base.display());
 }
+
+// ═══════════════ sync15 性能 bench（先测量后修的标尺）═══════════════
+
+/// Java tick 的单帧仿真：`WaylandCraft.update()` + `focusSurface` +
+/// `ImeCandidateOverlay.tick` 三件套按生产节奏走一遍——
+/// 1. pump（dispatch+flush，等价 update 的 event_loop.dispatch）；
+/// 2. 每帧 focusSurface(toplevel)：生产 Java 每 tick 调 bridge.focusSurface
+///    → keyboard_focus → ime.set_focus → popup_touch（sync14 病灶的
+///    沉默每帧 epoch++ 源头，本 bench 必须复刻它，测量才有意义）；
+/// 3. take_popup_snapshot + encode_popup_snapshot：与 bridge::ime_popup_frame
+///    生产函数逐字相同（交付耗时/字节记入 metrics）。
+///
+/// 返回本帧是否发生了 JNI 交付（Some）。
+fn java_tick(
+    h: &mut Harness,
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+) -> bool {
+    h.pump();
+    {
+        let mut ime = std::mem::take(&mut h.server.ime);
+        ime.set_focus(surface, h.server);
+        h.server.ime = ime;
+    }
+    let t_del = Instant::now();
+    let delivered = if let Some(snap) = h.server.ime.take_popup_snapshot() {
+        let data = crate::bridge::encode_popup_snapshot(&snap);
+        let dur = t_del.elapsed();
+        let m = &mut h.server.ime.metrics;
+        m.popup_delivery.record(dur);
+        m.popup_delivered_bytes += data.len() as u64;
+        true
+    } else {
+        false
+    };
+    delivered
+}
+
+/// 以 ~16ms 帧节拍把 java_tick 跑 `dur` 时长（等价一轮 Java 渲染循环窗）。
+fn java_burst(
+    h: &mut Harness,
+    surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    dur: Duration,
+) {
+    let t0 = Instant::now();
+    while t0.elapsed() < dur {
+        java_tick(h, surface);
+        std::thread::sleep(Duration::from_millis(6));
+    }
+}
+
+/// sync15 性能 bench（#[ignore]，本机跑）：**脚本化 50 键打字 + 候选窗
+/// 更新**，用与生产逐字相同的调用形状复刻 sync14 用户实测病灶
+/// （"输入法的时候特别卡，多次差点卡崩"）：
+///
+/// - 50 次 handle_key（press/release 各 50，key_input 直方图入册）；
+/// - 键间按 Java tick 节奏泵 + 每帧 set_focus（病灶驱动源）；
+/// - 统计 = `ImeState.metrics` 全量 + 桥级 IME_LOG_IO 快照，
+///   eprintln `=== [bench50] ...` 行，修复前/后各跑一次取对比数字。
+///
+/// 断言刻意宽松（场景成立性门槛，不锁性能绝对值——性能改善以打印
+/// 数字为准，写进交付报告）：
+/// - 50 键全部入册（key_input n=100）；
+/// - 打字期间候选窗至少真实交付过 3 帧（面板确实在更新）；
+/// - 汉字 commit 落地（链路功能没被性能改动破坏）。
+#[test]
+#[ignore = "真 fcitx5 latency bench（本机跑）：50 键脚本化打字 + 候选交付经济学"]
+fn real_fcitx5_50_key_latency_bench() {
+    use crate::ime::metrics::PopupDeliveryCounts;
+
+    let base = std::env::temp_dir().join(format!("wlc-f5bench-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let home = base.join("home");
+    let runtime = base.join("runtime");
+    let conf_dir = home.join("config/fcitx5");
+    for d in [&home, &home.join("config"), &conf_dir, &home.join("data"), &home.join("cache"), &runtime] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(conf_dir.join("profile"), SEED_PROFILE).unwrap();
+    std::fs::write(conf_dir.join("config"), SEED_CONFIG_ACTIVE).unwrap();
+
+    let (mut display, mut server) = server_setup();
+    let socket_name = format!("wayland-bench50-{}", std::process::id());
+    let listener = UnixListener::bind(runtime.join(&socket_name)).expect("bind");
+    listener.set_nonblocking(true).unwrap();
+
+    let (es, ec) = UnixStream::pair().unwrap();
+    let editor_client: Client = display
+        .handle()
+        .insert_client(es, Arc::new(ServerClientData))
+        .unwrap();
+    let mut editor: TestClient<EditorState> = editor_connect(ec, &mut display, &mut server);
+
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base.join("fcitx5.log"))
+        .unwrap();
+    let log_err = log.try_clone().unwrap();
+    let mut cmd = Command::new("fcitx5");
+    cmd.args(["-D", "--disable=dbus"])
+        .arg("--verbose")
+        .arg("default=3,waylandim=5")
+        .env("WAYLAND_DISPLAY", &socket_name)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("LANG", "C.UTF-8")
+        .env_remove("DISPLAY")
+        .env_remove("XAUTHORITY")
+        .env_remove("DBUS_SESSION_BUS_ADDRESS");
+    cmd.stdin(Stdio::null()).stdout(Stdio::from(log)).stderr(Stdio::from(log_err));
+    let mut fcitx = cmd.spawn().expect("spawn fcitx5");
+
+    let mut h = Harness {
+        display: &mut display,
+        server: &mut server,
+        editor: &mut editor,
+        listener: &listener,
+    };
+
+    // 生产同款：Java 启动时 setImeLogFile 打开 .minecraft/waylandcraft-ime.log。
+    // bench 里装一个真文件，log_io 的 write_ops/bytes 才是可对比的真实
+    // 系统调用读数（无文件时只有 stderr，file ops 恒 0）。
+    let ime_log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(base.join("ime.log"))
+        .unwrap();
+    crate::bridge::set_ime_log_file_for_test(ime_log_file);
+
+    // ── 建链：bind → 聚焦 enable → grab（同生产会话启动形状）──
+    let bound = h.wait_for(|s| s.ime.im2.instance.is_some(), Duration::from_secs(90));
+    assert!(bound, "真 fcitx5 应 bind im2（bench 前置）");
+    let surface = h.server_surface(&editor_client);
+    {
+        let mut ime = std::mem::take(&mut h.server.ime);
+        ime.set_focus(&surface, h.server);
+        h.server.ime = ime;
+        h.server.seat.keyboard_focus(surface.clone());
+    }
+    let ti = h.editor.state.ti.as_ref().unwrap().clone();
+    ti.enable();
+    ti.commit();
+    h.pump_burst(Duration::from_millis(400));
+    let grabbed = h.wait_for(|s| s.ime.im2.grab.is_some(), Duration::from_secs(15));
+    assert!(grabbed, "引擎应 grab 键盘（bench 需要 im2 主路径形态）");
+
+    // ── 脚本化 50 键：8×(n i h a o space) + n i ──
+    // 覆盖"逐键候选重绘 + 空格选词 commit"两类 popup 更新事件。
+    let words: Vec<u32> = [N, I, H, A, O, SPACE]
+        .into_iter()
+        .cycle()
+        .take(48)
+        .chain([N, I])
+        .collect();
+    assert_eq!(words.len(), 50);
+    let bench_t0 = Instant::now();
+    let mut jni_deliveries = 0u64;
+    for evdev in words {
+        for pressed in [true, false] {
+            let mods = h.server.seat.modifiers_tuple();
+            let action = if pressed { KeyboardAction::Press } else { KeyboardAction::Release };
+            // 与生产 keyboard_input 同形：handle_key 计时入 key_input 直方图
+            //（grab 在场时 handle_key 即 bridge 的绝大部分本体）。
+            let t0 = Instant::now();
+            let _handled = h.server.ime.handle_key(evdev + 8, action, mods);
+            h.server.ime.metrics.key_input.record(t0.elapsed());
+            // 键后按 Java 帧节拍泵（press 120ms / release 60ms ≈ 用户
+            // 150ms 键间隔的一半，保证候选重绘落在窗口内被数到）。
+            let pause = if pressed { 120 } else { 60 };
+            let t_end = Instant::now() + Duration::from_millis(pause);
+            while Instant::now() < t_end {
+                if java_tick(&mut h, &surface) {
+                    jni_deliveries += 1;
+                }
+                std::thread::sleep(Duration::from_millis(6));
+            }
+        }
+    }
+    let bench_secs = bench_t0.elapsed().as_secs_f64();
+    // 让最后一次 commit 落地。
+    let commit_seen = wait_new_cjk(&mut h, 0, Duration::from_secs(6));
+    java_burst(&mut h, &surface, Duration::from_millis(300));
+
+    // ── 数字 dump（报告原料：修复前/后各一份）──
+    let m = &h.server.ime.metrics;
+    let popup = PopupDeliveryCounts {
+        frames: h.server.ime.popup.frames_captured() as u64,
+        deliveries: h.server.ime.popup.deliveries() as u64,
+    };
+    let commits = cjk_commits(&h.editor.state.ti_events);
+    eprintln!("=== [bench50] 场景: 50 键(8×nihao+空格 + n i), 时长 {bench_secs:.1}s, Java tick=6ms 帧节拍+每帧 set_focus");
+    eprintln!("=== [bench50] key_input   {}", m.key_input.format());
+    eprintln!("=== [bench50] submit_wait {}", m.submit_sync_wait.format());
+    eprintln!("=== [bench50] popup_deliv {}", m.popup_delivery.format());
+    eprintln!(
+        "=== [bench50] popup: frames={} deliveries={} dup_skipped={} delivered_bytes={}KB jni_tick_deliveries={}",
+        popup.frames, popup.deliveries, m.popup_dup_skipped, m.popup_delivered_bytes / 1024, jni_deliveries
+    );
+    // 先闭合缓冲/重复段再读计数（否则 write_ops 少算未落盘部分）。
+    crate::bridge::ime_log_flush();
+    let (lines, bytes, ops, supp) = crate::bridge::IME_LOG_IO.snapshot();
+    eprintln!("=== [bench50] log_io: lines={lines} bytes={}KB write_ops={ops} suppressed={supp}", bytes / 1024);
+    eprintln!("=== [bench50] commits={commits:?} first_commit={commit_seen:?}");
+    eprintln!("=== [bench50] ime_info 延迟段:\n{}", m.format_latency_section(popup));
+    eprintln!("=== [bench50] base dir kept for forensics: {}", base.display());
+
+    // ── 场景成立性断言（宽松；性能数字以 eprintln 为准）──
+    assert_eq!(m.key_input.count(), 100, "50 键 press+release 全入册");
+    assert!(
+        popup.frames >= 3,
+        "打字期间候选面板应重绘 ≥3 帧（场景成立性），实际 {}",
+        popup.frames
+    );
+    assert!(
+        !commits.is_empty(),
+        "脚本化打字必须产生汉字 commit（链路功能完好），ti3: {:?}",
+        h.editor.state.ti_events
+    );
+
+    let _ = fcitx.kill();
+    let _ = fcitx.wait();
+}

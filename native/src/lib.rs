@@ -471,7 +471,11 @@ impl<'a> WaylandCraft<'a> {
         // Unconfigured——不会有孤儿进程。
         {
             let st = &mut self.state;
-            st.ime.nested_tick(std::time::Instant::now(), &st.socket);
+            let now = std::time::Instant::now();
+            st.ime.nested_tick(now, &st.socket);
+            // sync15：热路径仪表推进 + 每 10s 一行聚合 debug 日志
+            // （轮询驱动，无定时器；update_rounds 计数即 dispatch 轮次）。
+            st.ime.metrics_tick(now);
         }
 
         // v0.13.6：每帧检查 satellite 是否还活着——死了自动 restart。

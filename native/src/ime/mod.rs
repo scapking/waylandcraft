@@ -57,6 +57,7 @@
 mod ime_event;
 mod input_method_v2;
 pub(crate) mod input_popup;
+pub(crate) mod metrics;
 mod nested_daemon;
 mod relay;
 mod text_input_v3;
@@ -158,6 +159,12 @@ pub struct ImeState {
     /// 最近一次 fcitx5 种子 outcome 的引擎名列表（/wl ime info 透明化；
     /// 数据在 nested_tick 的种子分支就地留存——nested_daemon 种子逻辑不动）。
     seed_engines: Vec<String>,
+
+    /// sync15 热路径仪表（先测量后修的测量半程）：keyboard_input 全程
+    /// 直方图、submit_key_sync 等待、popup 交付经济学、按键路由分布、
+    /// 10s 聚合行窗口簿记。全部单事件循环线程读写（日志 IO 计数在桥级
+    /// relaxed 原子，跨线程安全但不进 ime_info）。
+    pub(crate) metrics: metrics::ImeMetrics,
 }
 
 impl ImeState {
@@ -269,6 +276,20 @@ impl ImeState {
         // focused）门把守，native 不该重复且错误地用窗口信号再 gate 一次。
         let im2active = self.popup_ime_active();
         let visible = self.popup.has_content(now) && im2active;
+        // sync15 交付去重闸：epoch 动了不等于 Java 能观测到的状态动了——
+        // 每帧 focusSurface（keyboard_focus JNI）与 ti3 enable/disable 抖动
+        // （Activate/Deactivate touch）都推进 epoch，但只要 (seq, visible)
+        // 与上次交付一致，重新 clone 64KB + 编码 + JNI byte[] + Java 解码
+        // 重传纹理就是纯浪费（真机 bench 实测：36 帧内容被交付 1423 次 /
+        // 40MB JNI 字节 / 9.4s——sync14 "输入法特别卡" 的主通路之一）。
+        // 去重轮以 None 消费 epoch：像素零拷贝、record_delivery/gate 日志
+        // 都不计入（deliveries 计数从此等于真实状态转移数）。
+        let seq_will = self.popup.delivery_seq(visible);
+        if self.popup.delivery_redundant(seq_will, visible) {
+            self.popup.consume_epoch();
+            self.metrics.popup_dup_skipped += 1;
+            return None;
+        }
         let snap = self.popup.snapshot(visible);
         // 内容在场时的完整门快照（sync12 复盘盲区：status 只在空闲瞬间采样，
         // 抓不到"有帧时哪道门挡了"）。200ms 节流，一条日志直接指认。
@@ -287,6 +308,7 @@ impl ImeState {
         // 观测网（sync8 静默故障复盘）：交付侧记账——"native 采到了帧"
         // 与"Java 拿到了可见帧"必须可用数字切分，不再靠日志行序人肉对齐。
         self.popup.record_delivery(snap.visible);
+        self.popup.note_delivery_fingerprint(snap.seq, snap.visible);
         Some(snap)
     }
 
@@ -388,7 +410,31 @@ impl ImeState {
             }
         ));
         out.push_str(&format!("引擎工作态(预编辑流在场): {} —— 协议不暴露引擎名，此为「中文引擎工作态」判定\n", self.popup_work_state()));
+        // sync15 延迟段：keyboard_input / submit_key_sync / popup 交付的
+        // 直方图读数 + 按键路由分布 + 候选窗交付经济学。纯读，累计值。
+        out.push_str(&self.metrics.format_latency_section(metrics::PopupDeliveryCounts {
+            frames: self.popup.frames_captured() as u64,
+            deliveries: self.popup.deliveries() as u64,
+        }));
         out
+    }
+
+    /// sync15：由 `WaylandCraft::update()` 每帧驱动的热路径仪表推进。
+    ///
+    /// 职责：`update_rounds` 计数 + 满 10s 写一行聚合 debug 日志（无定时器，
+    /// 轮询驱动同 expire_hold 风格）。日志经 `bridge::ime_log_write`，顺带
+    /// 被 Phase C 的缓冲/重复合并覆盖（本行内容独立，不会被相邻合并吞掉——
+    /// 内容含窗口计数，每窗口变化）。
+    pub fn metrics_tick(&mut self, now: std::time::Instant) {
+        let popup = metrics::PopupDeliveryCounts {
+            frames: self.popup.frames_captured() as u64,
+            deliveries: self.popup.deliveries() as u64,
+        };
+        if let Some(line) = self.metrics.tick_window_report(now, popup, &crate::bridge::IME_LOG_IO) {
+            crate::bridge::ime_log_write(&line);
+            // 心跳落盘点：缓冲日志的最坏可见延迟 = 窗口周期（Phase C 合同）。
+            crate::bridge::ime_log_flush();
+        }
     }
 
     /// 是否有激活的文本输入会话（relay 是唯一事实源，ti3 enable 驱动）。
@@ -527,8 +573,16 @@ impl ImeState {
         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         state: &mut crate::WLCState,
     ) {
+        // sync15：Java 渲染循环每帧调 focusSurface（WaylandCraft.ensureKeyboard
+        // Focus "tick"），幂等地重复聚焦同一 surface 也照常进来。旧实现每帧
+        // popup_touch 推 epoch——配合交付端的同帧重交付，构成 60fps 的全量
+        // 复制风暴。可见性公式（sync11 起）已不含 has_focus/surface 身份，
+        // 焦点原料只在**首次获得**时推一次（内容/激活态变化另有触点；交付
+        // 端指纹去重兜底其余触点），同 surface 重复 set_focus 不再推 epoch。
+        if !self.has_focus {
+            self.popup_touch();
+        }
         self.has_focus = true;
-        self.popup_touch(); // 可见性原料（ti3 焦点）变化 → 轮询端须感知
         let had_focus = self.ti3.focus_surface().is_some();
         // 1. ti3 wire 层：enter 该 surface（协议要求：enter 必须发给聚焦
         // client 的全部 ti3 实例）。
@@ -606,13 +660,18 @@ impl ImeState {
         // sync7 修复：这里曾直接丢弃返回值——ti3 层无聚焦但 relay 会话仍
         // active 时，Deactivate 命令（含 wire done）被扔掉的形态正是当年
         // 影子计数「记了数但 wire 没发」的漂移来源之一。必须照常执行。
-        self.has_focus = false;
+        // sync15：焦点原料真实 false→? 变化才推 epoch——生产聊天场景无
+        // 聚焦窗口时 WaylandCraft.update 每帧 focusSurface(null) 走到这里，
+        // 旧代码每帧 popup_touch = 每帧空转交付（配合 set_focus 同款修复）。
+        let had_focus = std::mem::replace(&mut self.has_focus, false);
         let cmds = self.relay.focus_lost();
         // 失焦 = 组合流终结兜底（focus_lost 在无激活会话时不产 Deactivate，
         // exec_on_im2 的复位分支会被跳过——这里统一清工作态角标原料）。
         self.last_preedit_active = false;
         self.execute_ime_commands(cmds);
-        self.popup_touch(); // 可见性原料（ti3 焦点）变化 → 轮询端须感知
+        if had_focus {
+            self.popup_touch(); // 可见性原料（ti3 焦点）真实消失 → 轮询端感知
+        }
     }
 
     /// 激活的 ti3 实例被销毁（text_input_v3.rs Dispatch 调用）：
@@ -1264,6 +1323,41 @@ mod facade_tests {
         assert!(a.contains("候选窗:"), "{a}");
         assert!(a.contains("引擎工作态"), "{a}");
         assert!(a.contains("会话:"), "{a}");
+    }
+
+    // ── sync15 仪表：延迟段 + 窗口行（测量半程）──
+
+    #[test]
+    fn ime_info_includes_latency_section_pure_read() {
+        // 延迟段存在且反映当前计数；两次调用一致（既有零副作用合同
+        // 覆盖到新区块——刻意不读桥级全局，保证并行测试下也确定）。
+        let mut ime = ImeState::default();
+        ime.metrics.key_input.record_us(120);
+        ime.metrics.popup_delivery.record_us(30_000);
+        ime.metrics.route_im2_grab = 3;
+        ime.metrics.keys_during_starting = 2;
+        let a = ime.ime_info(false);
+        let b = ime.ime_info(false);
+        assert_eq!(a, b, "latency 段不得有副作用");
+        assert!(a.contains("延迟 keyboard_input(全程)"), "{a}");
+        assert!(a.contains("延迟 submit_key_sync(等待): n=0"), "{a}");
+        assert!(a.contains("im2-grab=3"), "{a}");
+        assert!(a.contains("Starting期(词典窗口)=2"), "{a}");
+    }
+
+    #[test]
+    fn metrics_tick_counts_rounds_and_fires_window_line() {
+        // update() 驱动：首轮建窗计数 + 到 10s 差分推进（窗口行经
+        // ime_log_write 落日志——这里只验簿记与调用安全，行内容在
+        // metrics.rs 单测覆盖）。
+        let mut ime = ImeState::default();
+        let t0 = std::time::Instant::now();
+        ime.metrics_tick(t0);
+        assert_eq!(ime.metrics.update_rounds, 1);
+        ime.metrics_tick(t0 + std::time::Duration::from_secs(1));
+        assert_eq!(ime.metrics.update_rounds, 2, "1s 不满窗不再出行");
+        ime.metrics_tick(t0 + std::time::Duration::from_secs(11));
+        assert_eq!(ime.metrics.update_rounds, 3);
     }
 
     #[test]

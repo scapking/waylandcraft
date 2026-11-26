@@ -74,6 +74,14 @@ public final class ImeCandidateOverlay {
 	 */
 	private static Frame worldFrame;
 
+	/**
+	 * 上传转码暂存（sync15 修复 D）：按尺寸复用的 direct buffer——字节序
+	 * 交换写入后一次 memCopy 进 NativeImage，替代旧逐像素 16k 次 memPutInt。
+	 * 上限 ~64KB（候选窗 MAX_DIM 4096 也才 16MB；实际 fcitx5 面板 <64KB），
+	 * 只随帧尺寸增长重分配，进程级常驻不泄漏。
+	 */
+	private static java.nio.ByteBuffer uploadScratch;
+
 	// ═══════════════════════════ 观测层计数 ═══════════════════════════
 
 	private static long polls;            // tick 轮询总次数
@@ -355,15 +363,23 @@ public final class ImeCandidateOverlay {
 			int n = f.width() * f.height();
 			// wire 像素字节 [B,G,R,A]（= u32 0xAARRGGBB 小端）；MC 26.x
 			// NativeImage RGBA 内存 [R,G,B,A]（RemoteWindowRenderer 取证），
-			// memPutInt 小端落盘 → 组装 (A<<24)|(B<<16)|(G<<8)|R。
-			for(int i = 0; i < n; i++) {
-				int b = i * 4;
-				int b0 = d[b] & 0xFF;
-				int b1 = d[b + 1] & 0xFF;
-				int b2 = d[b + 2] & 0xFF;
-				int b3 = d[b + 3] & 0xFF;
-				MemoryUtil.memPutInt(ptr + i * 4L, (b3 << 24) | (b0 << 16) | (b1 << 8) | b2);
+			// 小端 int = (A<<24)|(B<<16)|(G<<8)|R。
+			//
+			// sync15 修复 D（批量上传）：旧实现逐像素 memPutInt——16k 次
+			// 单点写，且旧交付闸门下**每次轮询**都跑（bench50 基线：
+			// 1423 次重传 × 16k 写 ≈ 2300 万次/9.4s）。改为转码进复用的
+			// direct buffer + 一次 memCopy：循环仍在（字节序交换无法 memcpy
+			// 直通），但目标写从 16k 次逐点 Unsafe.putInt 变成一次块拷贝，
+			// scratch 按尺寸只分配一次。字节序：x86/ARM 全小端平台
+			// LITTLE_ENDIAN int 视图落盘字节 = 旧 memPutInt 逐字节等价
+			// （MC 无大端目标平台，合同不变）。
+			int bytes = n * 4;
+			if(uploadScratch == null || uploadScratch.capacity() < bytes) {
+				if(uploadScratch != null) MemoryUtil.memFree(uploadScratch);
+				uploadScratch = MemoryUtil.memAlloc(bytes);
 			}
+			ImeCandidateLayout.transferArgb(d, n, uploadScratch);
+			MemoryUtil.memCopy(MemoryUtil.memAddress(uploadScratch), ptr, bytes);
 			texture.upload();
 		} catch(RuntimeException | UnsatisfiedLinkError e) {
 			// 观测层：计数 + 5s 节流 WARN（旧版每次即时 warn，GL 侧持续失败

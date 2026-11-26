@@ -1032,6 +1032,68 @@ fn popup_pointer_axis_sends_wheel() {
     assert!(evs.iter().any(|e| e == "axis_value120"), "{:?}", evs);
 }
 
+// ═══════════ sync15 交付去重（"每 tick 全量重发"病灶回归）═══════════
+
+/// 生产病灶复刻 + 修复门槛（用户实测"输入法的时候特别卡"主通路之一）：
+/// Java 渲染循环每帧 focusSurface → keyboard_focus → ime.set_focus。
+/// 修复前该路径**无条件** popup_touch 推 epoch，配合交付闸门（旧）把同一
+/// `(seq, visible)` 每帧全量 clone+encode+JNI 重发（真机 bench50 实测：
+/// 12-36 个真实帧被交付 1423-1473 次 / 13-40MB JNI 字节 / 9.4s）。
+/// 修复后两层闸：
+/// 1. set_focus 幂等（焦点原料未变化不推 epoch）→ churn 轮询直接 None；
+/// 2. 内容指纹去重（其余触点如 keyboard_activate/会话抖动推进 epoch 时，
+///    (seq,visible) 不变 → None + dup_skipped 计数）；
+/// 3. 真实状态转移（隐藏/恢复/新帧）不受影响，照常完整交付。
+#[test]
+fn popup_tick_churn_same_frame_delivered_once() {
+    let mut f = setup_popup();
+    f.focus_and_enable();
+    let (_surface, _popup, px) = popup_with_frame(&mut f, 4, 3, 2);
+    let first = f
+        .server
+        .ime
+        .take_popup_snapshot()
+        .expect("新帧必须交付");
+    assert!(first.visible);
+    assert_eq!(first.argb.as_ref().unwrap(), &px);
+    let d0 = f.server.ime.popup.deliveries();
+
+    // 120 帧生产节拍 churn：set_focus(同一 surface) + 轮询。
+    let srv = f.editor_server_surface();
+    for i in 0..120 {
+        let mut ime = std::mem::take(&mut f.server.ime);
+        ime.set_focus(&srv, &mut f.server);
+        f.server.ime = ime;
+        assert!(
+            f.server.ime.take_popup_snapshot().is_none(),
+            "第 {i} 帧幂等 set_focus 不得产生任何交付（epoch 都不应推进）"
+        );
+    }
+    assert_eq!(f.server.ime.popup.deliveries(), d0, "deliveries 只数真实状态转移");
+    assert_eq!(f.server.ime.metrics.popup_dup_skipped, 0, "幂等层在前，去重层不该被触达");
+
+    // 去重层：其余合法触点（keyboard_activate / ti3 抖动 Activate/Deactivate
+    // 等）推进 epoch 但指纹未变 → None 消费 + 计数（不再重发像素）。
+    for i in 0..5 {
+        f.server.ime.popup_touch();
+        assert!(
+            f.server.ime.take_popup_snapshot().is_none(),
+            "touch 后同 (seq,visible) 必须去重（第 {i} 轮）"
+        );
+    }
+    assert_eq!(f.server.ime.metrics.popup_dup_skipped, 5);
+
+    // 真实转移必须照常交付：会话终结 → 不可见（fingerprint visible 位翻转）。
+    f.unfocus();
+    let hide = f.server.ime.take_popup_snapshot().expect("会话终结必须交付隐藏");
+    assert!(!hide.visible);
+    // 重新激活 → 可见恢复（同帧同 seq 但 visible 位再次翻转，须重交付）。
+    f.focus_and_enable();
+    let s = f.server.ime.take_popup_snapshot().expect("重新激活必须交付可见");
+    assert!(s.visible);
+    assert_eq!(s.argb.as_ref().unwrap(), &px, "恢复交付携带完整像素");
+}
+
 // ═══════════════ 真 fcitx5 端到端（#[ignore]，本机跑，取证日志落盘）═══════════════
 
 /// 隔离 profile/config：与 tests_real 同一取证结论（ActiveByDefault 种子），
