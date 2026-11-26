@@ -2939,7 +2939,10 @@ fn portal_capture_stop<'local>(
     _class: JClass<'local>,
     _instance: jlong,
 ) -> Result<(), BridgeError> {
-    // PipeWire mainloop runs in a thread, will exit when process exits
+    // P1-4：旧实现是空函数（"进程退出时线程自灭"），每次 start/stop 泄漏
+    // 一个永不退出、仍在收帧分配的 pw-stream 线程 + 一个不 Close 的 portal Session。
+    // 现在走 portal_capture::stop_portal_capture()：quit → join → 清帧槽 → Session.Close。
+    crate::portal_capture::stop_portal_capture();
     Ok(())
 }
 

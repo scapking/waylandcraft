@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pipewire as pw;
@@ -6,6 +7,29 @@ use pw::prelude::*;
 
 static CAPTURE_FRAMES: std::sync::Mutex<Option<Arc<Mutex<Option<FrameData>>>>> =
     std::sync::Mutex::new(None);
+
+/// P1-4：捕获生命周期状态。
+///
+/// 旧实现 start_pw_stream spawn 的 "pw-stream" 线程在 `mainloop.run()` 上永不返回，
+/// portal_capture_stop 是空函数——每次 start/stop 泄漏 1 个 30fps 收帧的僵尸线程
+/// （每帧新建 8MB+ Vec，约 250MB/s 分配，2-5% CPU，8-16MB 常驻），且 portal
+/// Session 从不 Close（桌面持续显示"正在录屏"）。
+/// 现在 quit 标志 + join + Session.Close + 唯一 token，stop 后资源全部归零。
+struct CaptureEntry {
+    quit: Arc<AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+    session: Option<String>,
+}
+
+static CAPTURE: Mutex<Option<CaptureEntry>> = Mutex::new(None);
+
+/// portal handle token 序列号（同进程内单调，配合 pid 保证跨重启唯一）
+static TOKEN_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn portal_token(prefix: &str) -> String {
+    let seq = TOKEN_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{}{}-{}", prefix, std::process::id(), seq)
+}
 
 #[derive(Clone)]
 pub struct FrameData {
@@ -73,20 +97,31 @@ fn wait_portal_response(request_path: &str, timeout_secs: u64) -> Result<(u32, S
 }
 
 /// 从 CreateSession 的 Response 信号中提取 session_handle
-/// Response 行形如:
-///   ... org.freedesktop.portal.Request.Response (uint32 0, {'session_handle': <'/org/freedesktop/portal/desktop/session/1_xxx/wcs1'>, ...})
+/// Response 行形如（gdbus call 与 gdbus monitor 的引号/标注风格不同）:
+///   ... Response (uint32 0, {'session_handle': <'/org/freedesktop/portal/desktop/session/1_xxx/wcs1'>, ...})
+///   "session_handle": objectpath "/org/freedesktop/portal/desktop/session/1_xxx/wcs1"
+/// P1-4：旧实现只认"session_handle 之后第一对单引号"，在带类型标注
+/// （objectpath '/org/...'）或双引号打印时拿到的是 `: <objectpath ` 之类的
+/// 垃圾段而返回 None。改为扫描全行的引号片段（' 与 " 都认），取第一个
+/// 以 session 路径前缀开头的——对旧格式仍然成立（超集）。
 fn extract_session_handle(response: &str) -> Option<String> {
-    if let Some(pos) = response.find("session_handle") {
-        let rest = &response[pos..];
-        if let Some(q1) = rest.find('\'') {
-            let after = &rest[q1 + 1..];
-            if let Some(q2) = after.find('\'') {
-                let path = &after[..q2];
-                if path.starts_with("/org/freedesktop/portal/desktop/session/") {
-                    return Some(path.to_string());
+    const PREFIX: &str = "/org/freedesktop/portal/desktop/session/";
+    let b = response.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        let q = b[i];
+        if q == b'\'' || q == b'"' {
+            // 配对同类引号（对象路径本身不含引号）
+            if let Some(l) = response[i + 1..].find(q as char) {
+                let token = &response[i + 1..i + 1 + l];
+                if token.starts_with(PREFIX) {
+                    return Some(token.to_string());
                 }
+                i = i + 1 + l + 1; // 跳到闭引号之后
+                continue;
             }
         }
+        i += 1;
     }
     None
 }
@@ -94,14 +129,26 @@ fn extract_session_handle(response: &str) -> Option<String> {
 /// 通过 XDG Desktop Portal ScreenCast 启动捕获
 /// 返回 PipeWire 节点 ID
 pub fn start_portal_capture() -> Result<u32, String> {
+    // P1-4：先回收上一轮残留（Java 侧漏 stop / start 失败半途），
+    // 保证"一次 start 对应一次会话+一个线程"，不再叠加泄漏。
+    stop_portal_capture();
+
     // 1. CreateSession
-    eprintln!("[portal] CreateSession...");
+    // P1-4：token 固定 wcs1/wcr1 → 第二次 start 被 portal 以重复 token 拒绝。
+    // 改为 pid+自增序列，进程内单调、重启后仍唯一。
+    let tok_session = portal_token("wcs");
+    let tok_request = portal_token("wcr");
+    eprintln!("[portal] CreateSession (token {tok_session}/{tok_request})...");
+    let session_opts = format!(
+        "{{'session_handle_token': <'{}'>, 'handle_token': <'{}'>}}",
+        tok_session, tok_request
+    );
     let out = gdbus_call(&[
         "call", "--session",
         "--dest", "org.freedesktop.portal.Desktop",
         "--object-path", "/org/freedesktop/portal/desktop",
         "--method", "org.freedesktop.portal.ScreenCast.CreateSession",
-        "{'session_handle_token': <'wcs1'>, 'handle_token': <'wcr1'>}",
+        &session_opts,
     ])?;
     // 返回: (objectpath '/org/.../wcr1',)
     let req1 = extract_object_path(&out)?;
@@ -116,22 +163,40 @@ pub fn start_portal_capture() -> Result<u32, String> {
         .ok_or("CreateSession: cannot extract session_handle")?;
     eprintln!("[portal] Session: {}", session);
 
+    // 会话已建立——立即登记，此后任何失败路径都能被 stop_portal_capture 关闭
+    *CAPTURE.lock().map_err(|e| format!("lock: {}", e))? = Some(CaptureEntry {
+        quit: Arc::new(AtomicBool::new(false)),
+        join: None,
+        session: Some(session.clone()),
+    });
+
     // 2. SelectSources
     eprintln!("[portal] SelectSources...");
+    let select_opts = format!("{{'handle_token': <'{}'>, 'types': <uint32 2>, 'multiple': <false>}}", portal_token("wcr"));
     let out = gdbus_call(&[
         "call", "--session",
         "--dest", "org.freedesktop.portal.Desktop",
         "--object-path", "/org/freedesktop/portal/desktop",
         "--method", "org.freedesktop.portal.ScreenCast.SelectSources",
         &session,
-        "{'handle_token': <'wcr2'>, 'types': <uint32 2>, 'multiple': <false>}",
+        &select_opts,
     ])?;
-    let req2 = extract_object_path(&out)?;
-    let (code, _) = wait_portal_response(&req2, 10)?;
-    if code != 0 { return Err(format!("SelectSources failed: {}", code)); }
+    let req2 = match extract_object_path(&out) {
+        Ok(p) => p,
+        Err(e) => { stop_portal_capture(); return Err(e); }
+    };
+    let (code, _) = match wait_portal_response(&req2, 10) {
+        Ok(v) => v,
+        Err(e) => { stop_portal_capture(); return Err(e); }
+    };
+    if code != 0 {
+        stop_portal_capture();
+        return Err(format!("SelectSources failed: {}", code));
+    }
 
     // 3. Start (用户需要在弹窗中确认)
     eprintln!("[portal] Start (请在弹窗中选择窗口并点击分享)...");
+    let start_opts = format!("{{'handle_token': <'{}'>}}", portal_token("wcr"));
     let out = gdbus_call(&[
         "call", "--session",
         "--dest", "org.freedesktop.portal.Desktop",
@@ -139,19 +204,74 @@ pub fn start_portal_capture() -> Result<u32, String> {
         "--method", "org.freedesktop.portal.ScreenCast.Start",
         &session,
         "''",
-        "{'handle_token': <'wcr3'>}",
+        &start_opts,
     ])?;
-    let req3 = extract_object_path(&out)?;
+    let req3 = match extract_object_path(&out) {
+        Ok(p) => p,
+        Err(e) => { stop_portal_capture(); return Err(e); }
+    };
     eprintln!("[portal] Start req: {}", req3);
 
-    let (code, response) = wait_portal_response(&req3, 60)?;
-    if code != 0 { return Err(format!("Start failed: {}", code)); }
+    let (code, response) = match wait_portal_response(&req3, 60) {
+        Ok(v) => v,
+        Err(e) => { stop_portal_capture(); return Err(e); }
+    };
+    if code != 0 {
+        // 用户在弹窗里点了取消/超时：会话同样必须关闭，否则"正在录屏"指示灯长亮
+        stop_portal_capture();
+        return Err(format!("Start failed: {}", code));
+    }
 
     // 4. 从 Response 中提取 PipeWire 节点 ID
-    let node_id = extract_node_id_from_response(&response)?;
+    let node_id = match extract_node_id_from_response(&response) {
+        Ok(id) => id,
+        Err(e) => { stop_portal_capture(); return Err(e); }
+    };
     eprintln!("[portal] PipeWire node: {}", node_id);
 
     Ok(node_id)
+}
+
+/// P1-4：关闭捕获——退线程、清帧槽、Close portal Session。幂等：未启动/已停止时空操作。
+///
+/// 由 portal_capture_stop（Java stop 路径）与 start 的失败/重入路径调用。
+/// join 有界（pw-stream 线程每 ≤50ms 检查一次 quit 标志），在 Java 调用线程上等待可接受。
+pub fn stop_portal_capture() {
+    let entry = match CAPTURE.lock() {
+        Ok(mut g) => g.take(),
+        Err(_) => None,
+    };
+    let Some(mut entry) = entry else { return };
+
+    // 1. 让 pw-stream 线程退出 iterate 循环
+    entry.quit.store(true, Ordering::Relaxed);
+    // 2. join：stream/context/core/mainloop 都在该线程上释放（pipewire 对象
+    //    必须在自己的 loop 线程上销毁；join 保证 stop 返回时资源已归还）
+    if let Some(join) = entry.join.take() {
+        if join.join().is_err() {
+            eprintln!("[portal] pw-stream thread panicked while stopping");
+        }
+    }
+    // 3. 帧槽清零：get_frame() 之后立即返回 None，不会再拷旧帧
+    if let Ok(mut g) = CAPTURE_FRAMES.lock() {
+        *g = None;
+    }
+    // 4. Session.Close：撤掉桌面的"正在录屏"指示并释放 portal 侧资源
+    if let Some(session) = entry.session.take() {
+        close_session(&session);
+    }
+}
+
+fn close_session(session_path: &str) {
+    match gdbus_call(&[
+        "call", "--session",
+        "--dest", "org.freedesktop.portal.Desktop",
+        "--object-path", session_path,
+        "--method", "org.freedesktop.portal.Session.Close",
+    ]) {
+        Ok(_) => eprintln!("[portal] Session closed: {}", session_path),
+        Err(e) => eprintln!("[portal] Session.Close {} failed: {}", session_path, e),
+    }
 }
 
 fn extract_object_path(s: &str) -> Result<String, String> {
@@ -164,18 +284,32 @@ fn extract_object_path(s: &str) -> Result<String, String> {
 
 fn extract_node_id_from_response(response: &str) -> Result<u32, String> {
     // Response 格式: Response(uint32 0, @a{sv} {...streams: [(uint32 NODE_ID, {...})]...})
-    // 查找 "streams" 后面的第一个数字——那就是 node_id。
-    // 之前用 "id > 100" 过滤，会漏掉小于 100 的节点 ID（例如 42），改为取第一个数字。
+    // 取 "streams" 之后的第一个独立数字作为 node_id。
+    // P1-4 加固：旧实现按"非数字分段"取第一个数字串——带类型标注的打印
+    // （[(uint32 42, ...)]）会先撞上 "uint32" 里的 32，连到错误节点。
+    // 现在跳过紧跟在字母后面的数字段（uintNN/intNN 等类型名的一部分），
+    // 仍然取后面第一个 >0 的数；对无标注格式 [(42, ...)] 行为不变。
     if let Some(pos) = response.find("streams") {
         let rest = &response[pos..];
-        for part in rest.split(|c: char| !c.is_ascii_digit()) {
-            if !part.is_empty() {
-                if let Ok(id) = part.parse::<u32>() {
-                    // 节点 ID 通常 > 0；排除掉 0 避免误抓其他 0
+        let b = rest.as_bytes();
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i].is_ascii_digit() {
+                let start = i;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    i += 1;
+                }
+                // 前一个字符是字母 → 是类型名（uint32 等）的一部分，跳过
+                if start > 0 && (b[start - 1].is_ascii_alphabetic() || b[start - 1] == b'_') {
+                    continue;
+                }
+                if let Ok(id) = rest[start..i].parse::<u32>() {
                     if id > 0 {
                         return Ok(id);
                     }
                 }
+            } else {
+                i += 1;
             }
         }
     }
@@ -219,19 +353,40 @@ pub fn start_pw_stream(node_id: u32) -> Result<(), String> {
         *guard = Some(frame_data.clone());
     }
 
-    std::thread::Builder::new()
+    // P1-4：线程句柄登记进 CAPTURE，stop 时 quit 标志 + join，线程可回收
+    let quit = Arc::new(AtomicBool::new(false));
+    let quit_thread = quit.clone();
+    let join = std::thread::Builder::new()
         .name("pw-stream".to_string())
         .spawn(move || {
-            if let Err(e) = pw_stream_loop(node_id, frame_data) {
+            if let Err(e) = pw_stream_loop(node_id, frame_data, quit_thread) {
                 eprintln!("[portal] PW error: {}", e);
             }
         })
         .map_err(|e| format!("spawn: {}", e))?;
 
+    let mut guard = CAPTURE.lock().map_err(|e| format!("lock: {}", e))?;
+    match guard.as_mut() {
+        // 正常路径：start_portal_capture 已建条目（含 session），补线程句柄
+        Some(entry) => {
+            entry.quit = quit;
+            entry.join = Some(join);
+        }
+        // 乱序调用防御（只有 start_pw_stream 没有 start_portal_capture）：
+        // 也登记进 CAPTURE，保证 stop 能收线程
+        None => {
+            *guard = Some(CaptureEntry { quit, join: Some(join), session: None });
+        }
+    }
+
     Ok(())
 }
 
-fn pw_stream_loop(node_id: u32, frame_data: Arc<Mutex<Option<FrameData>>>) -> Result<(), String> {
+fn pw_stream_loop(
+    node_id: u32,
+    frame_data: Arc<Mutex<Option<FrameData>>>,
+    quit: Arc<AtomicBool>,
+) -> Result<(), String> {
     pw::init();
 
     let mainloop = pw::main_loop::MainLoop::new(None).map_err(|e| format!("mainloop: {}", e))?;
@@ -362,7 +517,14 @@ fn pw_stream_loop(node_id: u32, frame_data: Arc<Mutex<Option<FrameData>>>) -> Re
     ).map_err(|e| format!("connect: {}", e))?;
 
     eprintln!("[portal] PW stream connected to node {}", node_id);
-    mainloop.run();
+    // P1-4：mainloop.run() 永不返回（线程只能随进程退出而死）——换成带 50ms
+    // 超时的 iterate 轮询 quit 标志。视频流以 30fps 产生事件，iterate 立即返回，
+    // 无事件时最多睡 50ms；stop 置标志后线程 ≤50ms 内退出并在本线程释放
+    // stream/context/core/mainloop（pipewire 对象须在自身 loop 线程销毁）。
+    while !quit.load(Ordering::Relaxed) {
+        mainloop.loop_().iterate(std::time::Duration::from_millis(50));
+    }
+    eprintln!("[portal] pw-stream loop exit (node {})", node_id);
 
     Ok(())
 }
@@ -370,4 +532,67 @@ fn pw_stream_loop(node_id: u32, frame_data: Arc<Mutex<Option<FrameData>>>) -> Re
 pub fn get_frame() -> Option<FrameData> {
     let guard = CAPTURE_FRAMES.lock().ok()?;
     guard.as_ref().and_then(|arc| arc.lock().ok()?.clone())
+}
+
+#[cfg(test)]
+mod portal_tests {
+    use super::*;
+
+    #[test]
+    fn portal_tokens_are_unique_and_valid_dbus_tokens() {
+        // P1-4：固定 wcs1/wcr1 会让第二次 start 被 portal 以重复 token 拒绝。
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..100 {
+            let a = portal_token("wcs");
+            let b = portal_token("wcr");
+            assert!(seen.insert(a.clone()) && seen.insert(b.clone()), "token 重复: {a}/{b}");
+            // D-Bus object-path element 合法字符集（[A-Za-z0-9_] 为安全子集，'-' 也允许）
+            assert!(
+                a.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "非法 token 字符: {a}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_session_handles_quoted_and_annotated_forms() {
+        // gdbus call 风格：'...' 直接包裹
+        let line = "Response (uint32 0, {'session_handle': <'/org/freedesktop/portal/desktop/session/1_42/wcs12345-7'>, })";
+        assert_eq!(
+            extract_session_handle(line).as_deref(),
+            Some("/org/freedesktop/portal/desktop/session/1_42/wcs12345-7")
+        );
+        // gdbus monitor 风格："..." + objectpath 类型标注
+        let line2 = "  \"session_handle\": objectpath \"/org/freedesktop/portal/desktop/session/1_7/wcs99-3\"\n";
+        assert_eq!(
+            extract_session_handle(line2).as_deref(),
+            Some("/org/freedesktop/portal/desktop/session/1_7/wcs99-3")
+        );
+        // 混入 request token 干扰也不误取
+        let line3 = "Response (uint32 0, {'x': <'wcs5-1'>, 'session_handle': <'/org/freedesktop/portal/desktop/session/1_9/wcs5-2'>})";
+        assert_eq!(
+            extract_session_handle(line3).as_deref(),
+            Some("/org/freedesktop/portal/desktop/session/1_9/wcs5-2")
+        );
+        assert_eq!(extract_session_handle("Response (uint32 1, {})"), None);
+    }
+
+    #[test]
+    fn extract_node_id_skips_type_annotation_digits() {
+        // 带类型标注：uint32 的 "32" 是类型名的一部分，不能当 node id
+        let annotated = "Response (uint32 0, {'streams': [(uint32 1899, {'node.id': <1899>})], })";
+        assert_eq!(extract_node_id_from_response(annotated), Ok(1899));
+        // 无标注格式行为不变
+        let plain = "Response (0, {'streams': [(42, {})], })";
+        assert_eq!(extract_node_id_from_response(plain), Ok(42));
+        assert!(extract_node_id_from_response("nothing here").is_err());
+    }
+
+    #[test]
+    fn stop_without_start_is_safe_noop() {
+        // P1-4：stop 幂等——从未 start（CAPTURE 空）时不得 panic、不得发起 D-Bus 调用
+        stop_portal_capture();
+        stop_portal_capture();
+        assert!(CAPTURE.lock().unwrap().is_none());
+    }
 }
