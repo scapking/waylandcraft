@@ -141,6 +141,16 @@ pub struct InputPopupState {
     /// 不得伪造续显（sync9 的竞态吞帧只发生在"采到→回收 < 轮询间隔"
     /// 的从未交付形态；既有隐藏用例 popup_null_attach 依赖本区分）。
     frame_pending_deliver: bool,
+    /// 上一次随 Some 快照交给 Java 的内容指纹 `(seq, visible)`（sync15）。
+    /// 交付去重的判据：epoch 被焦点/激活原料触点（set_focus、keyboard_activate、
+    /// ti3 enable 抖动的 Activate/Deactivate）推进、但 `(seq, visible)` 与上次
+    /// 交付完全一致时，JNI 轮询以 None 消费该 epoch——像素不复制、字节流不编码、
+    /// Java 不解码不重传纹理。语义安全论证：快照对 Java 的全部可观测面就是这
+    /// 二元组（同 seq ⇒ 同内容，同 visible ⇒ 显隐指令不变）；Java 侧的 null=维持
+    /// 与补显合同（ImeCandidateLayout.shouldReshowCurrent）本就按 null 轮设计。
+    /// 代际复位：`created/cleared` 把 seq 重置回 0 并清本字段——新代际必须至少
+    /// 完整交付一次（防"旧代 seq=1 已交付、新代 seq=1 不同内容"的指纹假命中）。
+    last_fingerprint: Option<(u32, bool)>,
     /// 内容在场时刻的完整门快照日志节流点（sync12 实测复盘：status 的
     /// gate 行只在查询瞬间采样，采不到"有内容时哪道门挡了"——本字段配合
     /// take_popup_snapshot 在 has_content 为真的每次交付打一条 200ms 节流
@@ -159,6 +169,8 @@ impl InputPopupState {
         self.frame = None;
         self.seq = 0;
         self.epoch = self.epoch.wrapping_add(1);
+        // 新代际：指纹复位，下一轮轮询必须完整交付一次真实状态。
+        self.last_fingerprint = None;
         self.dmabuf_warned = false;
         crate::bridge::ime_log_write(
             "[waylandcraft][ime][popup] input_popup 角色登记（候选窗 surface 进入采集轨道）",
@@ -188,6 +200,8 @@ impl InputPopupState {
         self.frame = None;
         self.seq = 0;
         self.epoch = self.epoch.wrapping_add(1);
+        // 代际终结：指纹复位（与 created 同理，防跨代假命中）。
+        self.last_fingerprint = None;
         crate::bridge::ime_log_write(if held {
             "[waylandcraft][ime][popup] popup 角色解除（候选窗销毁/断连）；未交付帧进入 display hold（≤400ms 续交付）"
         } else {
@@ -206,6 +220,18 @@ impl InputPopupState {
     #[cfg(test)]
     pub(crate) fn set_clock(&mut self, t: std::time::Instant) {
         self.clock_override = Some(t);
+    }
+
+    /// 测试专用：只复位采集/指纹轨道（等价 created 的非 wayland 对象部分，
+    /// 免构造 ObjectId）。生产路径走 created/cleared。
+    #[cfg(test)]
+    pub(crate) fn created_reset_for_test(&mut self) {
+        self.frame = None;
+        self.held = None;
+        self.hold_until = None;
+        self.frame_pending_deliver = false;
+        self.seq = 0;
+        self.last_fingerprint = None;
     }
 
     /// hold 仍在交付窗口内（有暂存帧且未到期）？
@@ -314,6 +340,36 @@ impl InputPopupState {
     /// 有未交付的变化？（轮询第一道闸：无变化直接 null，零像素拷贝）
     pub(crate) fn changed(&self) -> bool {
         self.delivered != self.epoch
+    }
+
+    /// [`Self::snapshot`] 将携带的 seq——与 snapshot 同源选择但**零像素拷贝**
+    /// （交付指纹预计算用：live 帧用 self.seq；hold 续交付用暂存帧的 seq；
+    /// 不可见路径 snapshot 恒发 self.seq）。
+    pub(crate) fn delivery_seq(&self, visible: bool) -> u32 {
+        if self.frame.is_none() && visible {
+            if let Some(h) = &self.held {
+                if self.held_active(self.now()) {
+                    return h.seq;
+                }
+            }
+        }
+        self.seq
+    }
+
+    /// 本轮 (seq, visible) 与上次 Some 交付完全一致？（内容级去重闸）
+    pub(crate) fn delivery_redundant(&self, seq: u32, visible: bool) -> bool {
+        self.last_fingerprint == Some((seq, visible))
+    }
+
+    /// 配对一次 Some 交付记录指纹（由交付闸门在 record_delivery 处调用）。
+    pub(crate) fn note_delivery_fingerprint(&mut self, seq: u32, visible: bool) {
+        self.last_fingerprint = Some((seq, visible));
+    }
+
+    /// 去重轮询消费 epoch（delivered = epoch）：不动 frame_pending_deliver
+    /// （与 invisible 交付同款语义——从未可见交付的帧仍受 hold 保护）。
+    pub(crate) fn consume_epoch(&mut self) {
+        self.delivered = self.epoch;
     }
 
     /// 构造快照（不改 delivered——由 [`Self::mark_delivered`] 配对完成，
@@ -923,6 +979,31 @@ mod tests {
         let snap2 = st.snapshot(true);
         assert!(snap2.visible, "hold 必须让帧至少经历一次可见交付");
         assert_eq!(snap2.argb.unwrap().len(), 16);
+    }
+
+    #[test]
+    fn delivery_fingerprint_gates_identical_content_and_resets_on_generation() {
+        // sync15 去重闸原料：指纹初始不命中；记录 (seq,visible) 后同指纹命中、
+        // 任一维变化不命中；cleared（代际终结）复位指纹强制下轮完整交付。
+        let mut st = InputPopupState::default();
+        st.note_frame(2, 2, vec![0u8; 16]);
+        assert_eq!(st.delivery_seq(true), st.seq);
+        assert!(!st.delivery_redundant(1, true), "未交付过不得判为重复");
+        st.note_delivery_fingerprint(1, true);
+        assert!(st.delivery_redundant(1, true));
+        assert!(!st.delivery_redundant(1, false), "可见性翻转必须重新交付");
+        st.note_frame(2, 2, vec![1u8; 16]);
+        assert!(!st.delivery_redundant(2, true), "新内容新 seq 必须重新交付");
+        st.cleared();
+        assert_eq!(st.seq, 0);
+        assert!(!st.delivery_redundant(0, false), "代际复位后必须完整交付一次");
+        // hold 续交付指纹 = 暂存帧 seq（不是 self.seq）：
+        st.created_reset_for_test();
+        st.note_frame(3, 1, vec![9u8; 12]); // seq=1
+        st.note_frame_removed(); // 未交付 → hold(seq=1)
+        assert!(st.frame.is_none());
+        assert_eq!(st.delivery_seq(true), 1);
+        assert_eq!(st.delivery_seq(false), st.seq, "不可见快照带 self.seq");
     }
 
     #[test]
