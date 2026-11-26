@@ -47,11 +47,20 @@ public class KeyboardHandlerMixin {
 		
 		// [kb-debug] mixin 注入生效的证据：这里执行 = KeyboardHandlerMixin 已注入成功。
 		// 若用户日志里完全没有 [kb-debug] 行 → 注入失效，按键根本没进 WaylandCraft。
-		WaylandCraftCommon.LOGGER.info("[kb-debug] mixin onPress key={} action={} scancode={} level={} screen={} mode={}",
-			event.key(), action, scancode,
-			Minecraft.getInstance().level != null ? "in" : "none",
-			Minecraft.getInstance().screen != null ? Minecraft.getInstance().screen.getClass().getSimpleName() : "none",
-			WaylandCraft.instance.keyboardCaptureMode);
+		// v1.4.2 分级收口：P2-13 声明"逐键刷屏→debug"，但这两行漏网仍是 INFO——
+		// 1.4.1 实测 latest.log 每键 2 行 INFO + 磁盘写放大，是"打字/走路卡顿"
+		// 的直接贡献者之一。逐键行严格 verbose 门；"注入是否生效"的里程碑证据
+		// 改由首次按键打一行（firstPressLogged）承担，发布档仍可见且不刷屏。
+		if(dev.evvie.waylandcraft.utils.WcLogging.verbose()) {
+			WaylandCraftCommon.LOGGER.info("[kb-debug] mixin onPress key={} action={} scancode={} level={} screen={} mode={}",
+				event.key(), action, scancode,
+				Minecraft.getInstance().level != null ? "in" : "none",
+				Minecraft.getInstance().screen != null ? Minecraft.getInstance().screen.getClass().getSimpleName() : "none",
+				WaylandCraft.instance.keyboardCaptureMode);
+		} else if(KbFirstPressHolder.LOGGED.compareAndSet(false, true)) {
+			WaylandCraftCommon.LOGGER.info("[kb-debug] mixin injected OK (first key: key={} scancode={}) — 后续逐键行仅在 verboseLogging=true 时输出",
+				event.key(), scancode);
+		}
 		
 		// 第一步：xkb 状态先行（PRESS/RELEASE 才更新，REPEAT 不重复触发 Caps Lock 切换）
 		if((action == GLFW.GLFW_PRESS || action == GLFW.GLFW_RELEASE)
@@ -66,7 +75,22 @@ public class KeyboardHandlerMixin {
 		boolean intercepted = WaylandCraft.instance.onKeyPress(windowHandle, event.key(), scancode, action, event.modifiers());
 		if(intercepted) info.cancel();
 		// [kb-debug] onKeyPress 返回值 = 是否拦截（true 才 cancel，Minecraft 收不到该键）
-		WaylandCraftCommon.LOGGER.info("[kb-debug] onKeyPress 返回 {} (key={} action={})", intercepted, event.key(), action);
+		// v1.4.2：逐键 INFO → verbose 门（同上）。
+		if(dev.evvie.waylandcraft.utils.WcLogging.verbose()) {
+			WaylandCraftCommon.LOGGER.info("[kb-debug] onKeyPress 返回 {} (key={} action={})", intercepted, event.key(), action);
+		}
 	}
 	
+}
+
+/**
+ * mixin 类只能往目标类加方法、不能加字段（fabric-mixin AP 会直接拒绝编译）——
+ * "首次按键"里程碑标志放这个伴生类里，全 JVM 一次，用于发布档下保留一条
+ * "注入已生效"的证据行而不逐键刷屏。
+ */
+final class KbFirstPressHolder {
+	static final java.util.concurrent.atomic.AtomicBoolean LOGGED =
+		new java.util.concurrent.atomic.AtomicBoolean(false);
+	
+	private KbFirstPressHolder() {}
 }

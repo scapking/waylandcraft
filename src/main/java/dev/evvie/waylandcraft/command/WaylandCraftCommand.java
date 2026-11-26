@@ -3145,6 +3145,30 @@ public class WaylandCraftCommand {
 			+ " §7displays: §f" + wlc.displays.size()
 			+ " §7| adopted: §f" + wlc.appLifecycle.adoptedCount() + "§r"));
 
+		// v1.4.2 观测面：verbose 档逐窗口诊断行。1.4.1 实测病灶是
+		// "toplevels>0 但 mapped=0"（客户端建了窗口对象却从不提交第一帧），
+		// 计数行无法区分是哪个窗口/哪一环。逐行给 handle+alive+mapped+pid+title：
+		//   alive=1 mapped=0 → 握手断（配合同档注入的 WAYLAND_DEBUG 报文定位等待点）
+		//   alive=0 → 客户端已断开（bridge 未回收的残条目）
+		//   pid=0 → X11/satellite 窗口（非直连 wayland 客户端）
+		if(dev.evvie.waylandcraft.utils.WcLogging.verbose() && wlc.bridge != null) {
+			WLCToplevel[] allToplevels = wlc.bridge.getToplevels();
+			int diagCap = Math.min(allToplevels.length, 12);
+			for(int i = 0; i < diagCap; i++) {
+				WLCToplevel t = allToplevels[i];
+				boolean alive = t.isAlive();
+				boolean mapped = alive && t.getSurfaceTree() != null && t.isMapped();
+				source.sendFeedback(Component.literal("§7win §f0x" + Long.toHexString(t.getHandle())
+					+ " §7alive: §f" + alive
+					+ " §7mapped: §f" + mapped
+					+ " §7pid: §f" + t.pid
+					+ " §7title: §f" + (t.title == null ? "?" : t.title) + "§r"));
+			}
+			if(allToplevels.length > diagCap) {
+				source.sendFeedback(Component.literal("§7… +" + (allToplevels.length - diagCap) + " more§r"));
+			}
+		}
+
 		// ⑦ viewer 侧 playout 缓冲概览（无观众窗口时跳过）
 		if(wlc.remoteWindowRenderer != null) {
 			for(long h : dev.evvie.waylandcraft.network.SharedWindowClientHandler.getKnownWindowHandles()) {

@@ -95,3 +95,18 @@ Rust 侧全局 `bridge::VERBOSE_LOG: AtomicBool`（**默认 true**——native
 - `-Dwc.verbose` 在场时 settings 值仍持久化但不生效（CLI 回执会标注）。
 - 服务端（无 native）只有 Java 侧分级；`[SERVER] relay stats` 的开关
   由 `WcLogging` 默认档（发布环境=false）决定。
+
+## v1.4.2 收口（1.4.1 实测日志暴露的三个漏网点）
+
+- `KeyboardHandlerMixin` 两处逐键 `[kb-debug]`（mixin onPress / onKeyPress 返回）
+  漏网在 INFO 级——P2-13 本应"逐键→debug"。现严格 `WcLogging.verbose()` 门；
+  发布档保留一条"首次按键 = 注入已生效"里程碑行（伴生类 `KbFirstPressHolder`，
+  mixin 类不能加字段）。
+- verbose 档下 spawn 环境注入 `WAYLAND_DEBUG=1`（bash 通用 env 与 flatpak
+  `--env=` 两路，`process.rs`）：客户端侧协议报文落
+  `/tmp/waylandcraft-app{,-flatpak}.log`，定位"toplevel 已创建但永不 map"
+  的等待点。发布档零注入（报文量极大）。
+- `/wl status` 逐窗口诊断行（`win 0x… alive/… mapped/… pid/… title`）
+  仅 verbose 输出，计数行保持发布档可见。
+- 以上为日志/观测形态变化，无测试断言改动；门控语义由既有
+  `bridge::verbose_gate_tests` 与 `VerboseLoggingSettingsTest` 覆盖。

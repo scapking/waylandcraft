@@ -227,6 +227,14 @@ fn build_universal_env_list(wayland_display: &str, display: &str, session_marker
     if !session_marker.is_empty() {
         env.push(("WAYLANDCRAFT_SESSION".to_string(), session_marker.to_string()));
     }
+    // v1.4.2 观测注入：verbose 档给子进程加 WAYLAND_DEBUG=1——客户端侧协议报文
+    // 进应用 stderr，汇入 /tmp/waylandcraft-app-bash.log。1.4.x 病灶形态
+    // "toplevel 已创建但永不 map（isMapped 恒 false）"只有报文能证明客户端
+    // 在等哪个事件（initial configure / wl_display roundtrip / pong…）。
+    // 报文量极大（每客户端每秒数百行），严格限 verbose，发布档零注入。
+    if crate::bridge::verbose_logging() {
+        env.push(("WAYLAND_DEBUG".to_string(), "1".to_string()));
+    }
     // C 方案：嵌套应用需要宿主 dbus 路径找 IME daemon（ibus / fcitx5）
     // 如果有就传（最常见 unix:path=/run/user/1000/bus）
     if let Ok(bus) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
@@ -287,6 +295,13 @@ fn inject_flatpak_env(args: &mut Vec<String>, wayland_display: &str, display: &s
     // 陈旧检测/收养归属对 flatpak 应用同样成立（否则 flatpak 版微信/QQ 漏网）。
     if !session_marker.is_empty() {
         opts.push(format!("--env=WAYLANDCRAFT_SESSION={}", session_marker));
+    }
+
+    // v1.4.2 观测注入（与 build_universal_env_list 同门）：verbose 档下进沙箱
+    // 的协议报文同样落 /tmp/waylandcraft-app-flatpak.log。不属于"后端选择"
+    // 变量，不违背上方"不注入 QT_QPA_PLATFORM 等"的既有纪律。
+    if crate::bridge::verbose_logging() {
+        opts.push("--env=WAYLAND_DEBUG=1".to_string());
     }
 
     // DISPLAY 永远指向 xwayland-satellite（窗口回 Minecraft 的保证）；
