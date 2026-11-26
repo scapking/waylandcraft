@@ -237,6 +237,17 @@ public class WaylandCraft implements ClientModInitializer {
 				WaylandCraftCommon.LOGGER.warn("[ime][source] setImeSource failed: {}", t.toString());
 			}
 		});
+		// 日志分级 verboseLogging：responder 注册即触发启动期同步（Java 生效档
+		// = 系统属性覆盖 > settings；WcLogging.applySetting 内部下发 Rust，
+		// native 缺失静默）。分级表见 docs/LOGGING.md。
+		settingsManager.registerResponder(WaylandCraftSettings.VERBOSE_LOGGING, (value) -> {
+			try {
+				dev.evvie.waylandcraft.utils.WcLogging.applySetting(
+					value instanceof Boolean b ? b : true);
+			} catch (Throwable t) {
+				WaylandCraftCommon.LOGGER.warn("[logging] verboseLogging responder failed: {}", t.toString());
+			}
+		});
 	}
 
 	/* Update bridge and clients. May be called at any state of the game, even outside of a level
