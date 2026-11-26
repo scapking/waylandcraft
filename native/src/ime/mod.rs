@@ -54,6 +54,7 @@
 //! FocusIn/FocusOut（弹候选窗、维持热焦点，纯干扰）。daemon 掉线
 //! 回退后 route_live 变 false，ti3 事件恢复喂宿主（幂等补热）。
 
+mod builtin;
 mod ime_event;
 mod input_method_v2;
 pub(crate) mod input_popup;
@@ -64,12 +65,16 @@ mod text_input_v3;
 mod virtual_keyboard;
 
 #[cfg(test)]
+mod tests_builtin;
+
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tests_real;
 #[cfg(test)]
 mod tests_popup;
 
+pub use builtin::{BuiltinEngine, ImeSource};
 pub use ime_event::{
     Commit, CursorRect, DeleteSurrounding, Done, DownEvent, FocusChange, KeyEvent,
     LookupTable, PreeditUpdate, SurroundingText, UpEvent,
@@ -165,6 +170,23 @@ pub struct ImeState {
     /// 10s 聚合行窗口簿记。全部单事件循环线程读写（日志 IO 计数在桥级
     /// relaxed 原子，跨线程安全但不进 ime_info）。
     pub(crate) metrics: metrics::ImeMetrics,
+
+    /// 输入法数据来源偏好（settings 键 `imeSource`，默认 Auto）。
+    /// Auto：fcitx5 在场/可用（nested 路由未判死）时**逐字节维持既有
+    /// im2/host_bridge/raw 行为**；仅当 daemon 判定「未安装/连续失败」
+    /// （NoBinary/Failed）时回退内置引擎。Fcitx5/Builtin 为强制档。
+    ime_source: builtin::ImeSource,
+
+    /// 上一次 handle_key 生效的来源裁决（fcitx5↔builtin 切换瞬间用于
+    /// 清掉内置引擎的在途组合，杜绝孤儿 preedit）。
+    last_effective_source: Option<builtin::ImeSource>,
+
+    /// 内置拼音引擎（纯逻辑；键路由 seam 见 handle_key）。
+    builtin: BuiltinEngine,
+
+    /// 内嵌词库是否已尝试加载（WLCState::new 的 init 线程一次性；
+    /// handle_key 里另有惰性兜底供测试/异常路径）。
+    builtin_dict_ready: bool,
 }
 
 impl ImeState {
@@ -380,7 +402,9 @@ impl ImeState {
         } else {
             self.seed_engines.join(", ")
         };
-        let route = if self.nested_route_live() {
+        let route = if self.effective_source() == builtin::ImeSource::Builtin {
+            "builtin"
+        } else if self.nested_route_live() {
             if self.keyboard_grabbed() { "im2-grab" } else { "im2" }
         } else {
             "host_bridge/raw 回退"
@@ -394,6 +418,7 @@ impl ImeState {
             NestedPhase::Failed(_) => "failed",
         };
         let mut out = String::new();
+        out.push_str(&format!("来源: {}\n", self.builtin_status_brief()));
         out.push_str(&format!("nested: {} (phase={phase} route={route})\n", self.nested_status_line()));
         out.push_str(&format!("已种引擎(种子 outcome): {engines}\n"));
         out.push_str(&format!("会话: app_active={} focus={} grab={} serial_mismatch={}\n",
@@ -1065,6 +1090,25 @@ impl ImeState {
         action: KeyboardAction,
         mods: (u32, u32, u32, u32),
     ) -> bool {
+        // ── ime_source 裁决（唯一新增 seam；Fcitx5/Auto-fcitx 在场分支原样）──
+        let effective = self.effective_source();
+        if self.last_effective_source != Some(effective) {
+            self.last_effective_source = Some(effective);
+            crate::bridge::ime_log_write(&format!(
+                "[waylandcraft][ime][source] 路由切换 → {effective:?}（source={:?}）",
+                self.ime_source
+            ));
+            // 切离内置档：在途组合立即终结（否则 fcitx5 接手后残留 preedit
+            // 永远没人清）。
+            if effective != builtin::ImeSource::Builtin
+                && self.builtin.cancel()
+            {
+                self.emit_ti_batch(vec![TiCommand::Preedit(String::new(), 0, 0)]);
+            }
+        }
+        if effective == builtin::ImeSource::Builtin {
+            return self.builtin_key(key, action, mods);
+        }
         // 路由裁决：mode=off / 用户 stop 后即使残留 grab 对象（daemon 断连
         // 清理要等一轮 dispatch）也绝不把键交给它。
         if !self.nested_route_live() {
@@ -1078,6 +1122,210 @@ impl ImeState {
         grab.key(serial, get_time(), wire, action.key_state());
         grab.modifiers(serial, mods.0, mods.1, mods.2, mods.3);
         true
+    }
+
+    // ── 内置引擎 seam（builtin/ 模块的门面接入点）──
+
+    /// 当前配置的来源偏好（status/ime_info 用）。
+    pub fn ime_source(&self) -> builtin::ImeSource {
+        self.ime_source
+    }
+
+    /// 实际生效的来源：Auto 时 fcitx5 嵌套 daemon 判死（未安装/连续失败）
+    /// 才落内置；Unconfigured/Starting/Active/Disabled 一律维持既有行为
+    /// （逐字节回退红线：既有 fcitx5/host_bridge/raw 逻辑不被内置档触碰）。
+    pub fn effective_source(&self) -> builtin::ImeSource {
+        match self.ime_source {
+            builtin::ImeSource::Fcitx5 => builtin::ImeSource::Fcitx5,
+            builtin::ImeSource::Builtin => builtin::ImeSource::Builtin,
+            builtin::ImeSource::Auto => {
+                let dead = matches!(
+                    self.nested.phase(),
+                    NestedPhase::NoBinary | NestedPhase::Failed(_)
+                );
+                if dead {
+                    builtin::ImeSource::Builtin
+                } else {
+                    builtin::ImeSource::Fcitx5
+                }
+            }
+        }
+    }
+
+    /// init 线程一次性加载内嵌词库（WLCState::new 调用；µs~ms 级，不占 tick）。
+    pub fn init_builtin_dict(&mut self) {
+        if self.builtin_dict_ready {
+            return;
+        }
+        let t = std::time::Instant::now();
+        match builtin::embedded_dict() {
+            Some(d) => {
+                let (syl, nodes, terms) = d.stats();
+                let micros = t.elapsed().as_micros();
+                self.builtin.set_dict(Some(d));
+                self.builtin_dict_ready = true;
+                crate::bridge::ime_log_write(&format!(
+                    "[waylandcraft][ime][builtin] 内嵌拼音词库就绪: {terms} 词条 / {syl} 音节 / {nodes} 节点, parse {micros}µs（零拷贝）"
+                ));
+            }
+            None => {
+                crate::bridge::ime_log_write(
+                    "[waylandcraft][ime][builtin] 内嵌词库解析失败——内置引擎不可用（构建异常）",
+                );
+                crate::status::note_error("error", "[ime][builtin] 内嵌拼音词库解析失败");
+            }
+        }
+    }
+
+    /// 内置档按键处理：仅当存在激活的 ti3 会话才接管（游戏操控零干扰）。
+    /// commit/preedit 复用 relay 原子缓冲 → emit_ti_batch 既有出口。
+    fn builtin_key(
+        &mut self,
+        key: u32,
+        action: KeyboardAction,
+        mods: (u32, u32, u32, u32),
+    ) -> bool {
+        if !self.relay.app_active() {
+            if self.builtin.cancel() {
+                self.emit_ti_batch(vec![TiCommand::Preedit(String::new(), 0, 0)]);
+            }
+            return false;
+        }
+        // 命令行豁免：应用光标上下文以 `/` 开头（MC 指令栏形态）→ 字母
+        // 直通，防内置档吃掉 "/wl …" 之类的命令输入。
+        if self.relay.current_state().surrounding_text.trim_start().starts_with('/') {
+            if self.builtin.cancel() {
+                self.emit_ti_batch(vec![TiCommand::Preedit(String::new(), 0, 0)]);
+            }
+            return false;
+        }
+        if !self.builtin_dict_ready {
+            self.init_builtin_dict();
+        }
+        let press = matches!(action, KeyboardAction::Press | KeyboardAction::Repeat);
+        let result = self.builtin.on_key(key, press, mods.0);
+        if !result.ops.is_empty() {
+            let ops = result.ops;
+            for op in ops {
+                self.relay.ime_op(op);
+            }
+            // 内置引擎没有 im2 serial 通道（非协议端点）：等同宿主穿透的
+            // Done 语义——无条件原子应用（serial 防线不存在，批次由本层
+            // 同步构造，天然成序）。
+            let fr = self.relay.ime_flush();
+            if fr.flushed {
+                self.emit_ti_batch(fr.commands);
+            }
+        }
+        if !self.builtin.composing() {
+            // 内置档无 popup 像素轨道：组字证据由引擎组合态直接维护。
+            self.last_preedit_active = false;
+        }
+        result.consumed
+    }
+
+    /// 内嵌词库是否已就绪（status/ime_info 用；纯读）。
+    pub fn builtin_dict_ready_probe(&self) -> bool {
+        self.builtin.has_dict()
+    }
+
+    /// Java 候选面板轮询：内置引擎快照 JSON；`None` = 无变化（轻量合同）。
+    pub fn take_builtin_snapshot(&mut self) -> Option<String> {
+        self.builtin.snapshot_json()
+    }
+
+    /// 候选面板点选（页内下标）。返回提交文本（空 = 无变化）。
+    pub fn builtin_select(&mut self, page_index: usize) -> String {
+        if !self.relay.app_active() {
+            return String::new();
+        }
+        let result = self.builtin.ui_select_page_index(page_index);
+        if !result.consumed {
+            return String::new();
+        }
+        let mut committed = String::new();
+        for op in result.ops {
+            if let crate::ime::relay::ImeOp::CommitString(t) = &op {
+                committed = t.clone();
+            }
+            self.relay.ime_op(op);
+        }
+        let fr = self.relay.ime_flush();
+        if fr.flushed {
+            self.emit_ti_batch(fr.commands);
+        }
+        self.last_preedit_active = false;
+        committed
+    }
+
+    /// 候选面板翻页（delta=±1）。返回是否实际翻页。
+    pub fn builtin_page(&mut self, delta: i32) -> bool {
+        let r = self.builtin.ui_page_step(delta);
+        r.consumed
+    }
+
+    /// `/wl ime source auto|fcitx5|builtin`：改配置即时生效；非法值拒绝。
+    pub fn set_ime_source(&mut self, raw: &str) -> Result<String, String> {
+        let Some(src) = builtin::ImeSource::parse(raw) else {
+            return Err(format!("非法来源 {raw:?}（合法 auto|fcitx5|builtin）"));
+        };
+        let prev = std::mem::replace(&mut self.ime_source, src);
+        if src != builtin::ImeSource::Builtin && self.builtin.cancel() {
+            self.emit_ti_batch(vec![TiCommand::Preedit(String::new(), 0, 0)]);
+        }
+        self.last_effective_source = Some(self.effective_source());
+        crate::bridge::ime_log_write(&format!(
+            "[waylandcraft][ime][source] {prev:?} → {src:?}（effective={:?}）",
+            self.effective_source()
+        ));
+        Ok(format!(
+            "imeSource = {}（effective={}）",
+            src.as_str(),
+            self.effective_source().as_str()
+        ))
+    }
+
+    /// `/wl ime eng`：引擎清单如实上报（内置现仅拼音；fcitx5 侧为种子引擎）。
+    pub fn ime_eng_list(&self) -> String {
+        let dict = match self.builtin.dict_stats() {
+            Some((syl, _nodes, terms)) => format!("拼音（内嵌 v1 词库: {terms} 词条 / {syl} 音节）"),
+            None if self.builtin_dict_ready => "拼音（词库损坏，不可用）".to_string(),
+            None => "拼音（词库未加载）".to_string(),
+        };
+        let mut out = String::new();
+        out.push_str(&format!("内置: {dict}\n"));
+        out.push_str(&format!("内置语言档: {}（裸 Shift 切换）\n", if self.builtin.english_mode() { "西文" } else { "拼音" }));
+        if self.seed_engines.is_empty() {
+            out.push_str("fcitx5: （daemon 未种子/未启动）\n");
+        } else {
+            out.push_str(&format!("fcitx5: {}\n", self.seed_engines.join(", ")));
+        }
+        out
+    }
+
+    /// status.rs / ime_info 共用的一行简报（纯读）。
+    pub fn builtin_status_brief(&self) -> String {
+        let dict = match self.builtin.dict_stats() {
+            Some((_syl, _n, terms)) => format!("dict={terms}词条"),
+            None => "dict=未加载".to_string(),
+        };
+        let comp = if self.builtin.composing() {
+            format!(
+                "组合={} 候选={} 页={}/{}",
+                self.builtin.buffer(),
+                self.builtin.candidate_count(),
+                self.builtin.page() + 1,
+                self.builtin.page_count().max(1)
+            )
+        } else {
+            "空闲".to_string()
+        };
+        format!(
+            "source={} effective={} mode={} {dict} {comp}",
+            self.ime_source.as_str(),
+            self.effective_source().as_str(),
+            if self.builtin.english_mode() { "en" } else { "cn" },
+        )
     }
 }
 

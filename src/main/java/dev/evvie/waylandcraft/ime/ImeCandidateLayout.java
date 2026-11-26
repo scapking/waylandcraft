@@ -230,4 +230,76 @@ public final class ImeCandidateLayout {
 	public static boolean shouldReshowCurrentWorld(boolean wasShowing, Frame f, boolean windowInPlace, Frame retained) {
 		return shouldReshowCurrent(wasShowing, f, windowInPlace, retained);
 	}
+
+	// ═══════════════ 内置候选（结构化文本通道）：纯函数层 ═══════════════
+
+	/**
+	 * 内置引擎候选快照（JSON 合同 = Rust {@code BuiltinEngine::snapshot_json}，
+	 * 仅状态变化时投递）。candidates/labels 为**当前页**内容。
+	 */
+	public record BuiltinSnapshot(boolean visible, String preedit, int cursor, int page, int pages,
+			int pageSize, String[] candidates, String[] labels) {}
+
+	/**
+	 * 解码内置候选快照 JSON。null/空串 = 无新状态 → null；非法 JSON 防御式
+	 * 返回 null（调用方维持现状并计一次 parseFail，绝不炸游戏）。
+	 */
+	public static BuiltinSnapshot decodeBuiltin(String json) {
+		if(json == null || json.isEmpty()) return null;
+		try {
+			com.google.gson.JsonObject o = com.google.gson.JsonParser.parseString(json).getAsJsonObject();
+			boolean visible = o.get("visible").getAsBoolean();
+			String preedit = o.get("preedit").getAsString();
+			int cursor = o.get("cursor").getAsInt();
+			int page = o.get("page").getAsInt();
+			int pages = o.get("pages").getAsInt();
+			int pageSize = o.get("page_size").getAsInt();
+			String[] cands = strArray(o, "candidates");
+			String[] labels = strArray(o, "labels");
+			if(pageSize <= 0 || labels.length != cands.length) return null;
+			return new BuiltinSnapshot(visible, preedit, cursor, page, pages, pageSize, cands, labels);
+		} catch(RuntimeException e) {
+			return null;
+		}
+	}
+
+	private static String[] strArray(com.google.gson.JsonObject o, String key) {
+		var arr = o.getAsJsonArray(key);
+		String[] out = new String[arr.size()];
+		for(int i = 0; i < arr.size(); i++) out[i] = arr.get(i).getAsString();
+		return out;
+	}
+
+	/**
+	 * 候选单元水平排布（给定各单元文本宽度）：返回每个单元的左边界（绝对 x）。
+	 * 纯函数——渲染与命中共用同一份边界数组，杜绝绘制/判定两套算术漂移。
+	 */
+	public static int[] builtinCellLefts(int x0, int gap, int[] cellWidths) {
+		int[] lefts = new int[cellWidths.length];
+		int x = x0;
+		for(int i = 0; i < cellWidths.length; i++) {
+			lefts[i] = x;
+			x += cellWidths[i] + gap;
+		}
+		return lefts;
+	}
+
+	/** 命中检测：mx 落在哪个候选单元（cellLefts 升序 + 末单元右界）。-1=未命中。 */
+	public static int hitBuiltinCell(int[] cellLefts, int[] cellWidths, int rightLimit, double mx) {
+		for(int i = 0; i < cellLefts.length; i++) {
+			int end = i + 1 < cellLefts.length ? cellLefts[i + 1] : rightLimit;
+			if(mx >= cellLefts[i] && mx < end) return i;
+		}
+		return -1;
+	}
+
+	/**
+	 * 内置候选显隐状态机（decideShowing 的文本通道同族，独立不干扰像素路径）：
+	 * 无快照 → 维持；有快照 → 跟 visible；无聚焦框/无会话语境由调用方决定。
+	 */
+	public static boolean decideShowingBuiltin(boolean wasShowing, BuiltinSnapshot snap, boolean contextAllows) {
+		if(!contextAllows) return false;
+		if(snap == null) return wasShowing;
+		return snap.visible();
+	}
 }

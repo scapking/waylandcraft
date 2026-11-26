@@ -598,6 +598,36 @@ bind_java_type! {
             fn = native_version,
         },
         // v0.14 嵌套输入法守护进程：/wl ime nested [status|start|stop]。
+        static extern fn ime_source_command {
+            sig = (instance: jlong, sub: JString) -> JString,
+            name = "imeSourceCommandNative",
+            fn = ime_source_command,
+        },
+        static extern fn set_ime_source {
+            sig = (instance: jlong, mode: JString),
+            name = "setImeSourceNative",
+            fn = set_ime_source,
+        },
+        static extern fn ime_builtin_candidates {
+            sig = (instance: jlong) -> JString,
+            name = "imeBuiltinCandidatesNative",
+            fn = ime_builtin_candidates,
+        },
+        static extern fn ime_builtin_select {
+            sig = (instance: jlong, page_index: jint) -> JString,
+            name = "imeBuiltinSelectNative",
+            fn = ime_builtin_select,
+        },
+        static extern fn ime_builtin_page {
+            sig = (instance: jlong, delta: jint) -> jboolean,
+            name = "imeBuiltinPageNative",
+            fn = ime_builtin_page,
+        },
+        static extern fn ime_eng_list {
+            sig = (instance: jlong) -> JString,
+            name = "imeEngListNative",
+            fn = ime_eng_list,
+        },
         static extern fn ime_nested_command {
             sig = (instance: jlong, sub: JString) -> JString,
             name = "imeNestedCommandNative",
@@ -2142,6 +2172,96 @@ fn run_ime_diagnostic<'local>(
     let instance = jptr_to_instance!(instance, "runImeDiagnostic")?;
     let report = instance.state.run_diagnostic();
     env.new_string(report).map_err(BridgeError::JniError)
+}
+
+/// setImeSource(instance, "auto"|"fcitx5"|"builtin") —— settings 键
+/// `imeSource` 下发（WaylandCraft.java responder）。非法值如实记日志、
+/// 不改内部状态（与 setImeNested 同纪律）。
+fn set_ime_source<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    mode: JString<'local>,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "setImeSource")?;
+    let mode: String = env.get_string(&mode)?.into();
+    if let Err(e) = instance.state.ime.set_ime_source(&mode) {
+        crate::bridge::ime_log_write(&format!(
+            "[waylandcraft][ime][source] 忽略非法 imeSource={mode:?}（合法 auto|fcitx5|builtin）: {e}"
+        ));
+    }
+    Ok(())
+}
+
+/// imeSourceCommand(instance, "auto"|"fcitx5"|"builtin") —— `/wl ime source`
+/// CLI 即时切档（Java 侧已做合法性预检；这里复用同一 setter 保证语义单一）。
+fn ime_source_command<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    sub: JString<'local>,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeSourceCommand")?;
+    let sub: String = env.get_string(&sub)?.into();
+    let reply = match instance.state.ime.set_ime_source(&sub) {
+        Ok(s) => format!("{s}
+{}", instance.state.ime.builtin_status_brief()),
+        Err(e) => e,
+    };
+    env.new_string(reply).map_err(BridgeError::JniError)
+}
+
+/// imeBuiltinCandidates(instance) —— 内置候选面板轮询（结构化文本）。
+/// 返回空串 = 无变化（轻量合同，与 imePopupFrame 的 null 语义同族）；
+/// 否则为快照 JSON（合同见 builtin::BuiltinEngine::snapshot_json）：
+/// `{"visible","preedit","cursor","page","pages","page_size",
+///    "candidates":[…],"labels":["1"…]}`。仅内置档参与渲染；fcitx5 像素
+/// 帧路径（imePopupFrame）与本通道互斥、互不影响。
+fn ime_builtin_candidates<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeBuiltinCandidates")?;
+    let json = instance.state.ime.take_builtin_snapshot().unwrap_or_default();
+    env.new_string(json).map_err(BridgeError::JniError)
+}
+
+/// imeBuiltinSelect(instance, page_index) —— 候选面板点选（页内 0..8）。
+/// 返回提交的文本（空 = 无效果），供 Java 打观测日志。
+fn ime_builtin_select<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    page_index: jint,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeBuiltinSelect")?;
+    let idx = if page_index < 0 { 0usize } else { page_index as usize };
+    let committed = instance.state.ime.builtin_select(idx);
+    env.new_string(committed).map_err(BridgeError::JniError)
+}
+
+/// imeBuiltinPage(instance, delta) —— 候选面板翻页（±1）。返回是否翻动。
+fn ime_builtin_page<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    delta: jint,
+) -> Result<jboolean, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeBuiltinPage")?;
+    Ok(instance.state.ime.builtin_page(delta as i32))
+}
+
+/// imeEngList(instance) —— `/wl ime eng`：引擎清单（内置拼音 + fcitx5
+/// 种子引擎如实列出）。纯读。
+fn ime_eng_list<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    let instance = jptr_to_instance!(instance, "imeEngList")?;
+    let text = instance.state.ime.ime_eng_list();
+    env.new_string(text).map_err(BridgeError::JniError)
 }
 
 /// imeNestedCommand(instance, "status"|"start"|"stop") —— v0.14 嵌套 IME

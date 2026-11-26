@@ -75,6 +75,16 @@ public class WaylandCraftSettings {
 	 */
 	String imeNested = "auto";
 
+	/* ---- 内置输入法引擎（imeSource）---- */
+	/**
+	 * 输入法数据来源：auto=fcitx5 嵌套 daemon 在场/可用时走 im2 路线（逐字节
+	 * 维持既有行为），仅当 daemon 未安装/连续失败时回退内置拼音引擎；
+	 * fcitx5=强制嵌套 daemon（禁内置）；builtin=强制内置拼音引擎
+	 * （零外部进程、零 IPC，装 mod 即用中文）。内置候选经结构化文本通道
+	 * 交付 Java 侧原版字体渲染（与 fcitx5 像素帧候选窗互斥）。
+	 */
+	String imeSource = "auto";
+
 	/* This is where the field names go to avoid typos */
 	public static final String PIXELS_PER_BLOCK = "pixelsPerBlock";
 	public static final String WINDOW_ANTIALIASING = "windowAntialiasing";
@@ -100,6 +110,7 @@ public class WaylandCraftSettings {
 	public static final String SHARE_PLAYOUT_DELAY_MS = "sharePlayoutDelayMs";
 	public static final String AUDIO_SHARE_RANGE_BLOCKS = "audioShareRangeBlocks";
 	public static final String IME_NESTED = "imeNested";
+	public static final String IME_SOURCE = "imeSource";
 	
 	/* This is where the getters go */
 	
@@ -197,6 +208,10 @@ public class WaylandCraftSettings {
 
 	public String getImeNested() {
 		return imeNested;
+	}
+
+	public String getImeSource() {
+		return imeSource;
 	}
 	
 	/* Methods to modifiy settings by name */

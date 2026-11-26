@@ -217,6 +217,26 @@ impl StatusReport {
             subsystems.push(("nested_ime", entry));
         }
 
+        // ── ime_builtin（内置拼音引擎观测面）────────────────────────
+        // 来源裁决（source/effective）、词库规模与引擎组合态一行透明化。
+        {
+            let ime = &wc.state.ime;
+            use crate::ime::ImeSource;
+            let brief = ime.builtin_status_brief();
+            let entry = match ime.effective_source() {
+                ImeSource::Builtin => {
+                    if ime.builtin_dict_ready_probe() {
+                        SubEntry::ok(brief)
+                    } else {
+                        SubEntry::error(format!("{brief}; 内置词库不可用"))
+                    }
+                }
+                ImeSource::Fcitx5 => SubEntry::na(format!("{brief}; 未生效（fcitx5 路线在场/强制）")),
+                ImeSource::Auto => SubEntry::na(brief),
+            };
+            subsystems.push(("ime_builtin", entry));
+        }
+
         // ── ime_candidate_popup（游戏内候选窗 overlay 的 native 侧观测面）──
         // sync8 复盘：候选窗静默不显示，日志无法切分"native 采到帧但
         // Java 从未收到"。这行把采集/交付/可见性门原料变成可对比数字；
@@ -332,7 +352,9 @@ impl StatusReport {
         // raw=纯直通）——status.log 一行定位"中文到底走哪条路"。
         metrics.push((
             "ime_route",
-            if wc.state.ime.nested_route_live() {
+            if wc.state.ime.effective_source() == crate::ime::ImeSource::Builtin {
+                "builtin"
+            } else if wc.state.ime.nested_route_live() {
                 if wc.state.ime.keyboard_grabbed() { "im2-grab" } else { "im2" }
             } else if wc
                 .host_bridge

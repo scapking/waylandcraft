@@ -302,6 +302,17 @@ public class WaylandCraftCommand {
 					.then(ClientCommands.literal("info")
 						.executes(WaylandCraftCommand::imeInfo)
 					)
+					// 内置拼音引擎：来源档即时切换（settings 键 imeSource，
+					// CLI 分支带校验；auto|fcitx5|builtin）。
+					.then(ClientCommands.literal("source")
+						.then(ClientCommands.argument("mode", StringArgumentType.word())
+							.executes(WaylandCraftCommand::imeSourceSet)
+						)
+					)
+					// 引擎清单（内置=拼音如实；fcitx5 档列出种子引擎）
+					.then(ClientCommands.literal("eng")
+						.executes(WaylandCraftCommand::imeEng)
+					)
 					// v0.14 嵌套 IM 守护进程三级子命令（裁决全在 Rust NestedIme）
 					.then(ClientCommands.literal("nested")
 						.then(ClientCommands.literal("status")
@@ -1084,6 +1095,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §emoveStep§7 = §e" + wlc.settingsManager.getDoubleSetting(WaylandCraftSettings.MOVE_STEP) + "§r  §8(double, 手动 Ctrl+方向键平移步长格)§r"));
 		// v0.14 嵌套输入法守护进程
 		source.sendFeedback(Component.literal(" §eimeNested§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.IME_NESTED) + "§r  §8(auto|on|off, 嵌套 WAYLAND_DISPLAY 上拉起独立 fcitx5/ibus；/wl ime nested status 看裁决)§r"));
+		source.sendFeedback(Component.literal(" §eimeSource§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.IME_SOURCE) + "§r  §8(auto|fcitx5|builtin, 内置拼音引擎来源档；/wl ime source <mode> 即时切档)§r"));
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
 		source.sendFeedback(Component.literal(" §7Use §e/wl settings set <key> <value>§7 to set§r"));
 		return 1;
@@ -1129,6 +1141,16 @@ public class WaylandCraftCommand {
 				}
 				// v0.14 嵌套输入法守护进程开关（settings 键 imeNested；/wl 用
 				// nestedIme 别名）。responder 会同步下发到 native；非法值拒绝。
+				case "imeSource", "imeSrc" -> {
+					String v = value == null ? "" : value.trim().toLowerCase();
+					if(!v.equals("auto") && !v.equals("fcitx5") && !v.equals("builtin")) {
+						source.sendError(Component.literal("§c✘ imeSource 只能是 auto|fcitx5|builtin（当前: " + value + "）§r"));
+						return 0;
+					}
+					wlc.settingsManager.setStringSetting(WaylandCraftSettings.IME_SOURCE, v);
+					source.sendFeedback(Component.literal("§a✔ §eimeSource§r = §e" + v + "§r  §8(fcitx5 在场优先 im2；判死/强制档语义见 /wl ime info)§r"));
+					return 1;
+				}
 				case "imeNested", "nestedIme" -> {
 					String v = value.toLowerCase();
 					if(!v.equals("auto") && !v.equals("on") && !v.equals("off")) {
@@ -2785,6 +2807,62 @@ public class WaylandCraftCommand {
 		// 候选 rect + 原始 ti3 光标矩形。native 行给"帧到哪了"，本行给"显示在哪"。
 		source.sendFeedback(Component.literal(" §7"
 				+ dev.evvie.waylandcraft.ime.ImeCandidateWorld.describe() + "§r"));
+		// 内置候选面板（结构化文本通道）Java 半程：形态/预编辑/候选/页码。
+		source.sendFeedback(Component.literal(" §7"
+				+ dev.evvie.waylandcraft.ime.ImeBuiltinPanel.describe() + "§r"));
+		return 1;
+	}
+
+	// ===== /wl ime source <auto|fcitx5|builtin> —— 内置/fcitx5 来源选择 =====
+
+	/**
+	 * CLI 分支带校验：仅接受三档；写 settings（持久化 + responder 即时下发
+	 * native）并回显 Rust 生效裁决（source/effective/内置简报）。持久化经
+	 * settingsManager，重启后仍生效。
+	 */
+	private static int imeSourceSet(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.bridge == null) {
+			source.sendError(Component.literal("§c✘ native bridge 不可用（平台不支持 / native 未加载）§r"));
+			return 0;
+		}
+		String mode = StringArgumentType.getString(context, "mode").trim().toLowerCase();
+		if(!mode.equals("auto") && !mode.equals("fcitx5") && !mode.equals("builtin")) {
+			source.sendError(Component.literal("§c✘ imeSource 只能是 auto|fcitx5|builtin（当前: " + mode + "）§r"));
+			return 0;
+		}
+		wlc.settingsManager.setStringSetting(WaylandCraftSettings.IME_SOURCE, mode);
+		String reply = wlc.bridge.imeSourceCommand(mode);
+		if(reply == null) {
+			source.sendError(Component.literal("§c✘ imeSourceCommand 无响应（旧 .so 缺符号）§r"));
+			return 0;
+		}
+		source.sendFeedback(Component.literal("§6▬▬▬ IME source §6▬▬▬"));
+		for(String line : reply.split("\n")) {
+			if(!line.isEmpty()) source.sendFeedback(Component.literal(" §7" + line + "§r"));
+		}
+		return 1;
+	}
+
+	// ===== /wl ime eng —— 引擎清单 =====
+
+	private static int imeEng(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.bridge == null) {
+			source.sendError(Component.literal("§c✘ native bridge 不可用（平台不支持 / native 未加载）§r"));
+			return 0;
+		}
+		String reply = wlc.bridge.imeEngList();
+		if(reply == null) {
+			source.sendError(Component.literal("§c✘ imeEngList 无响应（旧 .so 缺符号或 instance==0）§r"));
+			return 0;
+		}
+		source.sendFeedback(Component.literal("§6▬▬▬ IME engines §6▬▬▬"));
+		for(String line : reply.split("\n")) {
+			if(!line.isEmpty()) source.sendFeedback(Component.literal(" §7" + line + "§r"));
+		}
 		return 1;
 	}
 }

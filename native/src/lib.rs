@@ -150,8 +150,10 @@ impl WLCState {
         let seat = WLCSeatState::new();
         seat.create_globals(&disp);
 
-        let ime = ImeState::default();
+        let mut ime = ImeState::default();
         ime.create_globals(&disp);
+        // 内置拼音词库在 init 阶段解析（内嵌零拷贝，µs~ms 级）——不占游戏 tick。
+        ime.init_builtin_dict();
 
         let data = WLCDataState::new(&disp);
         data.create_global();
