@@ -60,52 +60,53 @@ public class ServerEventHandler {
 		LOGGER.info("Player {} disconnecting, cleaning up shared windows", playerUUID);
 		
 		SharedWindowManager manager = WaylandCraftCommon.instance.sharedWindowManager;
-		
+
 		// 清理玩家相关的窗口
 		manager.handlePlayerDisconnect(playerUUID);
-		
+
 		// 广播更新的窗口列表给所有剩余玩家
-		broadcastWindowListUpdate(server);
-		
+		// P1-7：改走 tick 合并广播（断线重连风暴下不再逐事件全服刷）
+		SharedWindowServerHandler.requestWindowListBroadcast();
+
 		LOGGER.info("Cleaned up shared windows for player {}", playerUUID);
 	}
 	
 	/**
 	 * 发送窗口列表给指定玩家
+	 *
+	 * 与 SharedWindowServerHandler.broadcastWindowListToAll 同步的两处修正：
+	 * - P1-1：canSend 过滤（旧客户端未注册列表 payload 时不白写）；
+	 * - NONE 权限窗口不发送（同列表广播的元数据泄露修复——原实现把全部窗口
+	 *   连同 NONE 一起发给新玩家，泄露 handle/title；JOIN 流程里
+	 *   grantViewToNewPlayer 先跑，合法窗口仍会出现在列表）。
 	 */
 	private static void sendWindowListToPlayer(ServerPlayer player) {
+		if (!net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.canSend(player, SharedWindowListPayload.TYPE)) {
+			return;
+		}
 		SharedWindowManager manager = WaylandCraftCommon.instance.sharedWindowManager;
-		
+
 		// 构建窗口列表
 		var windowList = new java.util.ArrayList<SharedWindowListPayload.WindowInfo>();
-		
+		UUID playerUUID = player.getUUID();
+
 		for(var entry : manager.getAllWindows()) {
+			var perm = entry.getPermission(playerUUID);
+			if (perm == dev.evvie.waylandcraft.shared.WindowPermission.NONE) {
+				continue;
+			}
 			windowList.add(new SharedWindowListPayload.WindowInfo(
 				entry.getWindowHandle(),
 				entry.getOwnerUUID(),
 				entry.getWindowTitle(),
-				entry.getPermission(player.getUUID())
+				perm
 			));
 		}
-		
+
 		// 发送给玩家
 		SharedWindowListPayload payload = new SharedWindowListPayload(windowList);
 		net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking.send(player, payload);
-		
-		LOGGER.debug("Sent window list to player {}: {} windows", player.getUUID(), windowList.size());
-	}
-	
-	/**
-	 * 广播窗口列表更新给所有玩家
-	 */
-	private static void broadcastWindowListUpdate(net.minecraft.server.MinecraftServer server) {
-		SharedWindowManager manager = WaylandCraftCommon.instance.sharedWindowManager;
-		
-		// 获取所有在线玩家
-		for(ServerPlayer player : server.getPlayerList().getPlayers()) {
-			sendWindowListToPlayer(player);
-		}
-		
-		LOGGER.debug("Broadcasted window list update to all players");
+
+		LOGGER.debug("Sent window list to player {}: {} windows", playerUUID, windowList.size());
 	}
 }
