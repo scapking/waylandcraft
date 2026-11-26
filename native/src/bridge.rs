@@ -108,10 +108,20 @@ pub fn audio_log_write(s: &str) {
 /// （eprintln 只进 stderr，不进 latest.log——诊断必须靠这个文件）。
 static IME_LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
 
+/// sync15 日志 IO 全局计数（relaxed 原子——DBus worker 线程与主循环都会
+/// 走 ime_log_write，只做报告不做判定）。
+/// - lines/bytes：实际写出的行与文件字节；
+/// - write_ops：向日志 fd 的 write 次数（当前实现 = 每行 1 次；Phase C
+///   缓冲化后此数应大幅低于 lines——修复前后对比的核心读数）；
+/// - suppressed_repeats：相邻重复行合并抑制次数（Phase C 起 >0）。
+pub(crate) static IME_LOG_IO: crate::ime::metrics::LogIoCounters =
+    crate::ime::metrics::LogIoCounters::new();
+
 /// 追加一行到 IME_LOG_FILE（若已设置），失败静默忽略。同时写 stderr。
 pub fn ime_log_write(s: &str) {
-    eprintln!("{s}");
     use std::io::Write;
+    eprintln!("{s}");
+    IME_LOG_IO.add_line(s.len() as u64 + 1);
     let mut guard = match IME_LOG_FILE.lock() {
         Ok(g) => g,
         Err(_) => return,
@@ -119,7 +129,16 @@ pub fn ime_log_write(s: &str) {
     if let Some(f) = guard.as_mut() {
         let _ = writeln!(f, "{} {s}", log_timestamp());
         let _ = f.flush();
+        IME_LOG_IO.add_write_op();
     }
+}
+
+/// 测试/基准专用：把 File 装进 IME_LOG_FILE（等价 setImeLogFile 的 JNI
+/// 路径，但免 JNIEnv）。真机 bench 用它开启文件 IO 以获得 write_ops/bytes
+/// 的真实基线（无文件时 write_ops 恒 0，只有 stderr）。
+#[cfg(test)]
+pub(crate) fn set_ime_log_file_for_test(f: std::fs::File) {
+    let _ = IME_LOG_FILE.lock().map(|mut g| *g = Some(f));
 }
 
 #[allow(clippy::vec_box)]
@@ -1628,6 +1647,11 @@ fn keyboard_input<'local>(
     let action = KeyboardAction::from_i32(action)
         .ok_or(BridgeError::UnknownKeyboardState(action))?;
 
+    // sync15 仪表：keyboard_input 全程（JNI 入口→返回，含路由分发与
+    // host 同步等待）。"输入法特别卡"（sync14 用户实测）的第一手读数——
+    // 若 p95 远大于单帧预算，说明渲染线程在按键链路里被同步等待拖住。
+    let t_total = std::time::Instant::now();
+
     // 1) v0.14 嵌套 IM 主路径：输入法 grab 在场（嵌套 daemon 已激活键盘）
     //    → 按键**只**发给 IME。引擎对按键的命运自行裁决：
     //      消费 → im2 preedit/commit 经 relay 推给应用 ti3；
@@ -1638,6 +1662,9 @@ fn keyboard_input<'local>(
         .state
         .ime
         .handle_key(scancode as u32, action, mods);
+    if handled {
+        instance.state.ime.metrics.route_im2_grab += 1;
+    }
 
     // 2) ⑧ 协议正确的按键路由（修复实测"输入法不可用"根因）：
     //    旧 C 方案 fire-and-forget 吞键——宿主引擎未激活时 ProcessKeyEvent 返回
@@ -1657,10 +1684,18 @@ fn keyboard_input<'local>(
         use crate::seat::KeyboardAction as KA;
         let keycode = scancode as u32;
         let nested_live = instance.state.ime.nested_route_live();
+        // sync15 仪表：daemon Starting 期（fcitx5 spawn 后、im2 bind/grab
+        // 就绪前——含 libpinyin 词典加载 4-5s）到达的按键计数。这些键
+        // 必然落在 raw/host 回退路径；计数 + key_input 直方图共同回答
+        // "词典加载期打字是否卡、卡在哪条路"。
+        if matches!(instance.state.ime.nested.phase(), crate::ime::NestedPhase::Starting) {
+            instance.state.ime.metrics.keys_during_starting += 1;
+        }
         let mut key_result: Option<crate::host_bridge::KeyResult> = None;
         if !nested_live {
             if let Some(hb) = &mut instance.host_bridge {
                 if hb.is_ready() {
+                    instance.state.ime.metrics.route_host_submitted += 1;
                     // v0.10.2：xkb 解码 keysym（ibus/fcitx keyval，不是 evdev）
                     let keysym = instance
                         .state
@@ -1677,9 +1712,23 @@ fn keyboard_input<'local>(
                         action,
                         mods,
                     };
+                    // sync15 仪表：submit_key_sync 在渲染线程上的实际等待
+                    // （150ms 上限）。用户日志里桥不可用（portal no owner
+                    // → is_ready false）时这条路根本不走，count=0 即可
+                    // 排除"渲染线程被 dbus 等待卡住"假说；若 count>0 且
+                    // p95 接近 150ms，就是真同步瓶颈，修排队不修语义。
+                    let t_submit = std::time::Instant::now();
                     key_result = Some(hb.submit_key_sync(&crate::ime::DownEvent::Key(ke)));
+                    instance.state.ime.metrics.submit_sync_wait.record(t_submit.elapsed());
                 }
             }
+        } else {
+            // nested 主路径在线但 grab 不在场 = 引擎不接管本键，raw 直通。
+            instance.state.ime.metrics.route_raw_nested += 1;
+        }
+        if !nested_live && !matches!(key_result, Some(_)) {
+            // 无就绪桥的 raw 兜底（⑧ 原始回退路径）。
+            instance.state.ime.metrics.route_raw_no_bridge += 1;
         }
         // None=没有就绪桥（⑧ 原始回退：纯 raw）；Unavailable=超时/通道断按未消费处理；
         // nested_live=true 时 key_result 恒 None——grab 缺席即引擎不接管，raw 直通。
@@ -1703,6 +1752,7 @@ fn keyboard_input<'local>(
             handled = true;
         }
     }
+    instance.state.ime.metrics.key_input.record(t_total.elapsed());
     Ok(())
 }
 
@@ -2042,11 +2092,21 @@ fn ime_popup_frame<'local>(
     let instance = jptr_to_instance!(instance, "imePopupFrame")?;
     // 可见性门已不依赖 seat.kb_active（窗口捕获信号，聊天打字恒 false——
     // sync11 根因）；快照只跟 IME 会话激活 + 内容，输入框聚焦由 Java hasBox 把守。
+    // sync15 仪表：有交付路径的全程（快照构造 + 编码 + JNI byte[]）。
+    // popup_delivered_bytes 直接量化"候选帧全量复制"的流量（~64KB/次；
+    // 同帧重复交付修复后：deliveries 增速与字节增速应同步骤降）。
+    let t_delivery = std::time::Instant::now();
     let Some(snap) = instance.state.ime.take_popup_snapshot() else {
         return Ok(JPrimitiveArray::null());
     };
     let data = encode_popup_snapshot(&snap);
-    Ok(env.byte_array_from_slice(&data)?)
+    let arr = env.byte_array_from_slice(&data)?;
+    {
+        let ime = &mut instance.state.ime;
+        ime.metrics.popup_delivery.record(t_delivery.elapsed());
+        ime.metrics.popup_delivered_bytes += data.len() as u64;
+    }
+    Ok(arr)
 }
 
 /// imePopupWorkState(instance) —— 中文引擎工作态（状态透明度角标用）。
