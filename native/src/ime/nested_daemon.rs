@@ -22,10 +22,14 @@
 //!
 //! - **环境**：`WAYLAND_DISPLAY`=我们的 socket、`HOME`/`XDG_CONFIG_HOME`/
 //!   `XDG_DATA_HOME`/`XDG_CACHE_HOME`=gameDir 下的隔离目录、
-//!   `XDG_RUNTIME_DIR` 沿用宿主（合成器 socket 文件在那），**删除**
-//!   `DBUS_SESSION_BUS_ADDRESS`/`DISPLAY`（不抢宿主 session bus、不开 X）。
-//! - **参数**：fcitx5 用 `-D --disable=dbus`（前台、禁 dbus addon——避免
-//!   org.fcitx.Fcitx5 名字与宿主实例冲突）；ibus-daemon 用独立
+//!   `XDG_RUNTIME_DIR` 沿用宿主（合成器 socket 文件在那）、
+//!   `DBUS_SESSION_BUS_ADDRESS`=**指向隔离目录内不存在的 socket**（v1.4.3：
+//!   旧法"删除该 env"被实证无效——libdbus 会回退 `$XDG_RUNTIME_DIR/bus`
+//!   连上宿主总线，ibusfrontend 随即顶掉宿主 ibus，桌面输入法被劫持成
+//!   直通；必须用"显式假地址"封死回退）、删除 `DISPLAY`/`XAUTHORITY`。
+//! - **参数**：fcitx5 用 `-D --disable=<全部 dbus 前端 addon>`（前台；
+//!   `dbus` 只是客户端集成，前端 `dbusfrontend`/`ibusfrontend` 等各自独立，
+//!   见 [`FCITX5_ARGS`] 事故注释）；ibus-daemon 用独立
 //!   `--address=unix:path=…` 且禁 panel/config/emoji 子进程。
 //! - **绝不传 `--replace`/`-r`**：那会踢掉用户的宿主输入法实例（单元测试
 //!   `spawn_plan_never_replaces` 把这条纪律写死在断言里）。
@@ -114,19 +118,29 @@ impl DaemonKind {
 
 // ── 常量（daemon 参数与节流；改这里前读模块头注释的隔离纪律）──
 
-/// fcitx5：前台 + 禁 dbus addon。
+/// fcitx5：前台 + **禁一切 dbus 面 addon**（客户端集成 + 全部总线前端）。
 /// 实测结论（2026-11-25，ime/tests_real.rs 三组对照，fcitx5 5.1.12）：
-/// - pinyin / pinyinhelper addon 在 `--disable=dbus` 下正常加载并出
-///   preedit/commit（libpinyin 直链，不需要 org.fcitx.Fcitx.AddonPinyinHelper
-///   dbus 服务；`seed` 实验组全绿）。sync6 实机"每键未消费"的根因不在
-///   dbus，而在隔离 HOME 缺少 `[Behavior] ActiveByDefault=True` 种子
-///   （见 [`seed_fcitx5_home`]），与 `--disable=dbus` 无关。
-/// - 保留 `--disable=dbus` 的理由：连私有总线也不如彻底不连隔离强
-///   （宿主 `org.fcitx.Fcitx5` 名字冲突面归零，且少管一个 dbus-daemon
-///   进程）。`real_fcitx5_private_dbus` 对照实验证明保留 dbus addon +
-///   私有 session 总线行为一致——若将来需要 fcitx5-configtool 对话式
-///   管理嵌套实例，切到该形态即可（构造方式见测试）。
-pub const FCITX5_ARGS: &[&str] = &["-D", "--disable=dbus"];
+/// - pinyin / pinyinhelper addon 在禁 dbus 下正常加载并出 preedit/commit
+///   （libpinyin 直链，不走 dbus；sync6 "每键未消费"根因是缺
+///   ActiveByDefault 种子，与 dbus 无关）。
+/// - **v1.4.3 事故反读（用户："每次启动 MC 都干扰原生输入法，只剩直通"）**：
+///   旧值只禁 `dbus`（客户端集成 addon），但 **`dbusfrontend`/`ibusfrontend`
+///   是独立 addon**——嵌套实例经 systemd libdbus 的 `XDG_RUNTIME_DIR/bus`
+///   回退（我们删除 DBUS_SESSION_BUS_ADDRESS 但合成器 socket 要求保留宿主
+///   XDG_RUNTIME_DIR，回退必然命中）连上宿主总线后，`ibusfrontend` 按设计
+///   **接管 `org.freedesktop.IBus` 并顶掉宿主 ibus-daemon**——桌面全部
+///   IBus 客户端从此打到隔离实例（候选 UI 在 MC 合成器内、默认英文直通、
+///   托盘不可见）。"禁 dbus addon = 名字冲突面归零"是错误的安全感。
+/// - 修复=三层：①本列表禁掉全部总线前端；②spawn 环境把
+///   `DBUS_SESSION_BUS_ADDRESS` **显式指向不存在的私有 socket**（见
+///   build_spawn_plan——env 缺失≠总线不可达，必须用"有值但连不上"封回退）；
+///   ③真机回归测试断言 spawn 前后宿主总线名字归属不变。
+/// - 若将来需要 fcitx5-configtool 对话管理嵌套实例，用
+///   `real_fcitx5_private_dbus` 的私有总线形态（行为一致性已有对照实验）。
+pub const FCITX5_ARGS: &[&str] = &[
+    "-D",
+    "--disable=dbus,dbusfrontend,ibusfrontend,fcitx4frontend,xim,kimpanel,notificationitem,notifications",
+];
 
 /// fcitx5 全局配置种子（修复根因的核心）。
 ///
@@ -1335,12 +1349,23 @@ pub fn build_spawn_plan(kind: DaemonKind, socket: &OsStr, home: &Path) -> SpawnP
     if let Some(rd) = std::env::var_os("XDG_RUNTIME_DIR") {
         env_set.push(("XDG_RUNTIME_DIR".to_string(), rd.to_string_lossy().into_owned()));
     }
+    // v1.4.3 总线封死（用户实测"启动 MC 干扰原生输入法"根因层）：
+    // **删除 env ≠ 总线不可达**——systemd 版 libdbus/sd-bus 在 env 缺失时
+    // 回退 `unix:path=$XDG_RUNTIME_DIR/bus`，而 XDG_RUNTIME_DIR 必须保留宿主
+    // 值（daemon 靠它找到我们的 wayland socket）。因此把 session bus 地址
+    // **显式指向一个不存在的私有 socket**：env 有值即优先于回退，daemon 内
+    // 任何试图触达总线的组件（含 --disable 名单之外的新 addon）必然连接失败。
+    // im2/virtual_keyboard/classicui 全走 wayland 层，不受影响（真机回归锁定）。
+    env_set.push((
+        "DBUS_SESSION_BUS_ADDRESS".to_string(),
+        format!("unix:path={}", home.join("no-session-bus").display()),
+    ));
     SpawnPlan {
         program: kind.binary(),
         args,
         env_set,
-        // 隔离纪律核心：绝不连宿主 session bus、绝不开 X。
-        env_unset: vec!["DBUS_SESSION_BUS_ADDRESS", "DISPLAY", "XAUTHORITY"],
+        // 隔离纪律核心：绝不连宿主 session bus（显式假地址封回退）、绝不开 X。
+        env_unset: vec!["DISPLAY", "XAUTHORITY"],
         log_file: home.join(log_name),
         pidfile: home.join(format!("{}.pid", kind.binary())),
     }
@@ -1480,7 +1505,6 @@ mod tests {
             want("XDG_CONFIG_HOME").as_deref(),
             Some("/tmp/wlc-test-ime-nested/config")
         );
-        assert!(plan.env_unset.contains(&"DBUS_SESSION_BUS_ADDRESS"));
         assert!(plan.env_unset.contains(&"DISPLAY"));
         // 绝不 --replace/-r 顶掉宿主实例：
         assert!(
@@ -1488,7 +1512,31 @@ mod tests {
             "spawn plan 出现 --replace/-r: {:?}",
             plan.args
         );
-        assert!(plan.args.iter().any(|a| a == "--disable=dbus"));
+        // v1.4.3 红线（"启动 MC 干扰原生输入法"事故）：总线隔离必须是
+        // "显式假地址"而不是"删除 env"——libdbus 缺 env 时回退
+        // $XDG_RUNTIME_DIR/bus（宿主），删除等于没删。
+        let dbus_addr = want("DBUS_SESSION_BUS_ADDRESS");
+        assert!(
+            dbus_addr.as_deref() == Some("unix:path=/tmp/wlc-test-ime-nested/no-session-bus"),
+            "DBUS_SESSION_BUS_ADDRESS 必须显式指向不存在的私有 socket，实际: {dbus_addr:?}"
+        );
+        assert!(
+            !plan.env_unset.contains(&"DBUS_SESSION_BUS_ADDRESS"),
+            "假地址写在 env_set，不能再被 env_unset 抹掉（spawn_daemon 先 set 后 remove）"
+        );
+        // 全部总线前端 addon 必须禁掉（只禁 dbus 不够：ibusfrontend 会
+        // 顶替宿主 org.freedesktop.IBus）。
+        let disable = plan
+            .args
+            .iter()
+            .find_map(|a| a.strip_prefix("--disable="))
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .collect::<Vec<_>>();
+        for frontend in ["dbus", "dbusfrontend", "ibusfrontend", "fcitx4frontend", "xim"] {
+            assert!(disable.contains(&frontend), "--disable 缺少总线前端 {frontend}: {disable:?}");
+        }
         assert_eq!(plan.pidfile, fake_home().join("fcitx5.pid"));
     }
 

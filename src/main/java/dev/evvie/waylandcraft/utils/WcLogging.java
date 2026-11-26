@@ -40,6 +40,17 @@ public final class WcLogging {
 	/** 系统属性覆盖档（null=未设置，走 settings）。类加载时读一次。 */
 	private static final Boolean OVERRIDE = readOverride();
 
+	/**
+	 * 「首次按键里程碑行已写」标志（非 verbose 档下保留一条 mixin 注入生效证据，
+	 * 之后逐键静默）。必须放这里而不是 mixin 包内伴生类：fabric-loader 把
+	 * mixins.json 声明的 packages 整包设成保留域，未声明的类被普通类加载器
+	 * 引用会抛 IllegalClassLoadError——1.4.2 的 KbFirstPressHolder 就死在这，
+	 * 每次按键在 KeyboardHandler.keyPress 里抛异常，游戏键盘全废
+	 * （见 MixinPackageHygieneTest 红线）。
+	 */
+	public static final java.util.concurrent.atomic.AtomicBoolean FIRST_KEY_PRESS_LOGGED =
+		new java.util.concurrent.atomic.AtomicBoolean(false);
+
 	private static volatile boolean verbose = effective(OVERRIDE, defaultVerbose());
 
 	private WcLogging() {}

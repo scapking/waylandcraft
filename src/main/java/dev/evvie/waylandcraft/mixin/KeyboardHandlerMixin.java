@@ -57,7 +57,7 @@ public class KeyboardHandlerMixin {
 				Minecraft.getInstance().level != null ? "in" : "none",
 				Minecraft.getInstance().screen != null ? Minecraft.getInstance().screen.getClass().getSimpleName() : "none",
 				WaylandCraft.instance.keyboardCaptureMode);
-		} else if(KbFirstPressHolder.LOGGED.compareAndSet(false, true)) {
+		} else if(dev.evvie.waylandcraft.utils.WcLogging.FIRST_KEY_PRESS_LOGGED.compareAndSet(false, true)) {
 			WaylandCraftCommon.LOGGER.info("[kb-debug] mixin injected OK (first key: key={} scancode={}) — 后续逐键行仅在 verboseLogging=true 时输出",
 				event.key(), scancode);
 		}
@@ -81,16 +81,4 @@ public class KeyboardHandlerMixin {
 		}
 	}
 	
-}
-
-/**
- * mixin 类只能往目标类加方法、不能加字段（fabric-mixin AP 会直接拒绝编译）——
- * "首次按键"里程碑标志放这个伴生类里，全 JVM 一次，用于发布档下保留一条
- * "注入已生效"的证据行而不逐键刷屏。
- */
-final class KbFirstPressHolder {
-	static final java.util.concurrent.atomic.AtomicBoolean LOGGED =
-		new java.util.concurrent.atomic.AtomicBoolean(false);
-	
-	private KbFirstPressHolder() {}
 }

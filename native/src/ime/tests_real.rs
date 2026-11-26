@@ -513,6 +513,33 @@ fn real_fcitx5_seed_config_active_by_default() {
     );
 }
 
+/// 宿主用户总线上输入法名字的归属快照（"pid 列 + 进程名列"），供
+/// real_fcitx5_production_spawn_path 做 spawn 前后对比。busctl 不存在、
+/// 无用户总线、或调用失败 → None（环境不支持该断言，静默跳过）。
+fn host_ime_bus_owners() -> Option<String> {
+    let out = std::process::Command::new("busctl")
+        .args(["--user", "list", "--no-legend"])
+        .env("XDG_RUNTIME_DIR", std::env::var_os("XDG_RUNTIME_DIR")?)
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let owned: Vec<String> = text
+        .lines()
+        .filter(|l| {
+            let first = l.split_whitespace().next().unwrap_or_default();
+            first == "org.freedesktop.IBus"
+                || first == "org.freedesktop.IBus.Panel"
+                || first == "org.fcitx.Fcitx5"
+        })
+        .map(|l| l.split_whitespace().skip(1).take(2).collect::<Vec<_>>().join("/"))
+        .collect();
+    Some(owned.join(","))
+}
+
 /// 生产路径端到端：完全走 `ImeState::nested_tick`（decide 状态机 →
 /// seed_fcitx5_home 种子 → build_spawn_plan（FCITX5_ARGS + 隔离 env）→
 /// spawn_daemon 双 fork + pidfile）→ 真 fcitx5 bind → grab → 拼音 →
@@ -574,6 +601,12 @@ fn real_fcitx5_production_spawn_path() {
 
     // 1) 驱动 nested_tick 直到 daemon bind im2（tick 内含 decide/spawn/
     //    seed；Active 由后续 tick 依 im2_bound 判定）。
+    // v1.4.3 宿主总线劫持红线：spawn 前后 org.freedesktop.IBus /
+    // org.fcitx.Fcitx5 的名字归属必须完全一致——嵌套 daemon 若经
+    // XDG_RUNTIME_DIR 回退摸到宿主总线，ibusfrontend 会顶掉宿主 ibus
+    // （用户症状："每次启动 MC 原生输入法只剩直通，要自己重设"）。
+    // 无 busctl / 无用户总线环境（CI）返回 None，跳过本断言。
+    let bus_before = host_ime_bus_owners();
     let mut bound = false;
     let t0 = Instant::now();
     while t0.elapsed() < Duration::from_secs(90) {
@@ -594,6 +627,13 @@ fn real_fcitx5_production_spawn_path() {
         .ime
         .nested_tick(Instant::now(), std::ffi::OsStr::new(&socket_name));
     let phase_after_bind = format!("{:?}", harness.server.ime.nested.phase());
+    if let Some(before) = &bus_before {
+        let after = host_ime_bus_owners().unwrap_or_default();
+        assert_eq!(
+            before, &after,
+            "嵌套 daemon（生产 spawn plan）运行期间宿主输入法总线名字归属发生变化——隔离被击穿"
+        );
+    }
     let seed_profile_ok = home.join("config/fcitx5/profile").exists();
     let seed_config_ok = home.join("config/fcitx5/config").is_file();
 
