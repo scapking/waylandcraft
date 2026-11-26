@@ -224,6 +224,12 @@ public class SharedWindowClientHandler {
 				handlePermissionUpdate(payload);
 			});
 		});
+
+		// ACL-2：owner 收到新观众邀请请求——聊天行 + 可点击命令（最小可靠形态，
+		// 不新增 GUI；点击即发出 /wl share invite accept/deny …）。
+		ClientPlayNetworking.registerGlobalReceiver(ShareInviteRequestPayload.TYPE, (payload, ctx) -> {
+			ctx.client().execute(() -> handleInviteRequest(payload));
+		});
 		
 		// 处理权限命令响应
 		ClientPlayNetworking.registerGlobalReceiver(PermissionResponsePayload.TYPE, (payload, ctx) -> {
@@ -389,19 +395,122 @@ public class SharedWindowClientHandler {
 	}
 	
 	/**
-	 * 处理权限更新
+	 * 处理权限更新。
+	 * ACL-4：收到 NONE（revoke/到期/注销/owner 退出/同 handle 重建）时立即
+	 * 销毁该窗口的显示与音频并对齐 removeWindow 清理路径——不能等下一次
+	 * 列表合并广播才停（那一拍里旧画面还在渲染、音频还在放）。
 	 */
 	private static void handlePermissionUpdate(SharedWindowPermissionPayload payload) {
 		WindowInfo info = remoteWindows.get(payload.windowHandle());
 		if(info == null) {
 			return;
 		}
-		
+
 		// 更新权限
 		info.setPermission(payload.permission());
-		
+
 		LOGGER.info("Permission updated for window 0x{}: {}",
 			Long.toHexString(payload.windowHandle()), payload.permission());
+
+		if(payload.permission() == WindowPermission.NONE) {
+			dismantleWindow(payload.windowHandle());
+		}
+	}
+
+	/**
+	 * ACL-4：立即销毁某窗口的观众侧存在：纹理/解码队列/playout 流/暂存音频/
+	 * 世界内显示。必须客户端线程调用（GL 资源约束，同 handleWindowListUpdate）。
+	 */
+	private static void dismantleWindow(long windowHandle) {
+		remoteWindows.remove(windowHandle);
+		WaylandCraft instance = WaylandCraft.instance;
+		if(instance != null) {
+			if(instance.remoteWindowRenderer != null) {
+				instance.remoteWindowRenderer.destroyTexture(windowHandle);
+				instance.remoteWindowRenderer.removeWindow(windowHandle);
+			}
+			if(instance.audioPlaybackManager != null) {
+				instance.audioPlaybackManager.close(windowHandle);
+			}
+			instance.sharedDisplays.removeIf(d -> d.getWindowHandle() == windowHandle);
+		}
+		pendingAudio.remove(windowHandle);
+		LOGGER.info("Window 0x{} dismantled locally (permission removed)", Long.toHexString(windowHandle));
+	}
+
+	// ===== ACL-2：邀请提示（owner 侧） =====
+
+	/** owner 侧挂起邀请：requester 小写名 → 记录。TTL 10 分钟，容量封顶防服务端刷包。 */
+	private record PendingInvite(long windowHandle, UUID requesterUUID, long receivedMs) {}
+	private static final Map<String, PendingInvite> pendingInvites = new ConcurrentHashMap<>();
+	private static final long PENDING_INVITE_TTL_MS = 600_000;
+	private static final int PENDING_INVITE_MAX = 64;
+
+	/**
+	 * 处理服务端转来的邀请请求：聊天一行 + 三个可点击按钮
+	 * （允许10m / 始终允许 / 拒绝）。点击即运行 /wl share invite 子命令。
+	 * 旧服务端不会发到这里（payload 未注册），新服务端对旧 owner 客户端
+	 * 会跳过发送（fail-closed，观众保持无权限）。
+	 */
+	private static void handleInviteRequest(ShareInviteRequestPayload payload) {
+		long now = System.currentTimeMillis();
+		pendingInvites.entrySet().removeIf(e -> now - e.getValue().receivedMs() > PENDING_INVITE_TTL_MS);
+		if(pendingInvites.size() >= PENDING_INVITE_MAX) {
+			LOGGER.warn("[invite] pending invite map full ({}), dropping prompt for {}",
+				PENDING_INVITE_MAX, payload.requesterName());
+			return;
+		}
+		pendingInvites.put(payload.requesterName().toLowerCase(),
+			new PendingInvite(payload.windowHandle(), payload.requesterUUID(), now));
+
+		var mc = net.minecraft.client.Minecraft.getInstance();
+		if(mc.player == null) return;
+		String h = "0x" + Long.toHexString(payload.windowHandle());
+		String p = payload.requesterName();
+
+		var line = net.minecraft.network.chat.Component.literal(
+			"[WaylandCraft] " + p + " 请求查看你的窗口 " + h);
+		var accept = net.minecraft.network.chat.Component.literal(" [允许10m]").withStyle(s ->
+			s.withClickEvent(new net.minecraft.network.chat.ClickEvent.RunCommand("/wl share invite accept " + h + " " + p + " 10m")));
+		var always = net.minecraft.network.chat.Component.literal(" [始终允许]").withStyle(s ->
+			s.withClickEvent(new net.minecraft.network.chat.ClickEvent.RunCommand("/wl share invite accept " + h + " " + p)));
+		var deny = net.minecraft.network.chat.Component.literal(" [拒绝]").withStyle(s ->
+			s.withClickEvent(new net.minecraft.network.chat.ClickEvent.RunCommand("/wl share invite deny " + h + " " + p)));
+		mc.player.sendSystemMessage(line.append(accept).append(always).append(deny));
+	}
+
+	/**
+	 * 解析邀请应答目标：从挂起邀请表取 (handle, requesterUUID)；
+	 * 找不到（过期/重启）返回 null，命令层回错误提示。
+	 */
+	static ShareInviteResponsePayload buildInviteResponse(long windowHandle, String requesterName,
+			byte decision, byte permissionLevel, long durationSeconds, long nowMs) {
+		PendingInvite inv = pendingInvites.get(requesterName.toLowerCase());
+		if(inv == null || inv.windowHandle() != windowHandle) return null;
+		if(nowMs - inv.receivedMs() > PENDING_INVITE_TTL_MS) return null;
+		return new ShareInviteResponsePayload(windowHandle, inv.requesterUUID(), decision, permissionLevel, durationSeconds);
+	}
+
+	/** 发送邀请应答并移除挂起记录（一次性，防重复点击刷授权）。 */
+	public static boolean sendInviteResponse(long windowHandle, String requesterName,
+			byte decision, long durationSeconds) {
+		ShareInviteResponsePayload payload = buildInviteResponse(windowHandle, requesterName,
+			decision, (byte) WindowPermission.VIEW.getLevel(), durationSeconds, System.currentTimeMillis());
+		if(payload == null) return false;
+		if(net.minecraft.client.Minecraft.getInstance().getConnection() == null) return false;
+		ClientPlayNetworking.send(payload);
+		pendingInvites.remove(requesterName.toLowerCase());
+		return true;
+	}
+
+	/** 测试接缝：注入一条挂起邀请 */
+	static void putPendingInviteForTest(String name, long windowHandle, UUID requester, long receivedMs) {
+		pendingInvites.put(name.toLowerCase(), new PendingInvite(windowHandle, requester, receivedMs));
+	}
+
+	/** 测试接缝：清空挂起邀请 */
+	static void resetPendingInvitesForTest() {
+		pendingInvites.clear();
 	}
 	
 	/**
@@ -486,13 +595,20 @@ public class SharedWindowClientHandler {
 	}
 	
 	/**
-	 * 发送窗口所有者授权管理命令（grant / revoke / list）
+	 * 发送窗口所有者授权管理命令（grant / revoke / list / acl）
 	 */
 	public static void sendWindowPermCommand(long windowHandle, byte action, String targetName) {
-		SharedWindowPermCommandPayload payload = new SharedWindowPermCommandPayload(windowHandle, action, targetName);
+		sendWindowPermCommand(windowHandle, action, targetName, WindowPermission.VIEW, 0);
+	}
+
+	/** ACL-1：带等级与时长的授权命令（durationSeconds=0 → 永久） */
+	public static void sendWindowPermCommand(long windowHandle, byte action, String targetName,
+			WindowPermission level, long durationSeconds) {
+		SharedWindowPermCommandPayload payload = new SharedWindowPermCommandPayload(
+			windowHandle, action, targetName, (byte) level.getLevel(), durationSeconds);
 		ClientPlayNetworking.send(payload);
-		LOGGER.info("Sent window perm command: action={} target={} window=0x{}",
-			action, targetName, Long.toHexString(windowHandle));
+		LOGGER.info("Sent window perm command: action={} target={} level={} durS={} window=0x{}",
+			action, targetName, level, durationSeconds, Long.toHexString(windowHandle));
 	}
 
 	/**
