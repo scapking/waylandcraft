@@ -260,7 +260,12 @@ impl XdgShellHandler for WLCState {
             state.geometry = positioner.get_geometry();
             state.positioner = positioner;
         });
-        surface.send_configure().expect("popup initial configure");
+        // P1-3: 失败只记日志，不在 handler 路径 panic——该调用链运行在 Java 线程
+        // （update→dispatch）上，panic 即便被 JNI 包装层兜成 Java 异常，也会打断
+        // 本帧全部 wayland 事件处理，弹窗 configure 仍然丢，且其他调用方未必有兜底。
+        if let Err(e) = surface.send_configure() {
+            eprintln!("[waylandcraft] popup initial configure failed: {e}");
+        }
     }
 
     fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
@@ -488,8 +493,16 @@ impl<'a> WaylandCraft<'a> {
 
         let state = &mut self.state;
         let event_loop = &mut self.event_loop;
-        event_loop.dispatch(Some(Duration::ZERO), state).unwrap();
-        state.display_handle.flush_clients().unwrap();
+        // P1-3: dispatch/flush 的 IO 错误（客户端暴毙、EAGAIN 等）是 wayland 异步模型
+        // 下的合法事件，旧实现 unwrap panic 直接炸掉本 tick（依赖 JNI 包装层兜底才不 abort）。
+        // 改为记错误日志并跳过本帧——下一帧 dispatch 会自然感知断连。
+        if let Err(e) = event_loop.dispatch(Some(Duration::ZERO), state) {
+            eprintln!("[waylandcraft] event loop dispatch error (frame skipped): {e}");
+            crate::status::note_error("error", &format!("[dispatch] {e}"));
+        }
+        if let Err(e) = state.display_handle.flush_clients() {
+            eprintln!("[waylandcraft] flush_clients error: {e}");
+        }
 
         // dispatch 后把 host_bridge 取回 self.host_bridge（避免下一帧重复 take）
         self.host_bridge = state.host_bridge.take();

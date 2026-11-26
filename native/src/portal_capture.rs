@@ -262,8 +262,13 @@ fn pw_stream_loop(node_id: u32, frame_data: Arc<Mutex<Option<FrameData>>>) -> Re
                 if media_type == pw::spa::param::format::MediaType::Video
                     && media_subtype == pw::spa::param::format::MediaSubtype::Raw
                 {
-                    user_data.parse(param).expect("parse video format");
-                    eprintln!("[portal] Video: {}x{}", user_data.size().width, user_data.size().height);
+                    // P1-3：pw-stream 线程上的 panic 会让捕获线程静默死亡
+                    //（Java 侧以为还在录屏）——格式解析失败只记日志跳过。
+                    if let Err(e) = user_data.parse(param) {
+                        eprintln!("[portal] parse video format failed: {}", e);
+                    } else {
+                        eprintln!("[portal] Video: {}x{}", user_data.size().width, user_data.size().height);
+                    }
                 }
             }
         })
@@ -281,12 +286,14 @@ fn pw_stream_loop(node_id: u32, frame_data: Arc<Mutex<Option<FrameData>>>) -> Re
                             let fmt = user_data.format();
                             let src = &slice[..size.min(slice.len())];
                             let data = convert_to_rgba(src, fmt);
-                            let mut frame = frame_ref.lock().unwrap();
-                            *frame = Some(FrameData {
-                                data,
-                                width: w,
-                                height: h,
-                            });
+                            // P1-3：锁中毒（其他持有者 panic）时跳过本帧而不是连锁 panic
+                            if let Ok(mut frame) = frame_ref.lock() {
+                                *frame = Some(FrameData {
+                                    data,
+                                    width: w,
+                                    height: h,
+                                });
+                            }
                         }
                     }
                 }

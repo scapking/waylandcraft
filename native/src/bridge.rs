@@ -762,6 +762,8 @@ fn send_frame<'local>(
 }
 
 // Get or insert an element and return its handle
+// P1-3: 表内缺失不再 unwrap panic（JNI 边界 panic 依赖包装层兜底，能不做就不做）——
+// 返回 0，调用方 jptr_to_ref/`*` 判空路径会转成明确的 BridgeError（Java 异常）。
 fn insert_get_handle<T>(vec: &mut Vec<Box<T>>, elem: &T) -> jlong
 where
     T: Clone + PartialEq,
@@ -770,18 +772,22 @@ where
         vec.push(Box::new(elem.clone()));
     }
 
-    let ptr: &mut T = vec.iter_mut().find(|r| ***r == *elem).unwrap();
-    ((ptr as *mut T) as usize) as jlong
+    match vec.iter_mut().find(|r| ***r == *elem) {
+        Some(ptr) => ((ptr.as_mut() as *mut T) as usize) as jlong,
+        None => 0,
+    }
 }
 
 // Get an element and return its handle
-// Element has to be in the list, otherwise this functions panics
+// P1-3: 元素不在表中（并发删除竞态下的合法情形）返回 0 句柄而不是 panic，
+// 由上层转成 Java 异常；行为对调用方可区分（0 == 不存在）。
 fn get_handle<T>(vec: &[Box<T>], elem: &T) -> jlong
 where
     T: Clone + PartialEq,
 {
-    let ptr: &T = vec.iter().find(|r| ***r == *elem).unwrap();
-    ((ptr as *const T) as usize) as jlong
+    vec.iter()
+        .find(|r| ***r == *elem)
+        .map_or(0, |r| (r.as_ref() as *const T) as usize as jlong)
 }
 
 // Insert all elements that aren't in the list already
@@ -807,13 +813,14 @@ where
 }
 
 // Remove element from list and free it
-fn remove_element<T>(vec: &mut Vec<Box<T>>, handle: jlong)
-where
-    T: Clone + PartialEq,
-{
-    let ptr: *mut T = (handle as usize) as *mut T;
-    let elem: &mut T = unsafe { &mut *ptr };
-    vec.retain(|e| **e != *elem);
+// P1-3: 旧实现**解引用** Java 传来的 handle——陈旧句柄（元素已被之前的调用释放、
+// 或 Java 侧传错/传 0）就是 use-after-free UB：不是 panic，catch_unwind 救不了，
+// 可能静默读到已释放内存并把野值当 PartialEq 比较。改为直接比较 Box 的指针地址：
+// 这些资源类型（WlSurface/ToplevelSurface/...）的 PartialEq 是同一性比较，
+// "与 *elem 不等价于地址不匹配"在语义上一致；地址不在表内 = 无操作，对脏输入安全。
+fn remove_element<T>(vec: &mut Vec<Box<T>>, handle: jlong) {
+    let addr = handle as usize;
+    vec.retain(|e| (e.as_ref() as *const T) as usize != addr);
 }
 
 fn toplevels<'local>(
@@ -2409,15 +2416,13 @@ fn toplevel_title<'local>(
 
     let surface = toplevel.wl_surface();
 
+    // P1-3: surface 上无 XdgToplevelSurfaceData（传错句柄类型/数据已回收）或锁中毒时
+    // 返回 null 字符串（调用方已处理 None → JString::null），不再 unwrap panic。
     let title = with_states(surface, |states| {
-        let attr_guard = states
+        states
             .data_map
             .get::<XdgToplevelSurfaceData>()
-            .unwrap()
-            .lock()
-            .unwrap();
-
-        attr_guard.title.clone()
+            .and_then(|d| d.lock().ok().and_then(|g| g.title.clone()))
     });
 
     if let Some(title) = title {
@@ -2436,15 +2441,12 @@ fn toplevel_app_id<'local>(
 
     let surface = toplevel.wl_surface();
 
+    // P1-3: 同 toplevelTitle——缺数据/锁中毒返回 null，不再 unwrap panic。
     let app_id = with_states(surface, |states| {
-        let attr_guard = states
+        states
             .data_map
             .get::<XdgToplevelSurfaceData>()
-            .unwrap()
-            .lock()
-            .unwrap();
-
-        attr_guard.app_id.clone()
+            .and_then(|d| d.lock().ok().and_then(|g| g.app_id.clone()))
     });
 
     if let Some(app_id) = app_id {
@@ -3076,3 +3078,70 @@ mod diagnostic_tests {
     }
 }
 
+
+#[cfg(test)]
+mod handle_tests {
+    use super::*;
+
+    // P1-3 句柄 helper 语义测试。用 u32 作 T（Clone+PartialEq 齐备，
+    // 地址语义与被测函数对 smithay 资源的用法一致）来验证：
+    // - 不再对 stale/0 handle 解引用（旧 remove_element 是 UB）
+    // - get/insert 未命中返回 0 而不是 panic
+
+    fn addr<T>(e: &Box<T>) -> jlong {
+        (e.as_ref() as *const T) as usize as jlong
+    }
+
+    #[test]
+    fn insert_get_handle_roundtrip_and_idempotent() {
+        let mut v: Vec<Box<u32>> = vec![];
+        let h = insert_get_handle(&mut v, &7u32);
+        assert_ne!(h, 0);
+        assert_eq!(v.len(), 1);
+        // 等值再插入：不新增，返回同一句柄
+        let h2 = insert_get_handle(&mut v, &7u32);
+        assert_eq!(h, h2);
+        assert_eq!(v.len(), 1);
+    }
+
+    #[test]
+    fn get_handle_miss_returns_zero_not_panic() {
+        let v: Vec<Box<u32>> = vec![Box::new(1u32)];
+        assert_eq!(get_handle(&v, &1u32), addr(&v[0]));
+        // 旧实现这里 .unwrap() panic（JNI 边界依赖包装层兜底）；现在是 0 句柄
+        assert_eq!(get_handle(&v, &999u32), 0);
+    }
+
+    #[test]
+    fn remove_element_by_address_only() {
+        let mut v: Vec<Box<u32>> = vec![Box::new(1u32), Box::new(2u32)];
+        let h1 = addr(&v[0]);
+        remove_element(&mut v, h1);
+        assert_eq!(v.len(), 1);
+        assert_eq!(*v[0], 2u32);
+
+        // stale handle（已从表中移除、指向可能已释放的内存）：
+        // 旧实现会解引用它 → use-after-free UB；现在纯地址比较，无操作。
+        remove_element(&mut v, h1);
+        assert_eq!(v.len(), 1);
+        remove_element(&mut v, 0);
+        assert_eq!(v.len(), 1);
+        remove_element(&mut v, -1);
+        assert_eq!(v.len(), 1);
+
+        let last = addr(&v[0]);
+        remove_element(&mut v, last);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn remove_element_stale_ptr_does_not_remove_live_element() {
+        // 模拟"句柄指向的内存已被复用"场景：一个与现存元素**等值但不同地址**的堆对象。
+        // 旧实现按值比较会把仍存活的元素误删；新实现只认地址。
+        let mut v: Vec<Box<u32>> = vec![Box::new(5u32)];
+        let alias = Box::new(5u32); // 与 v[0] 等值、不同地址
+        remove_element(&mut v, (alias.as_ref() as *const u32) as usize as jlong);
+        assert_eq!(v.len(), 1, "等值但不同地址的句柄不得删除存活元素");
+        let _ = alias;
+    }
+}
