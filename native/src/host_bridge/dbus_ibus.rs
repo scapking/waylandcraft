@@ -231,7 +231,8 @@ impl HostBridge for DbusIbusBridge {
                 // 不发回 commit/preedit。这是 v0.9.40 笔记"调用方预解析"从未
                 // 实现的根因。
                 if keysym == 0 {
-                    ime_log!("[waylandcraft][host_bridge][dbus-ibus] submit Key keysym=0 拒绝（防止引擎不识别）");
+                    // 分级=细节（逐键拒绝行，键键触发）→ verbose 档。
+                    crate::bridge::ime_log_v!("[waylandcraft][host_bridge][dbus-ibus] submit Key keysym=0 拒绝（防止引擎不识别）");
                     return; // 吞下：不要给 ibus 一个它无法识别的 keysym
                 }
                 Some(ToWorker::ProcessKey {
@@ -431,7 +432,9 @@ fn command_loop(
     while let Ok(cmd) = cmd_rx.recv() {
         let res: Result<(), String> = match cmd {
             ToWorker::FocusIn => {
-                ime_log!("[waylandcraft][host_bridge][dbus-ibus] FocusIn -> ibus-daemon");
+                // 分级=细节（每信号行；host 后备路径下 Java 每帧 focus 都
+                // 可能触发）→ verbose 档。
+                crate::bridge::ime_log_v!("[waylandcraft][host_bridge][dbus-ibus] FocusIn -> ibus-daemon");
                 ic_conns
                     .ic
                     .call::<_, _, ()>("FocusIn", &())
@@ -439,7 +442,8 @@ fn command_loop(
                     .map_err(|e| e.to_string())
             }
             ToWorker::FocusOut => {
-                ime_log!("[waylandcraft][host_bridge][dbus-ibus] FocusOut -> ibus-daemon");
+                // 分级=细节（每信号行）→ verbose 档。
+                crate::bridge::ime_log_v!("[waylandcraft][host_bridge][dbus-ibus] FocusOut -> ibus-daemon");
                 ic_conns
                     .ic
                     .call::<_, _, ()>("FocusOut", &())
@@ -447,7 +451,8 @@ fn command_loop(
                     .map_err(|e| e.to_string())
             }
             ToWorker::SetCursorLocationRelative { x, y, w, h } => {
-                ime_log!(
+                // 分级=细节（每光标信号行）→ verbose 档。
+                crate::bridge::ime_log_v!(
                     "[waylandcraft][host_bridge][dbus-ibus] SetCursorLocationRelative x={x} y={y} w={w} h={h}"
                 );
                 ic_conns
@@ -461,7 +466,8 @@ fn command_loop(
                 cursor_pos,
                 anchor_pos,
             } => {
-                ime_log!(
+                // 分级=细节（每 surrounding 事件行，含用户文本摘录）→ verbose 档。
+                crate::bridge::ime_log_v!(
                     "[waylandcraft][host_bridge][dbus-ibus] SetSurroundingText text=\"{}\" cursor={cursor_pos} anchor={anchor_pos}",
                     text.chars().take(16).collect::<String>()
                 );
@@ -500,7 +506,9 @@ fn command_loop(
                     .call::<_, _, bool>("ProcessKeyEvent", &(keysym, evdev, state));
                 match call_result {
                     Ok(consumed) => {
-                        ime_log!(
+                        // 分级=细节（宿主桥逐键成功行）→ verbose 档；
+                        // 同 match 的失败分支保留（失败行任何档位都写）。
+                        crate::bridge::ime_log_v!(
                             "[waylandcraft][host_bridge][dbus-ibus] ProcessKeyEvent keysym={keysym:#x} evdev={evdev} state={state:#x} -> consumed={consumed}"
                         );
                         // ⑧ consumed 回执送回提交线程（submit_key_sync 拦截；
@@ -646,7 +654,9 @@ fn handle_signal(
             } else {
                 String::new()
             };
-            ime_log!("[waylandcraft][host_bridge][dbus-ibus] handle_signal: CommitText text={:?}", text);
+            // 分级=细节（每信号行，含上屏文本内容——隐私面也应仅 verbose
+            // 档落盘）→ verbose 档。
+            crate::bridge::ime_log_v!("[waylandcraft][host_bridge][dbus-ibus] handle_signal: CommitText text={:?}", text);
             let _ = ev_tx.send(FromWorker::Commit(text));
             let _ = ev_tx.send(FromWorker::Done(0));
         }

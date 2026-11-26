@@ -236,9 +236,11 @@ impl Relay {
         }
         let was_active = self.app_active;
         self.app_active = enabled;
-        crate::bridge::ime_log_write(&format!(
+        // 分级=细节（会话 enable/disable 边界逐次一行；等价的宏观轨迹由
+        // 保留的 IME_STATE 状态机行承载）→ verbose 档。
+        crate::bridge::ime_log_v!(
             "[waylandcraft][ime][relay] set_app_enabled {enabled} (reason={reason})"
-        ));
+        );
         if enabled {
             if self.ime_present {
                 // done 由 wire 层实际发出后经 mirror_done_count 同步计数。

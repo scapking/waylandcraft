@@ -292,7 +292,9 @@ public class SharedWindowFrameRelay {
 			statsReceivers += forwarded;
 			long nowMs = System.currentTimeMillis();
 			if (nowMs - statsWindowStartMs >= 1000) {
-				if (statsFrames > 0) {
+				if (statsFrames > 0 && dev.evvie.waylandcraft.utils.WcLogging.verbose()) {
+					// 分级=细节（服务端 relay 每秒聚合 stats 行）→ verbose 档；
+					// 计数照常推进。拒绝（oversized WARN）/慢观众行保留。
 					WaylandCraftCommon.LOGGER.info("[SERVER] relay stats ({}ms): {} frames, {} KB/s, {} sends, skip_unwritable={} slow_viewers={}",
 						nowMs - statsWindowStartMs, statsFrames, String.format("%.1f", statsBytes / 1024.0), statsReceivers,
 						skippedUnwritable.get(), slowViewerEvents.get());

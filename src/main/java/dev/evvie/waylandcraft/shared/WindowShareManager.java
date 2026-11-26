@@ -745,12 +745,15 @@ public class WindowShareManager {
 		if(adaptiveOverLimitCount >= ADAPTIVE_EVAL_INTERVAL / 2) {
 			// 超过一半帧数都超限 → 降 fps（绝不降 scale，避免缩放窗口 UI）
 			adaptiveFpsFactor = Math.max(ADAPTIVE_FPS_MIN, adaptiveFpsFactor * ADAPTIVE_FPS_DOWN);
-			LOGGER.info("[ADAPTIVE] FPS factor decreased to {} (over limit: {} frames)", String.format("%.2f", adaptiveFpsFactor), adaptiveOverLimitCount);
+			// 分级=细节（INFO→debug）：自适应调速是周期控制环噪声，发布档
+			// latest.log 默认不可见；调优时把 log4j2 的本 mod logger 提到
+			// DEBUG 即可看回。分级表见 docs/LOGGING.md。
+			LOGGER.debug("[ADAPTIVE] FPS factor decreased to {} (over limit: {} frames)", String.format("%.2f", adaptiveFpsFactor), adaptiveOverLimitCount);
 			adaptiveOverLimitCount = 0;
 		} else if(utilization < 0.5f && adaptiveFpsFactor < ADAPTIVE_FPS_MAX) {
 			// 利用率低于50% → 恢复 fps（逐步回到目标帧率）
 			adaptiveFpsFactor = Math.min(ADAPTIVE_FPS_MAX, adaptiveFpsFactor * ADAPTIVE_FPS_UP);
-			LOGGER.info("[ADAPTIVE] FPS factor increased to {} (utilization: {}%)", String.format("%.2f", adaptiveFpsFactor), String.format("%.1f", utilization * 100));
+			LOGGER.debug("[ADAPTIVE] FPS factor increased to {} (utilization: {}%)", String.format("%.2f", adaptiveFpsFactor), String.format("%.1f", utilization * 100));
 			adaptiveUnderUtilCount = 0;
 		}
 	}

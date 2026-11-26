@@ -85,6 +85,17 @@ public class WaylandCraftSettings {
 	 */
 	String imeSource = "auto";
 
+	/* ---- 日志分级（verboseLogging）---- */
+	/**
+	 * 详细日志开关：true=全量（逐键/逐事件/周期采样行都写）；false=发布档
+	 * （只留启动摘要、WARN/ERROR、error ring、IME 里程碑、共享 start/stop
+	 * 结果，细节行在写入点短路）。默认 = FabricLoader.isDevelopmentEnvironment()
+	 * （gradle runClient 开发环境开，发布 jar 关）；-Dwc.verbose 系统属性
+	 * 可覆盖。变更经 responder 同步 Rust（setVerboseLogging JNI）。
+	 * 分级表见 docs/LOGGING.md。
+	 */
+	boolean verboseLogging = dev.evvie.waylandcraft.utils.WcLogging.defaultVerbose();
+
 	/* This is where the field names go to avoid typos */
 	public static final String PIXELS_PER_BLOCK = "pixelsPerBlock";
 	public static final String WINDOW_ANTIALIASING = "windowAntialiasing";
@@ -111,6 +122,7 @@ public class WaylandCraftSettings {
 	public static final String AUDIO_SHARE_RANGE_BLOCKS = "audioShareRangeBlocks";
 	public static final String IME_NESTED = "imeNested";
 	public static final String IME_SOURCE = "imeSource";
+	public static final String VERBOSE_LOGGING = "verboseLogging";
 	
 	/* This is where the getters go */
 	
@@ -212,6 +224,10 @@ public class WaylandCraftSettings {
 
 	public String getImeSource() {
 		return imeSource;
+	}
+
+	public boolean getVerboseLogging() {
+		return verboseLogging;
 	}
 	
 	/* Methods to modifiy settings by name */

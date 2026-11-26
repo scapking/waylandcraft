@@ -1202,6 +1202,23 @@ public class WaylandCraftBridge {
 		}
 	}
 
+	/**
+	 * 日志分级下发（settings.verboseLogging / -Dwc.verbose 合成的生效档，
+	 * 见 dev.evvie.waylandcraft.utils.WcLogging）。Rust 侧 VERBOSE_LOG 全局
+	 * AtomicBool——无需 instance，与 setModVersionNative 同型：
+	 * nativeAvailable 防护（server jar 无 .so 静默跳过）+ catch(Throwable)
+	 * （旧 .so 缺 setVerboseLoggingNative 符号 = UnsatisfiedLinkError，不致命）。
+	 */
+	public static void setVerboseLogging(boolean verbose) {
+		if(!nativeAvailable) return; // server/viewer 无 native：静默跳过
+		try {
+			setVerboseLoggingNative(verbose);
+		} catch(Throwable t) {
+			dev.evvie.waylandcraft.WaylandCraftCommon.LOGGER.warn("[logging] setVerboseLogging unavailable: {}", t.toString());
+		}
+	}
+	private static native void setVerboseLoggingNative(boolean verbose);
+
 	/* ---- v0.14 嵌套输入法守护进程 ----
 	 * sync5 教训：**任何新 native 调用点都必须能在无 native 时安全跳过**——
 	 * server jar 无 .so，两个 wrapper 都做 nativeAvailable/instance 门 +

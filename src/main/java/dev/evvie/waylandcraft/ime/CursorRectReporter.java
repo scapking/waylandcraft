@@ -59,9 +59,12 @@ public final class CursorRectReporter {
 				lastX = lastY = Integer.MIN_VALUE;
 				// P0 诊断：值丢失瞬间记录 getFocused() 返回什么（null / 非 EditBox 组件），
 				// 定位 (0,0,0,0) 锚点漂移的触发源。只在有值→无值转换时打一次，防刷屏。
-				String focusedDesc = focused == null ? "null" : focused.getClass().getSimpleName();
-				WaylandCraftCommon.LOGGER.info("[cursor] 焦点丢失 focused={} screen={} -> 补发 (0,0,0,0)",
-					focusedDesc, mc.screen.getClass().getSimpleName());
+				// 分级=细节（[cursor] 锚点轨迹行）→ verbose 档。
+				if (dev.evvie.waylandcraft.utils.WcLogging.verbose()) {
+					String focusedDesc = focused == null ? "null" : focused.getClass().getSimpleName();
+					WaylandCraftCommon.LOGGER.info("[cursor] 焦点丢失 focused={} screen={} -> 补发 (0,0,0,0)",
+						focusedDesc, mc.screen.getClass().getSimpleName());
+				}
 				WaylandCraft.instance.bridge.updateCursorRect(0, 0, 0, 0);
 			}
 			return;
@@ -77,12 +80,16 @@ public final class CursorRectReporter {
 		if (x != lastX || y != lastY) {
 			// P0 诊断：位置变化时记录 EditBox 身份（类 + 光标前文本），
 			// 确认锚点来源是哪个框（WaylandCraft 世界 UI vs MC 聊天框）。
-			String text = box.getValue();
-			if (text.length() > 16) {
-				text = text.substring(0, 16) + "...";
+			// 分级=细节（[cursor] 逐位置变化行，含输入框文本摘录——隐私面）
+			// → verbose 档；字符串裁剪也随门短路。
+			if (dev.evvie.waylandcraft.utils.WcLogging.verbose()) {
+				String text = box.getValue();
+				if (text.length() > 16) {
+					text = text.substring(0, 16) + "...";
+				}
+				WaylandCraftCommon.LOGGER.info("[cursor] EditBox class={} value=\"{}\" -> ({},{},{},{}) scale={}",
+					box.getClass().getSimpleName(), text, x, y, 2 * guiScale, 9 * guiScale, guiScale);
 			}
-			WaylandCraftCommon.LOGGER.info("[cursor] EditBox class={} value=\"{}\" -> ({},{},{},{}) scale={}",
-				box.getClass().getSimpleName(), text, x, y, 2 * guiScale, 9 * guiScale, guiScale);
 			lastX = x;
 			lastY = y;
 			// 光标近似矩形：宽 2 高 9（字体行高）→ 物理像素；桌面候选窗只取左上锚点。

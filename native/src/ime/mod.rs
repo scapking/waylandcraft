@@ -456,8 +456,12 @@ impl ImeState {
             deliveries: self.popup.deliveries() as u64,
         };
         if let Some(line) = self.metrics.tick_window_report(now, popup, &crate::bridge::IME_LOG_IO) {
-            crate::bridge::ime_log_write(&line);
-            // 心跳落盘点：缓冲日志的最坏可见延迟 = 窗口周期（Phase C 合同）。
+            // 分级=细节（10s 周期聚合采样行）→ verbose 档；心跳落盘本身
+            // 不受分级影响——里程碑行的可见延迟合同（Phase C：≤窗口周期）
+            // 不因门控变差。
+            if crate::bridge::verbose_logging() {
+                crate::bridge::ime_log_write(&line);
+            }
             crate::bridge::ime_log_flush();
         }
     }
@@ -639,14 +643,16 @@ impl ImeState {
         if let Some(hb) = state.host_bridge.as_mut() {
             if hb.is_ready() {
                 if self.nested_route_live() {
-                    crate::bridge::ime_log_write(
+                    // 分级=细节（Java 每帧 focusSurface 都进本分支）→ verbose 档。
+                    crate::bridge::ime_log_v!(
                         "[waylandcraft][ime][host_bridge] FocusIn 跳过（nested 主路径在线，路由门收紧）"
                     );
                 } else {
-                    crate::bridge::ime_log_write(&format!(
+                    // 分级=细节（同上，每帧幂等提交行）→ verbose 档。
+                    crate::bridge::ime_log_v!(
                         "[waylandcraft][ime][host_bridge] FocusIn（set_focus 路径，switched={}）",
                         switched
-                    ));
+                    );
                     hb.submit(DownEvent::State(FocusChange::Activate));
                 }
             }
@@ -790,11 +796,12 @@ impl ImeState {
                 Vec::new()
             }
             Ti3CommitOutcome::Enabled(st) => {
-                crate::bridge::ime_log_write(&format!(
+                // 分级=细节（ti3 enable 逐事件，含应用周边文本）→ verbose 档。
+                crate::bridge::ime_log_v!(
                     "[waylandcraft][ime] apply_ti3_outcome Enabled (surrounding='{}' cursor={} anchor={} rect={:?}) -> relay + host_bridge FocusIn",
                     &st.surrounding_text.chars().take(8).collect::<String>(),
                     st.surrounding_cursor, st.surrounding_anchor, st.cursor_rect
-                ));
+                );
                 // 先把首批状态灌入 relay 缓存（未激活时只更新不产出命令），
                 // 使随后的 Activate 单周期携带最新状态，避免多余的 done 往返。
                 let _ = ime.relay.push_app_state(st.clone());
@@ -803,7 +810,9 @@ impl ImeState {
                 // 引擎需要 surrounding 上下文决定 consumed，否则拒收所有按键。
                 // v0.14.1 路由门收紧：nested 主路径在线时整段跳过。
                 if nested_live {
-                    crate::bridge::ime_log_write(
+                    // 分级=细节（ti3 enable 逐事件的跳过说明）→ verbose 档；
+                    // 两条 NOT ready/None 失败行保留（后备路径断链证据）。
+                    crate::bridge::ime_log_v!(
                         "[waylandcraft][ime] apply_ti3_outcome Enabled: host_bridge 提交跳过（nested 主路径在线，路由门收紧）"
                     );
                 } else if let Some(hb) = hb {
@@ -830,7 +839,8 @@ impl ImeState {
                 ime.relay.set_app_enabled(true, "ti3.enable")
             }
             Ti3CommitOutcome::Disabled => {
-                crate::bridge::ime_log_write(
+                // 分级=细节（ti3 disable 逐事件）→ verbose 档。
+                crate::bridge::ime_log_v!(
                     "[waylandcraft][ime] apply_ti3_outcome Disabled -> relay/host FocusOut"
                 );
                 // 路由门收紧：nested 在线时不向宿主发 FocusOut。
@@ -844,11 +854,12 @@ impl ImeState {
                 ime.relay.set_app_enabled(false, "ti3.disable")
             }
             Ti3CommitOutcome::State(st) => {
-                crate::bridge::ime_log_write(&format!(
+                // 分级=细节（ti3 commit 逐事件，含周边文本摘录）→ verbose 档。
+                crate::bridge::ime_log_v!(
                     "[waylandcraft][ime] apply_ti3_outcome State (surrounding='{}' cursor={} anchor={} rect={:?})",
                     &st.surrounding_text.chars().take(8).collect::<String>(),
                     st.surrounding_cursor, st.surrounding_anchor, st.cursor_rect
-                ));
+                );
                 let cmds = ime.relay.push_app_state(st.clone());
                 // 路由门收紧：nested 在线时不再向宿主喂 Surrounding/
                 // 光标矩形（这类提交在 sync6 实机日志里与 FocusIn/Out
@@ -903,9 +914,12 @@ impl ImeState {
             if self.popup_ime_active() {
                 self.last_preedit_active = true;
             }
-            crate::bridge::ime_log_write(&format!(
+            // 分级=细节（im2 commit 逐事件——弹窗模式下面板每次更新都以
+            // 无内容 commit 收尾，属引擎心跳而非异常）→ verbose 档。
+            // serial 不符的 WARN 行保留（任何档位，含即时 flush）。
+            crate::bridge::ime_log_v!(
                 "[waylandcraft][ime][relay] im2 commit(serial={serial}) 无内容（wire done={done_sent}），忽略"
-            ));
+            );
             return;
         }
         if !fr.applied {
@@ -1063,12 +1077,14 @@ impl ImeState {
                     // 原子应用缓冲到 ti3 wire
                     let fr = self.relay.ime_flush();
                     if fr.applied {
-                        crate::bridge::ime_log_write(&format!(
+                        // 分级=细节（host 路径每 Done 一批一行）→ verbose 档。
+                        crate::bridge::ime_log_v!(
                             "[waylandcraft][ime] host_bridge flush applied -> ti3 batch ({} cmds)",
                             fr.commands.len()
-                        ));
+                        );
                         self.emit_ti_batch(fr.commands);
                     } else {
+                        // 分级=失败证据（批次被丢 = 字丢的直接线索）：保留。
                         crate::bridge::ime_log_write(
                             "[waylandcraft][ime] host_bridge flush NOT applied（无激活会话）",
                         );

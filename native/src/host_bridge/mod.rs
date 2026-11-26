@@ -237,11 +237,17 @@ pub fn probe() -> BridgeInit {
 }
 
 /// 协议无关的日志宏（与 system_ime 旧路径同名；写 stderr + ime.log）。
+/// **分级=里程碑/失败行**：任何档位都写（发布档保留清单见 bridge.rs
+/// 顶部注释与 docs/LOGGING.md）。
 macro_rules! ime_log {
     ($($arg:tt)*) => {
         crate::bridge::ime_log_write(&format!($($arg)*))
     };
 }
+
+// 细节级 IME 日志带门宏 ime_log_v!（逐事件/周期性；发布档在写入点
+// 短路、判定发生在 format 之前）定义收敛在 bridge.rs 单一处——本模块
+// 子模块用 `crate::bridge::ime_log_v!` 全路径调用。分级表见 docs/LOGGING.md。
 
 pub(crate) use ime_log;
 

@@ -321,11 +321,14 @@ impl InputPopupState {
         let held = self.take_over_undelivered();
         self.frame = None;
         self.epoch = self.epoch.wrapping_add(1);
-        crate::bridge::ime_log_write(if held {
-            "[waylandcraft][ime][popup] attach(NULL)：帧尚未交付 → display hold 接管（≤400ms 续交付）"
-        } else {
-            "[waylandcraft][ime][popup] attach(NULL) → 帧清空（候选窗隐藏）"
-        });
+        // 分级=细节（attach 逐帧隐藏行，组字每轮一次）→ verbose 档。
+        if crate::bridge::verbose_logging() {
+            crate::bridge::ime_log_write(if held {
+                "[waylandcraft][ime][popup] attach(NULL)：帧尚未交付 → display hold 接管（≤400ms 续交付）"
+            } else {
+                "[waylandcraft][ime][popup] attach(NULL) → 帧清空（候选窗隐藏）"
+            });
+        }
     }
 
     pub(crate) fn has_frame(&self) -> bool {
@@ -445,6 +448,11 @@ impl InputPopupState {
     /// 永远落在无内容的空闲态，正是这个盲区让 sync10-12 三轮都在猜。
     pub(crate) fn log_content_gate(&mut self, live: bool, held: bool, im2active: bool,
             visible: bool, seq: u32, w: i32, h: i32) {
+        // 分级=细节（popup gate 观测网：200ms 节流周期性门快照）→ verbose
+        // 档。非 verbose 直接返回——节流簿记也不做，发布档零开销。
+        if !crate::bridge::verbose_logging() {
+            return;
+        }
         let now = self.now();
         if self.last_gate_log.is_some_and(|t| now.duration_since(t).as_millis() < 200) {
             return;

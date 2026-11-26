@@ -119,9 +119,8 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for crate::WLCState {
                     return;
                 };
                 // VK 传 evdev 码；seat.keyboard_key 收 xkb 码（evdev+8）。
-                crate::bridge::ime_log_write(&format!(
-                    "[waylandcraft][ime][vk] 引擎直通 key={key} state={ks}"
-                ));
+                // 分级=细节（引擎直通逐键行）→ verbose 档。
+                crate::bridge::ime_log_v!("[waylandcraft][ime][vk] 引擎直通 key={key} state={ks}");
                 state.seat.keyboard_key(key + 8, action);
             }
             zwp_virtual_keyboard_v1::Request::Modifiers {
@@ -131,9 +130,10 @@ impl Dispatch<ZwpVirtualKeyboardV1, ()> for crate::WLCState {
                 group,
             } => {
                 // 修饰态不双写（真键盘路径是权威源），仅诊断可见性。
-                crate::bridge::ime_log_write(&format!(
+                // 分级=细节（sync15 点名的恒定刷屏行）→ verbose 档。
+                crate::bridge::ime_log_v!(
                     "[waylandcraft][ime][vk] modifiers（忽略，seat 为权威源）dep={mods_depressed} lat={mods_latched} lock={mods_locked} grp={group}"
-                ));
+                );
             }
             zwp_virtual_keyboard_v1::Request::Destroy => {}
             _ => unreachable!(),

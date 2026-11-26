@@ -1150,6 +1150,8 @@ public class WaylandCraftCommand {
 		// v0.14 嵌套输入法守护进程
 		source.sendFeedback(Component.literal(" §eimeNested§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.IME_NESTED) + "§r  §8(auto|on|off, 嵌套 WAYLAND_DISPLAY 上拉起独立 fcitx5/ibus；/wl ime nested status 看裁决)§r"));
 		source.sendFeedback(Component.literal(" §eimeSource§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.IME_SOURCE) + "§r  §8(auto|fcitx5|builtin, 内置拼音引擎来源档；/wl ime source <mode> 即时切档)§r"));
+		source.sendFeedback(Component.literal(" §everboseLogging§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.VERBOSE_LOGGING)
+				+ "§r  §8(bool, 详细日志开关；默认=开发环境开。发布档只留启动摘要/WARN-ERROR/IME 里程碑/共享 start-stop；-Dwc.verbose 可覆盖。分级表 docs/LOGGING.md)§r"));
 		source.sendFeedback(Component.literal("§6▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
 		source.sendFeedback(Component.literal(" §7Use §e/wl settings set <key> <value>§7 to set§r"));
 		return 1;
@@ -1203,6 +1205,23 @@ public class WaylandCraftCommand {
 					}
 					wlc.settingsManager.setStringSetting(WaylandCraftSettings.IME_SOURCE, v);
 					source.sendFeedback(Component.literal("§a✔ §eimeSource§r = §e" + v + "§r  §8(fcitx5 在场优先 im2；判死/强制档语义见 /wl ime info)§r"));
+					return 1;
+				}
+				// 日志分级开关：严格 true|false 校验（Boolean.parseBoolean 会把
+				// 任意脏值吞成 false，不适合布尔设置面）。responder 即时下发 Rust。
+				case "verboseLogging" -> {
+					// 严格 true|false（忽略大小写/空白），其余拒收——解析规则与
+					// -Dwc.verbose 共用 WcLogging.parseOverride（单测直打）。
+					Boolean b = dev.evvie.waylandcraft.utils.WcLogging.parseOverride(value);
+					if(b == null) {
+						source.sendError(Component.literal("§c✘ verboseLogging 只能是 true|false（当前: " + value + "）§r"));
+						return 0;
+					}
+					wlc.settingsManager.setBooleanSetting(WaylandCraftSettings.VERBOSE_LOGGING, b);
+					String note = dev.evvie.waylandcraft.utils.WcLogging.overrideActive()
+							? "（-Dwc.verbose 系统属性覆盖中，settings 已保存但生效档不变）"
+							: "（即时生效，已同步 Rust）";
+					source.sendFeedback(Component.literal("§a✔ §everboseLogging§r = §e" + b + "§r  §8" + note + "§r"));
 					return 1;
 				}
 				case "imeNested", "nestedIme" -> {
