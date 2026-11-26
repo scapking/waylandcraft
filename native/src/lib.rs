@@ -52,6 +52,10 @@ mod diagnostic;
 mod ddm;
 mod desktop_windows;
 mod portal_capture;
+// Windows 窗口/桌面捕获后端。mod 行不做 cfg 门控：portable 核心（帧槽状态机/
+// 过滤谓词/wire 编码/stop 幂等机）平台无关且需在 Linux cargo test 下可测，
+// 平台实现整体 #[cfg(windows)] 于文件内部门控（无 windows 依赖泄漏到 Linux 构建）。
+mod capture_windows;
 mod audio_capture;
 mod egl;
 // v0.13.4：ime 和 host_bridge 改为 pub 以让集成测试能 import

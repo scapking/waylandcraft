@@ -836,6 +836,36 @@ bind_java_type! {
             fn = portal_capture_stop,
         },
 
+        // Windows.Graphics.Capture 窗口/桌面捕获（对称 portal_capture_* 三件套 +
+        // 目标枚举）。非 Windows 平台注册保留（bind_java_type! 表不支持按条目 cfg），
+        // 调用一律抛 win_capture_unsupported——Java 侧只在 Windows 接线。
+        // 接入清单见 docs/CAPTURE_WINDOWS.md。
+        static extern fn win_capture_targets {
+            sig = (instance: jlong) -> JString,
+            name = "winCaptureTargets",
+            fn = win_capture_targets,
+        },
+        static extern fn win_capture_start_window {
+            sig = (instance: jlong, hwnd: jlong) -> byte[],
+            name = "winCaptureStartWindow",
+            fn = win_capture_start_window,
+        },
+        static extern fn win_capture_start_monitor {
+            sig = (instance: jlong, index: jint) -> byte[],
+            name = "winCaptureStartMonitor",
+            fn = win_capture_start_monitor,
+        },
+        static extern fn win_capture_frame {
+            sig = (instance: jlong) -> byte[],
+            name = "winCaptureFrame",
+            fn = win_capture_frame,
+        },
+        static extern fn win_capture_stop {
+            sig = (instance: jlong) -> JString,
+            name = "winCaptureStop",
+            fn = win_capture_stop,
+        },
+
         static extern fn audio_capture_start {
             sig = (instance: jlong, pid: jint) -> void,
             fn = audio_capture_start,
@@ -3307,6 +3337,95 @@ fn portal_capture_stop<'local>(
 ) -> Result<(), BridgeError> {
     // PipeWire mainloop runs in a thread, will exit when process exits
     Ok(())
+}
+
+// ═══════════════════════════════════════════════════════
+// Windows.Graphics.Capture 捕获（仅 Windows；见 capture_windows.rs）
+//
+// 与 portal_capture_* 的对称关系：
+//   portal_capture_start → win_capture_start_window / win_capture_start_monitor
+//     （同一 "ok:<id>" byte[] 回执；id：窗口=hwnd 十进制，显示器=负数 -1-index）
+//   portal_capture_frame → win_capture_frame
+//     （帧槽共享 + seq 去重：无新帧返回 null——portal 是每帧盲克隆，这里对齐
+//      ime_popup_frame 的零拷贝语义，RemoteWindowRenderer 按 seq 决定是否上传）
+//   portal_capture_stop  → win_capture_stop
+//     （确定性关闭：session.Close → pool.Close → join "wc-win-capture" 线程
+//      带 3s 预算 → 帧缓冲释放；返回关停报告字符串。portal 的空实现
+//      [僵尸线程直到进程退出] 是有意不参照的缺陷）
+//
+// 实现体全部走 crate::capture_windows 的平台中立 API：非 Windows 上
+// start/list 返回 Err、take/stop 天然空转——注册表条目跨平台保留（宏不支持
+// 按条目 cfg），语义为"该平台上此功能不可用"。
+// ═══════════════════════════════════════════════════════
+
+fn win_capture_targets<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    match crate::capture_windows::list_targets() {
+        Ok(json) => Ok(env.new_string(json)?),
+        Err(e) => {
+            eprintln!("[win-capture] targets failed: {e}");
+            Err(BridgeError::Null("win_capture_unavailable"))
+        }
+    }
+}
+
+fn win_capture_start_window<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+    hwnd: jlong,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    if hwnd == 0 {
+        return Err(BridgeError::Null("win_capture_invalid_hwnd"));
+    }
+    let report = crate::capture_windows::start_window_capture(hwnd as isize)
+        .map_err(|e| {
+            eprintln!("[win-capture] start_window failed: {e}");
+            BridgeError::Null("win_capture_start_failed")
+        })?;
+    Ok(env.byte_array_from_slice(report.as_bytes())?)
+}
+
+fn win_capture_start_monitor<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+    index: jint,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    if index < 0 {
+        return Err(BridgeError::Null("win_capture_invalid_monitor_index"));
+    }
+    let report = crate::capture_windows::start_monitor_capture(index)
+        .map_err(|e| {
+            eprintln!("[win-capture] start_monitor failed: {e}");
+            BridgeError::Null("win_capture_start_failed")
+        })?;
+    Ok(env.byte_array_from_slice(report.as_bytes())?)
+}
+
+fn win_capture_frame<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    // seq 去重：无新帧 → null（Java 保持现纹理，零拷贝零上传）。
+    match crate::capture_windows::take_frame_wire() {
+        Some(data) => Ok(env.byte_array_from_slice(&data)?),
+        None => Ok(JPrimitiveArray::null()),
+    }
+}
+
+fn win_capture_stop<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JString<'local>, BridgeError> {
+    // 幂等 + 确定性：返回报告（joined / thread-timeout-detached / no-session）。
+    let report = crate::capture_windows::stop_capture();
+    Ok(env.new_string(report.as_str())?)
 }
 
 // ═══════════════════════════════════════════════════════
