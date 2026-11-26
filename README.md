@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-v0.9.27-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-1.3.0--sync15-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -54,18 +54,29 @@ Turn any Wayland window into an in-game object. Launch apps, view them on a virt
 - **Full keyboard passthrough** — single keys, modifier combos (Ctrl/Shift/Alt), and long-press REPEAT all reach the focused window; capture split **G = keyboard only, J = keyboard + mouse**
 - **X11 app support** — bundled `xwayland-satellite` gives X11 applications a `DISPLAY` automatically (both `x86_64` and `arm64` binaries included)
 
-### 👥 Multiplayer Window Sharing
+### ⌨️ Input methods — CJK that actually works, everywhere
 
-Stream your desktop to other players in real time. Built as a first-class server-side feature, not an afterthought.
+The feature upstream called impossible, shipped end-to-end (see [docs/IME.md](docs/IME.md) for the full engineering saga):
 
-- **Live sharing** — other players see your windows rendered in their world
-- **Mobile viewing** — Android clients can view shared windows with zero extra setup
-- **Server-side relay** — frames are forwarded off the main thread; multi-window sharing is sharded across worker threads, so one slow viewer never blocks another window
-- **Adaptive quality** — configurable scale, JPEG quality, framerate, bitrate, plus built-in presets
+- **Nested IM daemon** — an isolated `fcitx5` (or ibus-daemon) instance runs inside waylandcraft's own compositor with a private HOME; it auto-seeds **every engine installed on your system** (pinyin, wubi, shuangpin, cangjie, …) and mirrors your host profile when present. It never touches your desktop IME.
+- **Candidate window rendered in-game** — the IM's real candidate UI is captured (ARGB frames) and drawn *at the text cursor* in Minecraft GUIs **and as a world-space quad next to in-game app windows**; mouse click selects, wheel pages. No blind typing.
+- **Built-in pinyin engine, zero dependencies** — an embedded dictionary + segmentation engine engages automatically when no fcitx5 is installed, so any Linux desktop types Chinese out of the box. Switch sources with `/wl ime source auto|fcitx5|builtin`, pick engines with `/wl ime eng`.
+- **Correct at the protocol level** — per-key consumed/unconsumed dispatch, no double-send, no swallowed keys; commits are guaranteed-delivered (every past incident is locked by a regression test, including real-fcitx5 live tests).
+- **Visible state** — 「拼」working badge, `/wl ime info`, `ime_*` subsystem rows in `/wl status`.
+- Works in **Minecraft chat, server address bar, search boxes**, and inside **shared/launched app windows** (firefox, chromium, terminals…).
 
-### 🔐 Granular Permissions
+### 👥 Buffered, stutter-free multiplayer
 
-Four-level permission model per player per window:
+- **Latency-for-smoothness playout**: viewers buffer `sharePlayoutDelayMs` (default 4000, 0–8000) using measured transfer floors — smooth video under jitter, **resolution never downscaled**.
+- **Per-window audio**: the shared *application's own* PipeWire stream (not your microphone), synchronized to the same playout clock, with distance falloff (`audioShareRangeBlocks`).
+- **Server-side fairness**: capability-filtered relays (vanilla players receive nothing undecodable) and write backpressure (slow viewers drop frames instead of OOM-ing the server).
+
+- **Live sharing + mobile viewing** — Android/Windows/macOS viewers join with zero extra setup; multi-window relay is sharded per window across worker threads.
+- **Adaptive quality** — configurable scale, JPEG quality, framerate, bitrate, plus built-in presets.
+
+### 🔐 Granular Permissions (production model)
+
+Server-authoritative, audit-logged, tamper-evident. Four-level permission model per player per window:
 
 | Level | Meaning |
 |-------|---------|
@@ -74,14 +85,26 @@ Four-level permission model per player per window:
 | `INTERACT` | Can send mouse/keyboard events to the window |
 | `CONTROL` | Can resize, reposition and manage permissions |
 
-Whitelist, blacklist, and per-window overrides are all supported.
+Owner is *always* CONTROL on their own windows; effective permission composes as blacklist > whitelist > per-window grant > default policy. On top of that:
+
+- **Timed grants** — `/wl share grant <win> <player> VIEW 10m`; expiry swept server-side, revoked windows dismantle instantly on the viewer (texture, audio, buffers).
+- **Invite mode** — `/wl share default ask`: new viewers trigger a clickable *allow-10m / always-allow / deny* prompt to the owner instead of auto-access.
+- **Handle-reuse safety** — re-registering a window (even same owner) wipes its ACL; no stale grants.
+- **Audit** — `/wl share acl` shows every grant (who/what/until/source); structured ACL log + ops counters.
+- Malformed/hostile inputs are clamped everywhere (levels, sizes, rates) — hardened against the full threat model in `ShareAcl*Test` (37 tests).
+
+### 🧩 Works without a server mod
+
+On vanilla servers the mod enters **local direct mode**: window items place, render and interact entirely client-side; sharing degrades with an explicit explanation instead of silently failing. Items never disappear because of a missing server mod.
 
 ### ⚡ Performance Engineering
 
 - PBO async readback + GPU scaling (`glBlitFramebuffer`)
-- Diff-frame transfer: only changed regions are encoded
+- Diff-frame transfer: only changed regions are encoded; scratch buffers reused (no per-frame multi-MB allocations)
 - Heartbeat frames for idle windows; `PNG`/`JPEG` auto-switch for transparency
 - Oversized frames are degraded by JPEG quality only — **UI size never changes** (when a window has transparent pixels, oversize frames are force-encoded to JPEG with alpha blended onto black, so degradation actually works)
+- Input hot paths measured, not guessed: key latency histogram (`/wl ime info`), popup frame delivery dedup (−97% JNI deliveries), buffered diagnostics logging (−98% write syscalls)
+- Single-owner-thread PipeWire model — cross-thread UAF crashes eliminated, verified by 64+16-round live stress
 
 ### 🎨 Shader Compatible
 
@@ -97,10 +120,10 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 | Linux arm64 | ✅ | ✅ | `waylandcraft-linux-arm64.jar` |
 | Android x86_64 (viewer) | ❌ | ✅ | `waylandcraft-android-x86_64.jar` |
 | Android arm64 (viewer) | ❌ | ✅ | `waylandcraft-android-arm64.jar` |
-| Windows x86_64 (viewer) | ❌ | ✅ | `waylandcraft-windows-x86_64.jar` |
-| Windows arm64 (viewer) | ❌ | ✅ | `waylandcraft-windows-arm64.jar` |
-| macOS x86_64 (viewer) | ❌ | ✅ | `waylandcraft-macos-x86_64.jar` |
-| macOS arm64 (viewer) | ❌ | ✅ | `waylandcraft-macos-arm64.jar` |
+| Windows x86_64 (viewer) | 🟡 native backend merged, packaging in progress | ✅ | `waylandcraft-windows-x86_64.jar` |
+| Windows arm64 (viewer) | 🟡 native backend merged, packaging in progress | ✅ | `waylandcraft-windows-arm64.jar` |
+| macOS x86_64 (viewer) | 🟡 native backend merged, packaging in progress | ✅ | `waylandcraft-macos-x86_64.jar` |
+| macOS arm64 (viewer) | 🟡 native backend merged, packaging in progress | ✅ | `waylandcraft-macos-arm64.jar` |
 | iOS arm64 (viewer, experimental) | ❌ | ✅ | `waylandcraft-ios-arm64.jar` |
 | Dedicated server (any arch) | — | — (hosts give/share/permission logic) | `waylandcraft-server.jar` |
 | Universal (any platform, catch-all) | ✅ | ✅ | `waylandcraft-universal.jar` |
@@ -134,7 +157,7 @@ Detects Iris and falls back to the vanilla entity pipeline automatically — win
 
 1. Install Fabric Loader and Fabric API.
 2. Drop the jar for your platform/arch (from [Releases](https://github.com/scapking/waylandcraft/releases), see [Platform Support](#️-platform-support)) into `.minecraft/mods/` — e.g. `waylandcraft-linux-x86_64.jar` on desktop Linux, `waylandcraft-android-arm64.jar` on a phone, `waylandcraft-macos-arm64.jar` on Apple Silicon.
-3. **Multi-player: the server must run the mod too** (give/permission/sharing logic lives server-side; without it these features silently no-op).
+3. **Multi-player:** with the mod on the server you get sharing, permissions and cross-player windows. **Without it**, the mod still works fully client-side in *local direct mode* (items, placement, interaction) and tells you exactly what multiplayer needs.
 4. Launch the game — single-player worlds embed a server and share the same `mods/` folder.
 
 ### First Steps
@@ -229,10 +252,23 @@ Windows can be arranged automatically around a fixed initialized origin (they no
 | `/wl permission allow <player> <PERM>` | Whitelist a player |
 | `/wl permission deny <player>` | Blacklist a player |
 | `/wl permission remove <player>` | Remove a player |
+| `/wl share grant <win> <player> <PERM> [10m]` | Grant (optionally time-limited) |
+| `/wl share revoke <win> <player>` | Revoke (tombstoned against defaults) |
+| `/wl share default ask\|allow\|deny` | New-viewer policy (`ask` = invite prompts) |
+| `/wl share acl [win]` | Audit view: who has what, until when, from where |
 
 `PERM`: `NONE` / `VIEW` / `INTERACT` / `CONTROL`
 
 ---
+
+### Diagnostics & IME
+
+| Command | Purpose |
+|---------|---------|
+| `/wl status` | One-screen dashboard: every subsystem (bridge/IME/audio/capture/EGL), colored health, error ring, live telemetry |
+| `/wl ime info` | IME deep state: daemon phase, seeded engines, source mode, candidate-window delivery stats, key latency histogram |
+| `/wl ime nested start\|stop` | Control the nested IM daemon |
+| `/wl ime source auto\|fcitx5\|builtin` · `/wl ime eng` | Choose IME source / list & pick engines |
 
 ## 📚 Command Reference
 
@@ -303,6 +339,10 @@ Share windows from the X11 desktop (via `xwayland-satellite`) directly, without 
 | `layoutDefaultHeight` | `540` | Resolution applied to windows joining the layout |
 | `groundClearance` | `0.4` | Min clearance of window bottom above floor (blocks) |
 | `moveStep` | `0.5` | Manual move step for Ctrl+arrow key movement |
+| `sharePlayoutDelayMs` | `4000` | Viewer playout buffer 0–8000 (0 = legacy low-latency; higher = smoother) |
+| `audioShareRangeBlocks` | `32` | Distance falloff radius for shared-window audio (0 = audible everywhere) |
+| `imeSource` | `auto` | IME engine source: `auto` / `fcitx5` / `builtin` |
+| `verboseLogging` | dev-env default | Full diagnostic logging on/off (release builds stay quiet; see [docs/LOGGING.md](docs/LOGGING.md)) |
 
 ---
 
@@ -327,11 +367,17 @@ Share windows from the X11 desktop (via `xwayland-satellite`) directly, without 
 
 ## ❓ FAQ
 
-**Q: Why must the server also install the mod?**
-A: `give`, permission, and sharing logic is registered server-side. Without the mod on the server these features silently no-op.
+**Q: Does the server need the mod?**
+A: For multiplayer sharing/permissions — yes, and it ships as the pure-Java `waylandcraft-server.jar`. **Without it the mod no longer breaks**: local direct mode keeps items, placement and interaction fully working client-side, and `/wl share` explains what a server mod would add.
+
+**Q: Can I type Chinese/Japanese in the game?**
+A: Yes — pinyin/wubi/shuangpin/… with the **in-game candidate window**, both in Minecraft's own chat and inside in-game app windows. Best with `fcitx5` installed (every engine auto-enabled); with nothing installed the built-in pinyin engine covers the basics. See [docs/IME.md](docs/IME.md).
 
 **Q: Can I view shared windows on my phone?**
 A: Yes. Install `waylandcraft-android-<arch>.jar` and join the server. Windows shared by PC teammates appear automatically — no extra steps on the phone.
+
+**Q: Shared windows stutter on my network.**
+A: Raise the viewer playout buffer: `/wl settings set sharePlayoutDelayMs 6000` (default 4000, range 0–8000; 0 = legacy low-latency mode). The buffer trades latency for zero stutter without touching resolution.
 
 **Q: Do X11 applications work?**
 A: Yes. `xwayland-satellite` is bundled inside the jar (both `x86_64` and `arm64`), so X11 apps get a `DISPLAY` automatically. The system still needs `Xwayland`, which ships with virtually every Wayland desktop.
@@ -354,7 +400,7 @@ A: This fork adds multi-player window sharing, the permission system, pure CLI m
 
 1. **Constrained window movement** — windows are locked to the vertical axis and the bottom edge stays ≥ 0.4 blocks above the floor. This is a deliberate simplification; freer placement may come later.
 2. **Quality vs latency tradeoff in sharing** — to keep the UI size identical to the sharer, only JPEG quality is lowered (never resolution) when frames exceed the limit; high-resolution windows still put pressure on weak servers/phones during relay and decode.
-3. **⚠️ IME in nested wayland clients (v1.2.5+)** — firefox / chromium / other wayland-native apps **running inside** waylandcraft cannot reliably use ibus / fcitx for Chinese/Japanese/Korean input. Cause: ibus's global focus state is bound to the host session (mutter / sway / KDE), and the host compositor cannot see focus changes inside waylandcraft's nested wayland session. Affects: **all versions that enable the ti3 server** (v1.2.5 to v1.2.14). **Workaround**: use **v1.2.4** (stable, IME behavior same); run firefox natively in your host session and stream it in via `wl add`; or launch X11 apps (which auto-fall-back to XIM). See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for details. **Recommended stable**: v1.2.4.
+3. **IME nuances that remain (down from "unusable" to listed edges)** — the nested-daemon architecture resolved CJK input entirely on fcitx5-equipped systems (candidate window, all engines, GUI + world windows). Remaining edges: (a) on **ibus-only** GNOME defaults, only the built-in pinyin engine is available — install fcitx5 for other engines (ibus ships no Wayland input-method v2 client; this is upstream-of-upstream, not our gap); (b) IME engines that render candidates exclusively via dmabuf popups are not yet captured (fcitx5 classicui uses shm — works); (c) candidate anchoring inside *nested app sub-surfaces* (popup-based input fields) can offset by the sub-surface origin. See [docs/IME.md](docs/IME.md) §compatibility.
 
 ---
 
@@ -412,10 +458,15 @@ cd .. && ./gradlew clean build
 | Layer | Technology |
 |-------|------------|
 | Game | Java 25, Fabric Loader 0.19.2+, Fabric API 0.147.0+ |
-| Native Bridge | Rust, JNI |
-| Wayland | Smithay, wayland-client, wlr-foreign-toplevel-management |
+| Native Bridge | Rust, JNI (panic-safe exports, version-injected metadata) |
+| Wayland | Smithay nested compositor, wayland-client, wlr-foreign-toplevel-management |
+| Input methods | `zwp_text_input_v3` + `zwp_input_method_v2` servers, virtual keyboard, nested fcitx5/ibus daemon supervisor, built-in pinyin engine, popup ARGB capture → GUI/world candidate rendering |
+| Audio | PipeWire per-PID capture (single owner-thread), OpenAL playout synced to video clock |
+| Capture | KDE/Wallpaper portal, XComposite/XGetImage, Windows.Graphics.Capture (merged), ScreenCaptureKit (merged) |
 | Image | PBO async readback, glBlitFramebuffer, JPEG/PNG, MemoryUtil |
-| Network | Fabric Networking API, custom Payload protocol |
+| Network | Fabric Networking API, protocol **v2** payloads (seq + capture timestamps), server relay with canSend filtering + write backpressure + sharded threads |
+
+**Test culture**: three tiers — pure-logic unit tests (251 Rust / 153 Java), wire-level integration tests that run a real compositor with a mock fcitx5 client, and `#[ignore]` **live suites** (real fcitx5 end-to-end commit/candidates/engine-switching, real PipeWire topology + stress). Release rule: a server jar is smoke-booted in an isolated server before publication; protocol changes ship all three endpoints in one batch.
 
 ---
 
@@ -436,6 +487,13 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
 
 **Recent highlights:**
 
+- **1.3.0 sync3–15 (fork series)** — the productization arc:
+  - **IME endgame** — nested fcitx5 daemon with auto-seeding of all installed engines; commit delivery hardened to protocol truth; **in-game candidate window** (GUI *and* world-space quads beside app windows, click + wheel); **built-in pinyin engine** for zero-dependency Chinese input; 「拼」state badge; `/wl ime info` / `/wl ime source` / `/wl ime eng`. Every field-reported failure mode became a regression test, including real-fcitx5 live suites.
+  - **Stutter-free sharing** — playout-buffered A/V (4s default, clock-offset aware), per-window application audio (per-PID PipeWire capture, watchdog re-promotion), resolution never downscaled.
+  - **Crash elimination** — PipeWire single-owner-thread threading model (cross-thread UAF gone, 80-round live stress), JNI-boundary UB fixes, portal capture stop-chain (no more zombie capture threads / stuck screen-record indicator).
+  - **Security hardening (27 audit findings)** — two remote server-crash P0s closed (permission-command clamp + auth, give_items thread/DoS), viewer backpressure + capability filtering, invite-based timed grants with revocation propagation, handle-reuse ACL wipe, input clamps end-to-end.
+  - **Cross-platform capture backends** — Windows (Graphics.Capture) and macOS (ScreenCaptureKit) natives merged at Rust level with module-level cross-compilation gates; Java wiring and native CI packaging in progress.
+  - **Diagnostics** — `/wl status` one-screen subsystem dashboard, error ring, key-latency histograms, structured ACL audit, release-vs-verbose log tiers.
 - **v0.9.27** — **IME protocol-level rewrite.** The old implementation could never reliably deliver IME text: the passthrough path sent `commit_string`/`preedit_string` to apps **without ever sending the mandatory `done` event**, so GTK/Qt buffered the text forever and nothing appeared on screen; host events were split into three unordered buffers (breaking the protocol-mandated `delete_surrounding` → `commit` order); IME state was forwarded before `commit(serial)` validation, making protocol discard impossible; and serial bookkeeping was wrong in three ways (`clear_focus` emitted a `done` without counting it — after any focus change *every* subsequent composition was discarded as stale; one global serial counter shared by all text-input instances instead of per-instance). The legacy `text-input-v1`/`input-method-v1` paths (~470 lines, which steered ibus onto the deprecated stack) are removed entirely; only the modern `zwp_text_input_v3` + `zwp_input_method_v2` stack remains, rebuilt around a pure-logic relay state machine (`ime/relay.rs`) that owns serial accounting, atomic batching and discard semantics. Host-desktop passthrough now preserves event order, reverse-syncs surrounding text / cursor rect / content type back to the desktop IME, replaces the 15s polling recreate with an event-driven renegotiation on window focus (GLFW callback → JNI), and detects structurally unsupported setups (X11/XWayland backend) up front instead of polling forever. Verified by 22 tests including wire-level integration tests that run a real compositor with two real Wayland clients (an editor and a simulated fcitx5). See [docs/IME.md](docs/IME.md).
 - **v0.9.17** — Fixed shared-window audio being effectively unusable: the PipeWire capture stream's `process` callback handle (`StreamListener`) was a function-local variable dropped on return, which unregistered the callback — so no PCM was ever captured. It is now kept alive in capture state. Added full audio-pipeline logging (native first-capture, per-stage errors now reach the Java log with the real reason, send/receive-side first-packet & byte-count logs).
 - **v0.9.16** — Added `/wl show all` / `/wl hide all` (also `*`) to show/hide every window in one command; `hide all` also unpins.
