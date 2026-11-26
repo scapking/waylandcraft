@@ -432,6 +432,8 @@ impl ImeState {
         };
         if let Some(line) = self.metrics.tick_window_report(now, popup, &crate::bridge::IME_LOG_IO) {
             crate::bridge::ime_log_write(&line);
+            // 心跳落盘点：缓冲日志的最坏可见延迟 = 窗口周期（Phase C 合同）。
+            crate::bridge::ime_log_flush();
         }
     }
 

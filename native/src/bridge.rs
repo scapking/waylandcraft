@@ -106,30 +106,216 @@ pub fn audio_log_write(s: &str) {
 /// 全链路：probe → connect → registry/globals → enter/leave → enable 状态机 →
 /// commit/preedit → 错误。所有 [system_ime] 行同时写 stderr 和此文件
 /// （eprintln 只进 stderr，不进 latest.log——诊断必须靠这个文件）。
-static IME_LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+/// sync15（性能修复 C）日志写入器：`BufWriter` 缓冲 + 相邻重复行合并。
+///
+/// 病灶（用户实测"输入法特别卡"的日志侧贡献）：旧实现**每行一次
+/// write(2)+flush**（`writeln!+flush` 在 File 上就是每行一条系统调用），
+/// 且 `eprintln!` 未缓冲也逐行一条——组字热路径每键 2-6 行（vk modifiers
+/// 恒定刷屏行、引擎直通、ti3 State…），全部发生在渲染线程/事件回调栈上。
+/// bench50 基线实测：9.4s 打字场景 220 行 = 218 次 fd write。
+///
+/// 修复语义：
+/// 1. **文件写缓冲**（BufWriter 默认 8KiB）：fd write 次数从"每行 1 次"
+///    降到"每 8KiB 1 次 + 心跳 1 次"；
+/// 2. **相邻重复行合并**（metrics::RepeatCollapse）：内容相同的连排行只写
+///    首行本体，段闭合时补一行 `原行 (xN)` 摘要——诊断信息不丢（首尾可见
+///    + 总次数），热刷屏行的 stderr/编码/写入全部省掉；
+/// 3. **重要行即时落盘**：WARN/ERROR/IME_STATE 行写后立即 flush（崩溃取证
+///    的最后防线），其余行由 10s 心跳（`ime_log_flush`，metrics_tick 驱动）
+///    兜底——最坏丢失窗口 = 心跳间隔 + 缓冲余量，且只影响尾部计数行，
+///    最后一条本体早已写出。
+/// stderr 行为保持"逐行即时"（与旧版一致，launcher 控制台实时性不降级）；
+/// 被抑制的重复行**不**再写 stderr（正是省掉的主要成本）。
+static IME_LOG_FILE: Mutex<Option<ImeLogWriter>> = Mutex::new(None);
 
-/// sync15 日志 IO 全局计数（relaxed 原子——DBus worker 线程与主循环都会
+/// 日志 IO 全局计数（relaxed 原子——DBus worker 线程与主循环都会
 /// 走 ime_log_write，只做报告不做判定）。
-/// - lines/bytes：实际写出的行与文件字节；
-/// - write_ops：向日志 fd 的 write 次数（当前实现 = 每行 1 次；Phase C
-///   缓冲化后此数应大幅低于 lines——修复前后对比的核心读数）；
-/// - suppressed_repeats：相邻重复行合并抑制次数（Phase C 起 >0）。
+/// - lines/bytes：实际写出的行数（含摘要行，不含被抑制的重复）与文件字节；
+/// - write_ops：CountingWriter 观察到的 fd write 次数（缓冲化后 ≪ lines，
+///   修复前后对比的核心读数）；
+/// - suppressed_repeats：相邻重复行合并抑制次数。
 pub(crate) static IME_LOG_IO: crate::ime::metrics::LogIoCounters =
     crate::ime::metrics::LogIoCounters::new();
 
-/// 追加一行到 IME_LOG_FILE（若已设置），失败静默忽略。同时写 stderr。
+/// 计数包装：BufWriter 每次真正向 fd 写入都记一次 write_ops——
+/// write_ops/lines 比值就是缓冲生效的直接读数（修复前恒 ≈1.0）。
+struct CountingWriter(std::fs::File);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = std::io::Write::write(&mut self.0, buf)?;
+        IME_LOG_IO.add_write_op();
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.0)
+    }
+}
+
+pub(crate) struct ImeLogWriter {
+    buf: std::io::BufWriter<Box<dyn std::io::Write + Send>>,
+    collapse: crate::ime::metrics::RepeatCollapse,
+    /// 生产 writer 恒 true（保留逐行 stderr 的既有诊断合同）；
+    /// 单测注入 false 以免污染测试输出。
+    stderr: bool,
+}
+
+/// 崩溃取证敏感的"必须立刻在文件里"的行（其余行允许心跳窗口）。
+#[inline]
+fn is_important_line(s: &str) -> bool {
+    s.contains("WARN") || s.contains("ERROR") || s.starts_with("IME_STATE")
+}
+
+impl ImeLogWriter {
+    fn new(file: std::fs::File) -> Self {
+        Self {
+            buf: std::io::BufWriter::new(Box::new(CountingWriter(file))),
+            collapse: crate::ime::metrics::RepeatCollapse::default(),
+            stderr: true,
+        }
+    }
+
+    /// 写一行本体（不含重复判定）：stderr（可选）+ 时间戳入缓冲。
+    fn write_line(&mut self, s: &str) {
+        use std::io::Write;
+        if self.stderr {
+            eprintln!("{s}");
+        }
+        let text = format!("{} {s}
+", log_timestamp());
+        IME_LOG_IO.add_line(text.len() as u64);
+        let _ = self.buf.write_all(text.as_bytes());
+        if is_important_line(s) {
+            let _ = self.buf.flush();
+        }
+    }
+
+    /// 闭合未决重复段并冲刷缓冲（心跳/会话边界/测试读档点）。
+    fn settle(&mut self) {
+        use std::io::Write;
+        if let Some((line, n)) = self.collapse.flush() {
+            self.write_line(&format!("{line} (x{n})"));
+        }
+        let _ = self.buf.flush();
+    }
+
+    /// feed + 落子的组合（ime_log_write 生产路径与单测共用，杜绝
+    /// "生产逻辑测试复刻漂移"）。
+    fn ingest(&mut self, s: &str) {
+        use crate::ime::metrics::Feed;
+        match self.collapse.feed(s) {
+            Feed::Absorbed => {
+                IME_LOG_IO.add_suppressed();
+            }
+            Feed::NewLine { closed } => {
+                // 旧段若有重复，先补摘要行再写本体。
+                if let Some((line, n)) = closed {
+                    self.write_line(&format!("{line} (x{n})"));
+                }
+                self.write_line(s);
+            }
+        }
+    }
+}
+
+/// 追加一行到 IME 日志（缓冲 + 相邻重复合并，语义见 [`IME_LOG_FILE`] 文档）。
+/// 未安装文件（早期启动/纯单测环境）时退化为逐行 stderr——与旧行为一致。
 pub fn ime_log_write(s: &str) {
-    use std::io::Write;
-    eprintln!("{s}");
-    IME_LOG_IO.add_line(s.len() as u64 + 1);
     let mut guard = match IME_LOG_FILE.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
-    if let Some(f) = guard.as_mut() {
-        let _ = writeln!(f, "{} {s}", log_timestamp());
-        let _ = f.flush();
-        IME_LOG_IO.add_write_op();
+    match guard.as_mut() {
+        Some(w) => w.ingest(s),
+        None => {
+            eprintln!("{s}");
+            IME_LOG_IO.add_line(s.len() as u64 + 1);
+        }
+    }
+}
+
+/// 心跳/边界落盘：闭合重复段 + 冲刷缓冲。metrics_tick 每 10s 与
+/// setImeLogFile 换文件时调用；bench 测试在读取计数前调用。
+pub fn ime_log_flush() {
+    let mut guard = match IME_LOG_FILE.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    if let Some(w) = guard.as_mut() {
+        w.settle();
+    }
+}
+
+#[cfg(test)]
+mod ime_log_tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct SharedSink(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn test_writer() -> (ImeLogWriter, std::sync::Arc<Mutex<Vec<u8>>>) {
+        let shared = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let w = ImeLogWriter {
+            // 大缓冲保证测试期间只由 settle 触发落盘（验证"非每行 flush"）。
+            buf: std::io::BufWriter::with_capacity(64 * 1024, Box::new(SharedSink(shared.clone()))),
+            collapse: crate::ime::metrics::RepeatCollapse::default(),
+            stderr: false,
+        };
+        (w, shared)
+    }
+
+    #[test]
+    fn ime_log_writer_collapses_repeats_into_summary_line() {
+        // sync15 修复 C 核心语义：50 连排重复行 = 1 本体 + 1 摘要 (x50)，
+        // 而非 50 次编码 + 50 次缓冲写入 +（旧实现）50 次 fd write。
+        let (mut w, shared) = test_writer();
+        for _ in 0..50 {
+            w.ingest("SPAM identical line");
+        }
+        w.ingest("different line");
+        w.settle();
+        let text = String::from_utf8(shared.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.matches("SPAM identical line").count(), 2, "{text}");
+        assert!(text.contains("SPAM identical line (x50)"), "{text}");
+        assert_eq!(text.lines().count(), 3, "SPAM 本体 + 摘要 + different 本体：{text}");
+        assert!(w.collapse.pending().is_none(), "settle 后无未闭合段");
+    }
+
+    #[test]
+    fn important_lines_flush_immediately_others_buffer() {
+        // 崩溃取证合同：WARN 行写后必达 sink（fd）；普通行留在缓冲，
+        // settle 才落——write_ops 与 lines 解耦的机制本身。
+        let (mut w, shared) = test_writer();
+        w.ingest("normal line without flush");
+        assert!(shared.lock().unwrap().is_empty(), "普通行必须留在 BufWriter 缓冲里");
+        w.ingest("[waylandcraft][ime][relay] WARN serial mismatch 文本照常交付");
+        assert!(!shared.lock().unwrap().is_empty(), "WARN 行必须即时冲刷落盘");
+        let text = String::from_utf8(shared.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("normal line without flush"), "冲刷带上此前的缓冲内容");
+    }
+
+    #[test]
+    fn non_important_lines_do_not_touch_fd_per_line() {
+        // 缓冲生效的直接读数：300 行非重要行在 settle 前 0 次 fd 写入
+        // （旧实现 = 每行 1 次 write+flush）。
+        let (mut w, shared) = test_writer();
+        for i in 0..300 {
+            w.ingest(&format!("distinct line {i}")); // 内容各异，排除重复合并干扰
+        }
+        assert!(shared.lock().unwrap().is_empty(), "64KiB 缓冲未写满前不得触达 fd");
+        w.settle();
+        let text = String::from_utf8(shared.lock().unwrap().clone()).unwrap();
+        assert_eq!(text.lines().count(), 300);
     }
 }
 
@@ -138,7 +324,7 @@ pub fn ime_log_write(s: &str) {
 /// 的真实基线（无文件时 write_ops 恒 0，只有 stderr）。
 #[cfg(test)]
 pub(crate) fn set_ime_log_file_for_test(f: std::fs::File) {
-    let _ = IME_LOG_FILE.lock().map(|mut g| *g = Some(f));
+    let _ = IME_LOG_FILE.lock().map(|mut g| *g = Some(ImeLogWriter::new(f)));
 }
 
 #[allow(clippy::vec_box)]
@@ -1905,6 +2091,8 @@ fn set_ime_log_file<'local>(
         .open(&path_str);
     match file {
         Ok(mut f) => {
+            // 换文件前先把旧 writer 缓冲的尾部落盘/摘要闭合（不丢行）。
+            ime_log_flush();
             // 每次进程启动写一条运行边界（带 native 版本标识）。
             // ime.log 是追加模式（不清空），多实例/多版本日志混在一起时，
             // 用这条分隔行区分"本次运行"的起点 —— 诊断时从最新边界行
@@ -1927,7 +2115,7 @@ fn set_ime_log_file<'local>(
                     return Ok(());
                 }
             };
-            *guard = Some(f);
+            *guard = Some(ImeLogWriter::new(f));
             eprintln!(
                 "[system_ime] setImeLogFile: 输入法穿透全链路日志 -> {path_str}"
             );

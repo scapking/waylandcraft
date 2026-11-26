@@ -1176,6 +1176,8 @@ fn real_fcitx5_50_key_latency_bench() {
         "=== [bench50] popup: frames={} deliveries={} dup_skipped={} delivered_bytes={}KB jni_tick_deliveries={}",
         popup.frames, popup.deliveries, m.popup_dup_skipped, m.popup_delivered_bytes / 1024, jni_deliveries
     );
+    // 先闭合缓冲/重复段再读计数（否则 write_ops 少算未落盘部分）。
+    crate::bridge::ime_log_flush();
     let (lines, bytes, ops, supp) = crate::bridge::IME_LOG_IO.snapshot();
     eprintln!("=== [bench50] log_io: lines={lines} bytes={}KB write_ops={ops} suppressed={supp}", bytes / 1024);
     eprintln!("=== [bench50] commits={commits:?} first_commit={commit_seen:?}");
