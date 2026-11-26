@@ -24,7 +24,8 @@ public record SharedWindowPermissionPayload(long windowHandle, UUID playerUUID, 
 		buf -> new SharedWindowPermissionPayload(
 			buf.readLong(),
 			buf.readUUID(),
-			WindowPermission.values()[buf.readVarInt()]
+			// P1-6：非法等级回退 NONE（拒绝），不再 values()[越界] AIOOBE
+			WindowPermission.fromLevel(buf.readVarInt())
 		)
 	);
 	

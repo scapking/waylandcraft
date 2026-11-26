@@ -35,7 +35,8 @@ public record SharedWindowListPayload(List<WindowInfo> windows) implements Custo
 					buf.readLong(),
 					buf.readUUID(),
 					buf.readUtf(),
-					WindowPermission.values()[buf.readVarInt()]
+					// P1-6：非法等级回退 NONE（拒绝），不再 values()[越界] AIOOBE 崩解码线程
+					WindowPermission.fromLevel(buf.readVarInt())
 				));
 			}
 			return new SharedWindowListPayload(windows);
