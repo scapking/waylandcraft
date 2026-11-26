@@ -13,7 +13,7 @@
   <img src="https://img.shields.io/badge/Java-25-orange" />
   <img src="https://img.shields.io/badge/Platform-Linux%20%28capture%2Bshare%29-lightgrey" />
   <img src="https://img.shields.io/badge/Platform-Win%2FmacOS%2FAndroid%20%28viewer%29-lightgrey" />
-  <img src="https://img.shields.io/badge/Version-1.3.0--sync15-brightgreen" />
+  <img src="https://img.shields.io/badge/Version-1.4.0-brightgreen" />
   <img src="https://img.shields.io/badge/License-MIT-blue" />
 </p>
 
@@ -487,7 +487,7 @@ See the [Releases](https://github.com/scapking/waylandcraft/releases) page for t
 
 **Recent highlights:**
 
-- **1.3.0 sync3–15 (fork series)** — the productization arc:
+- **1.4.0 (fork series sync3–15)** — the productization arc:
   - **IME endgame** — nested fcitx5 daemon with auto-seeding of all installed engines; commit delivery hardened to protocol truth; **in-game candidate window** (GUI *and* world-space quads beside app windows, click + wheel); **built-in pinyin engine** for zero-dependency Chinese input; 「拼」state badge; `/wl ime info` / `/wl ime source` / `/wl ime eng`. Every field-reported failure mode became a regression test, including real-fcitx5 live suites.
   - **Stutter-free sharing** — playout-buffered A/V (4s default, clock-offset aware), per-window application audio (per-PID PipeWire capture, watchdog re-promotion), resolution never downscaled.
   - **Crash elimination** — PipeWire single-owner-thread threading model (cross-thread UAF gone, 80-round live stress), JNI-boundary UB fixes, portal capture stop-chain (no more zombie capture threads / stuck screen-record indicator).
