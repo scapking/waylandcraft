@@ -144,6 +144,7 @@ public class WindowShareManager {
 		// 音频捕获：跟随最近共享的窗口（native 单例，一次一个）
 		if(WaylandCraft.instance != null && WaylandCraft.instance.audioCaptureManager != null) {
 			audioCapture = WaylandCraft.instance.audioCaptureManager;
+			long prevAudioHandle = audioWindowHandle;
 			audioWindowHandle = windowHandle;
 			audioCapture.setActiveWindow(windowHandle);
 			WLCToplevel toplevel = getLocalWindow(windowHandle);
@@ -151,6 +152,14 @@ public class WindowShareManager {
 			boolean audioOk = audioCapture.start(windowHandle, windowTitle, appId);
 			if(audioOk) {
 				LOGGER.info("Audio sharing enabled for 0x{}", Long.toHexString(windowHandle));
+			}
+			else {
+				// P2-18：start 失败回滚跟随目标。旧实现先改 handle 再 start，失败后
+				// audioWindowHandle 指向没有活动捕获的窗口——再停"上一个跟随窗口"时
+				// 停不掉它的音频，共享窗口间音频归属错乱。
+				audioWindowHandle = prevAudioHandle;
+				LOGGER.info("Audio capture start failed for 0x{} (audio stays on 0x{})",
+					Long.toHexString(windowHandle), Long.toHexString(prevAudioHandle));
 			}
 		}
 		
@@ -220,11 +229,18 @@ public class WindowShareManager {
 		// 音频捕获：X11 窗口有 _NET_WM_PID，直接复用按 PID 捕获的链路
 		if(WaylandCraft.instance != null && WaylandCraft.instance.audioCaptureManager != null) {
 			audioCapture = WaylandCraft.instance.audioCaptureManager;
+			long prevAudioHandle = audioWindowHandle;
 			audioWindowHandle = xid;
 			audioCapture.setActiveWindow(xid);
 			boolean audioOk = audioCapture.start(xid, title, appId);
 			if(audioOk) {
 				LOGGER.info("Audio sharing enabled for X11 0x{}", Long.toHexString(xid));
+			}
+			else {
+				// P2-18：同 wayland 路径，start 失败回滚跟随目标
+				audioWindowHandle = prevAudioHandle;
+				LOGGER.info("Audio capture start failed for X11 0x{} (audio stays on 0x{})",
+					Long.toHexString(xid), Long.toHexString(prevAudioHandle));
 			}
 		}
 
@@ -248,6 +264,9 @@ public class WindowShareManager {
 				audioCapture.stop();
 			}
 			audioWindowHandle = 0;
+			// P2-18：跟随窗口停止后回落到仍在共享的"最近一个"窗口继续捕获；
+			// 没有候选时明确提示（旧实现直接置 0，其余共享窗口从此无声且无日志线索）。
+			fallbackAudioFollow(windowHandle);
 		}
 		
 		diffUpdateManager.clearWindow(windowHandle);
@@ -736,6 +755,46 @@ public class WindowShareManager {
 		}
 	}
 	
+	/**
+	 * P2-18 纯函数（可单测）：从仍在共享的窗口里选音频回落候选——
+	 * 排除 excludeHandle 后取 startTime 最新者；无候选返回 null。
+	 */
+	static ShareState pickAudioFallback(Iterable<ShareState> states, long excludeHandle) {
+		ShareState next = null;
+		for(ShareState s : states) {
+			if(s == null || s.windowHandle == excludeHandle) continue;
+			if(next == null || s.startTime > next.startTime) next = s;
+		}
+		return next;
+	}
+
+	/**
+	 * P2-18：音频跟随窗口停止后，回落到仍在共享的"最近启动"窗口继续捕获
+	 * （与 startSharing 的"单例跟随最近窗口"语义一致）；无候选时保持无音频并提示。
+	 */
+	private void fallbackAudioFollow(long stoppedHandle) {
+		ShareState next = pickAudioFallback(shareStates.values(), stoppedHandle);
+		if(next == null) {
+			LOGGER.info("Audio follow window 0x{} stopped; no other shared window to fall back to",
+				Long.toHexString(stoppedHandle));
+			return;
+		}
+		if(audioCapture == null) return;
+		audioWindowHandle = next.windowHandle;
+		audioCapture.setActiveWindow(next.windowHandle);
+		String appId;
+		if(next.source == ShareState.Source.X11) {
+			appId = next.x11AppId;
+		} else {
+			WLCToplevel t = getLocalWindow(next.windowHandle);
+			appId = t != null ? t.appID : null;
+		}
+		boolean ok = audioCapture.start(next.windowHandle, next.windowTitle, appId);
+		if(!ok) audioWindowHandle = 0;
+		LOGGER.info("Audio follow fell back to shared window 0x{} (start ok={})",
+			Long.toHexString(next.windowHandle), ok);
+	}
+
 	@Nullable
 	private WLCToplevel getLocalWindow(long windowHandle) {
 		if(clientMod == null || clientMod.bridge == null) {
@@ -839,7 +898,8 @@ public class WindowShareManager {
 
 		public final long windowHandle;
 		public final String windowTitle;
-		public final long startTime;
+		// P2-18：非 final——音频回落候选按"最近启动"选择；单测需要可控注入该时刻
+		public long startTime;
 
 		public final Source source;
 

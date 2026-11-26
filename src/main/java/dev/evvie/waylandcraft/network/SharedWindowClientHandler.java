@@ -37,7 +37,14 @@ public class SharedWindowClientHandler {
 	private static final Map<Long, java.util.ArrayDeque<HeldAudio>> pendingAudio = new ConcurrentHashMap<>();
 	private static final long PENDING_AUDIO_TTL_MS = 15_000;
 	private static final int PENDING_AUDIO_MAX_PACKETS = 100;
+	// P2-14：全局待放窗口数上限。旧实现只有"每窗口 100 包"的局部上限——
+	// 恶意/异常服务端可用海量 windowHandle × 每 handle ≤100 包把 pendingAudio
+	// 无界撑大（且 TTL 清扫只在列表更新时跑，列表不来就永久驻留）。
+	private static final int PENDING_AUDIO_MAX_WINDOWS = 16;
+	// P2-14：TTL 清扫节流间隔（挂在音频包到达路径上自跑，不再依赖列表更新到达）
+	private static final long PENDING_SWEEP_INTERVAL_MS = 5_000;
 	private static volatile long lastPendingAudioLogMs = 0;
+	private static volatile long lastPendingSweepMs = 0;
 	
 	/** ⑥ /wl status：viewer 侧已知共享窗口句柄集合（只读视图） */
 	public static java.util.Collection<Long> getKnownWindowHandles() {
@@ -51,10 +58,34 @@ public class SharedWindowClientHandler {
 	}
 	
 	private static void holdAudio(SharedWindowAudioPayload payload) {
-		java.util.ArrayDeque<HeldAudio> q =
-			pendingAudio.computeIfAbsent(payload.windowHandle(), h -> new java.util.ArrayDeque<>());
+		holdAudioAt(payload, System.currentTimeMillis());
+	}
+
+	/** 可注入时间的 holdAudio（测试接缝；生产路径走 holdAudio 用真实时钟） */
+	static void holdAudioAt(SharedWindowAudioPayload payload, long now) {
+		// P2-14：TTL 清扫挂到包到达路径（节流 5s）——列表一直不更新也能回收，
+		// 不再依赖 handleWindowListUpdate 触发 flushPendingAudio。
+		if(now - lastPendingSweepMs >= PENDING_SWEEP_INTERVAL_MS) {
+			sweepPendingAudioAt(now);
+		}
+
+		java.util.ArrayDeque<HeldAudio> q = pendingAudio.get(payload.windowHandle());
+		if(q == null) {
+			if(pendingAudio.size() >= PENDING_AUDIO_MAX_WINDOWS) {
+				sweepPendingAudioAt(now); // 先强制清一轮过期项
+				if(pendingAudio.size() >= PENDING_AUDIO_MAX_WINDOWS) {
+					// 仍超限：新未知窗口丢包（宁缺一段音频，不无界泄漏）
+					if(now - lastPendingAudioLogMs > 10_000) {
+						lastPendingAudioLogMs = now;
+						LOGGER.warn("[audio] pending-audio window cap {} reached, dropping packets for unknown window 0x{}",
+							PENDING_AUDIO_MAX_WINDOWS, Long.toHexString(payload.windowHandle()));
+					}
+					return;
+				}
+			}
+			q = pendingAudio.computeIfAbsent(payload.windowHandle(), h -> new java.util.ArrayDeque<>());
+		}
 		int size;
-		long now = System.currentTimeMillis();
 		synchronized(q) {
 			q.addLast(new HeldAudio(payload, now));
 			while(q.size() > PENDING_AUDIO_MAX_PACKETS) q.removeFirst();
@@ -66,6 +97,51 @@ public class SharedWindowClientHandler {
 			LOGGER.info("[audio] holding packets for not-yet-listed window 0x{} ({} pending) — list update not arrived yet",
 				Long.toHexString(payload.windowHandle()), size);
 		}
+	}
+
+	/**
+	 * P2-14：清理"未出现在列表且队头已过期"的暂存队列（列表内窗口由 flushPendingAudio 负责）。
+	 * 测试接缝：now 注入。返回被移除的窗口数。
+	 */
+	static int sweepPendingAudioAt(long now) {
+		lastPendingSweepMs = now;
+		int removed = 0;
+		for(Long handle : new ArrayList<>(pendingAudio.keySet())) {
+			if(remoteWindows.containsKey(handle)) continue;
+			java.util.ArrayDeque<HeldAudio> q = pendingAudio.get(handle);
+			if(q == null) continue;
+			synchronized(q) {
+				while(!q.isEmpty() && now - q.peekFirst().arrivalMs() > PENDING_AUDIO_TTL_MS) {
+					q.removeFirst();
+				}
+				// 仅当 map 里仍是同一个队列才移除（与并发 holdAudio 的 addLast 竞争安全）
+				if(q.isEmpty() && pendingAudio.remove(handle, q)) {
+					removed++;
+				}
+			}
+		}
+		return removed;
+	}
+
+	/** 测试接缝：当前处于暂存状态的窗口数 */
+	static int pendingAudioWindowCount() {
+		return pendingAudio.size();
+	}
+
+	/** 测试接缝：某窗口当前暂存包数 */
+	static int pendingAudioPacketCount(long windowHandle) {
+		java.util.ArrayDeque<HeldAudio> q = pendingAudio.get(windowHandle);
+		if(q == null) return -1;
+		synchronized(q) {
+			return q.size();
+		}
+	}
+
+	/** 测试接缝：复位暂存状态（单例静态 map 跨用例隔离用） */
+	static void resetPendingAudioForTest() {
+		pendingAudio.clear();
+		lastPendingSweepMs = 0;
+		lastPendingAudioLogMs = 0;
 	}
 	
 	/** 列表更新后补放暂存音频；过期整批丢弃 */
