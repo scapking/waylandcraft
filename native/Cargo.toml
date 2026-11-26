@@ -23,7 +23,6 @@ zbus = { version = "5", default-features = false, features = ["tokio", "blocking
 # v0.13.10 撤销 zvariant 显式依赖——gvariant feature 跟 zvariant_utils
 # 不兼容（编译报 E0004 非穷尽模式）。改在 dbus_ibus.rs 跳过
 # SetSurroundingText 调。
-pipewire = "0.8"
 # Wayland client for wlr-foreign-toplevel-management
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
@@ -95,3 +94,8 @@ lto = true           # link-time optimization
 codegen-units = 1    # single codegen unit (better optimization)
 strip = true         # strip debug symbols
 panic = "abort"      # smaller binary
+
+# PipeWire 绑定只在真实实现编译的平台生效（stub 模块不需要；
+# 非 Linux 交叉 check 因此不再拉 libspa-sys/pkg-config）。
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+pipewire = "0.8"

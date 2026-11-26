@@ -567,6 +567,7 @@ mod ffi {
     use block2::RcBlock;
     use objc2::rc::Retained;
     use objc2::runtime::AnyClass;
+    use objc2::AnyThread;
     use objc2_core_foundation::{
         CFArray, CFArrayGetValueAtIndex, CFDictionary, CFDictionaryGetValue, CFNumber, CFRetained,
         CFString, CFType, Type,
@@ -578,6 +579,53 @@ mod ffi {
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Instant;
+
+    /// 一次性等待门（block 回调线程 signal、等待线程带超时 wait）。
+    ///
+    /// 不用 `std::sync::Semaphore`：rustc stable（含 1.100）尚未稳定该类型，
+    /// 跨版本工具链会直接 E0432。Mutex+Condvar 等价实现，且"先 signal 后
+    /// wait"不丢事件。
+    struct WaitGate {
+        done: Mutex<bool>,
+        cvar: Condvar,
+    }
+
+    impl WaitGate {
+        fn new() -> Self {
+            WaitGate {
+                done: Mutex::new(false),
+                cvar: Condvar::new(),
+            }
+        }
+
+        fn signal(&self) {
+            let mut g = self.done.lock().unwrap_or_else(|e| e.into_inner());
+            *g = true;
+            self.cvar.notify_all();
+        }
+
+        /// true = 已 signal；false = 超时且未 signal。
+        fn wait(&self, timeout: std::time::Duration) -> bool {
+            let mut g = self.done.lock().unwrap_or_else(|e| e.into_inner());
+            let deadline = Instant::now() + timeout;
+            while !*g {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, wait_res) = self
+                    .cvar
+                    .wait_timeout(g, remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+                g = next;
+                if wait_res.timed_out() {
+                    break;
+                }
+            }
+            *g
+        }
+    }
 
     // ── 时序常量 ─────────────────────────────────────────────
     /// 抓帧轮询目标帧率（SCScreenshotManager 为同步排队抓帧，10-15fps 为
@@ -605,8 +653,8 @@ mod ffi {
     ///    任一时刻只有一个线程持有/访问（无共享可变）；
     /// 3. SCContentFilter 创建后不可变，SCK 内部自身跨队列传递这类对象。
     /// 绑定未来若收紧（如标记 MainThreadOnly）此 unsafe impl 需重审。
-    pub struct SendRetained<T: objc2::AnyObject>(pub Retained<T>);
-    unsafe impl<T: objc2::AnyObject> Send for SendRetained<T> {}
+    pub struct SendRetained<T: objc2::Message>(pub Retained<T>);
+    unsafe impl<T: objc2::Message> Send for SendRetained<T> {}
 
     struct Shared {
         slot: Arc<FrameSlot>,
@@ -674,25 +722,23 @@ mod ffi {
 
     // ── SCShareableContent 异步→同步桥 ──────────────────────
 
-    /// 在调用线程同步获取 SCShareableContent（block + Semaphore）。
+    /// 在调用线程同步获取 SCShareableContent（block + WaitGate）。
     /// 返回的 filter 由调用线程构造（ObjC 对象不跨线程"共享"，只在下方
     /// SendRetained 论证内一次性转移）。
     fn shareable_blocking() -> Result<Retained<sck::SCShareableContent>, String> {
-        let sem = Arc::new(std::sync::Semaphore::new(0));
+        let gate = Arc::new(WaitGate::new());
         let out: Arc<Mutex<Option<Result<RetainedHolder, String>>>> =
             Arc::new(Mutex::new(None));
         {
-            let sem = sem.clone();
+            let gate = gate.clone();
             let out = out.clone();
             let block = RcBlock::new(move |content: *mut sck::SCShareableContent, err: *mut NSError| {
-                let result = match NonNull::new(content) {
-                    Some(ptr) => {
-                        // block 执行期间 ARC 持有 content；retain 成拥有权带走
-                        Ok(RetainedHolder(unsafe { Retained::retain(ptr) }))
-                    }
+                // objc2 0.6：Retained::retain(*mut) -> Option（null → None）
+                let result = match unsafe { Retained::retain(content) } {
+                    Some(ret) => Ok(RetainedHolder(ret)),
                     None => {
-                        let msg = match NonNull::new(err) {
-                            Some(e) => unsafe { e.as_ref().localizedDescription().to_string() },
+                        let msg = match unsafe { Retained::retain(err) } {
+                            Some(e) => e.localizedDescription().to_string(),
                             None => "unknown".to_string(),
                         };
                         Err(format!("shareable_content_failed: {msg}"))
@@ -703,7 +749,7 @@ mod ffi {
                         *g = Some(result);
                     }
                 }
-                sem.add_permits(1);
+                gate.signal();
             });
             unsafe {
                 sck::SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
@@ -713,7 +759,7 @@ mod ffi {
                 );
             }
         }
-        if sem.try_wait_for(SHARE_TIMEOUT).is_err() {
+        if !gate.wait(SHARE_TIMEOUT) {
             return Err("shareable_content_timeout".to_string());
         }
         match session_lock(&out).take() {
@@ -756,7 +802,7 @@ mod ffi {
     /// kCGWindowBounds 是嵌套 CFDictionary（键 "X"/"Y"/"Width"/"Height"）。
     fn dict_bounds(dict: &CFDictionary) -> Option<(i32, i32, i32, i32)> {
         static BOUNDS_KEYS: [&str; 4] = ["X", "Y", "Width", "Height"];
-        let bounds_ref = dict_value(dict, cg::kCGWindowBounds)?;
+        let bounds_ref = dict_value(dict, unsafe { cg::kCGWindowBounds })?;
         let bounds: CFRetained<CFDictionary> = bounds_ref.downcast().ok()?;
         let mut vals = [0i32; 4];
         for (i, k) in BOUNDS_KEYS.iter().enumerate() {
@@ -791,16 +837,16 @@ mod ffi {
             let Ok(dict) = item.downcast::<CFDictionary>() else {
                 continue;
             };
-            let Some(id) = dict_i64(&dict, cg::kCGWindowNumber) else {
+            let Some(id) = dict_i64(&dict, unsafe { cg::kCGWindowNumber }) else {
                 continue;
             };
             let (x, y, w, h) = dict_bounds(&dict).unwrap_or((0, 0, 0, 0));
             raw.push(WindowInfo {
                 id: id as u32,
-                owner: dict_str(&dict, cg::kCGWindowOwnerName).unwrap_or_default(),
-                title: dict_str(&dict, cg::kCGWindowName).unwrap_or_default(),
-                pid: dict_i64(&dict, cg::kCGWindowOwnerPID).unwrap_or(-1) as i32,
-                layer: dict_i64(&dict, cg::kCGWindowLayer).unwrap_or(-1),
+                owner: dict_str(&dict, unsafe { cg::kCGWindowOwnerName }).unwrap_or_default(),
+                title: dict_str(&dict, unsafe { cg::kCGWindowName }).unwrap_or_default(),
+                pid: dict_i64(&dict, unsafe { cg::kCGWindowOwnerPID }).unwrap_or(-1) as i32,
+                layer: dict_i64(&dict, unsafe { cg::kCGWindowLayer }).unwrap_or(-1),
                 x,
                 y,
                 width: w,
@@ -869,8 +915,8 @@ mod ffi {
             }
             let f: Retained<sck::SCContentFilter> = unsafe {
                 sck::SCContentFilter::initWithDesktopIndependentWindow(
-                    <sck::SCContentFilter as objc2::ClassType>::alloc(),
-                    win,
+                    sck::SCContentFilter::alloc(),
+                    &win,
                 )
             };
             let fr = unsafe { win.frame() };
@@ -903,8 +949,8 @@ mod ffi {
             }
             let f: Retained<sck::SCContentFilter> = unsafe {
                 sck::SCContentFilter::initWithDisplay_excludingWindows(
-                    <sck::SCContentFilter as objc2::ClassType>::alloc(),
-                    d,
+                    sck::SCContentFilter::alloc(),
+                    &d,
                     &no_exclusions,
                 )
             };
@@ -1032,9 +1078,11 @@ mod ffi {
     }
 
     fn make_config() -> Result<Retained<sck::SCStreamConfiguration>, String> {
+        // objc2 0.6.5：msg_send_id! 已弃用；msg_send! 原生处理
+        // Allocated 接收者 + init 方法族 → Retained 转换。
         let cfg: Retained<sck::SCStreamConfiguration> = unsafe {
-            let alloc = <sck::SCStreamConfiguration as objc2::ClassType>::alloc();
-            objc2::msg_send_id![alloc, init]
+            let alloc = sck::SCStreamConfiguration::alloc();
+            objc2::msg_send![alloc, init]
         };
         // SDR 显式固定：HDR 输出是半角浮点像素格式（RGBA16F），本模块通道
         // 判定只接受 8bit 形态。
@@ -1072,10 +1120,10 @@ mod ffi {
                 break;
             }
 
-            let sem = Arc::new(std::sync::Semaphore::new(0));
+            let gate = Arc::new(WaitGate::new());
             let out: Arc<Mutex<Option<CaptureOutcome>>> = Arc::new(Mutex::new(None));
             {
-                let sem = sem.clone();
+                let gate = gate.clone();
                 let out = out.clone();
                 let block = RcBlock::new(move |img: *mut cg::CGImage, err: *mut NSError| {
                     let outcome = unsafe { extract_pixels(img, err) };
@@ -1084,7 +1132,7 @@ mod ffi {
                             *g = Some(outcome);
                         }
                     }
-                    sem.add_permits(1);
+                    gate.signal();
                 });
                 unsafe {
                     sck::SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
@@ -1098,45 +1146,42 @@ mod ffi {
                 // 释放，但捕获的仅是 Arc，不触碰 frame slot 以外的状态。
             }
 
-            match sem.try_wait_for(CAPTURE_ACK_TIMEOUT) {
-                Ok(_permit) => {
-                    let taken = out
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .take();
-                    match taken {
-                        Some(CaptureOutcome::Ok(parts)) => {
-                            if !size_set {
-                                // 首帧得知真实像素尺寸 → 设 cap 降采样
-                                let (cw, ch) =
-                                    compute_capture_size(parts.width, parts.height, MAX_CAPTURE_EDGE);
-                                if cw != parts.width as usize || ch != parts.height as usize {
-                                    unsafe {
-                                        config.setWidth(cw);
-                                        config.setHeight(ch);
-                                    }
+            if gate.wait(CAPTURE_ACK_TIMEOUT) {
+                let taken = out
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+                match taken {
+                    Some(CaptureOutcome::Ok(parts)) => {
+                        if !size_set {
+                            // 首帧得知真实像素尺寸 → 设 cap 降采样
+                            let (cw, ch) =
+                                compute_capture_size(parts.width, parts.height, MAX_CAPTURE_EDGE);
+                            if cw != parts.width as usize || ch != parts.height as usize {
+                                unsafe {
+                                    config.setWidth(cw);
+                                    config.setHeight(ch);
                                 }
-                                size_set = true;
                             }
-                            shared
-                                .slot
-                                .publish(parts.width, parts.height, parts.pixels);
-                            failures = 0;
+                            size_set = true;
                         }
-                        Some(CaptureOutcome::Err(e)) => {
-                            failures += 1;
-                            eprintln!("[mac-capture] {label}: frame error ({failures}): {e}");
-                        }
-                        None => {
-                            failures += 1;
-                            eprintln!("[mac-capture] {label}: callback lost ({failures})");
-                        }
+                        shared
+                            .slot
+                            .publish(parts.width, parts.height, parts.pixels);
+                        failures = 0;
+                    }
+                    Some(CaptureOutcome::Err(e)) => {
+                        failures += 1;
+                        eprintln!("[mac-capture] {label}: frame error ({failures}): {e}");
+                    }
+                    None => {
+                        failures += 1;
+                        eprintln!("[mac-capture] {label}: callback lost ({failures})");
                     }
                 }
-                Err(_) => {
-                    failures += 1;
-                    eprintln!("[mac-capture] {label}: capture timeout ({failures})");
-                }
+            } else {
+                failures += 1;
+                eprintln!("[mac-capture] {label}: capture timeout ({failures})");
             }
 
             if failures >= MAX_CONSECUTIVE_FAILURES {

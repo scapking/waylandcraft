@@ -10,7 +10,7 @@
 
 | 方案 | 系统要求 | 结论 |
 | --- | --- | --- |
-| **SCScreenshotManager.captureImageWithFilter（已采用）** | macOS 14+ | 静态抓帧 API，一次调用一张 CGImage；以 12fps 轮询即可覆盖"桌面窗口当贴图"的需求。objc2 绑定齐备（`objc2-screen-capture-kit 0.3.2`），block 回调 + Semaphore 同步桥接，无 delegate、无 runloop 依赖。 |
+| **SCScreenshotManager.captureImageWithFilter（已采用）** | macOS 14+ | 静态抓帧 API，一次调用一张 CGImage；以 12fps 轮询即可覆盖"桌面窗口当贴图"的需求。objc2 绑定齐备（`objc2-screen-capture-kit 0.3.2`），block 回调 + WaitGate（Mutex+Condvar，std Semaphore 未稳定故不用）同步桥接，无 delegate、无 runloop 依赖。 |
 | SCStream 全速流 | macOS 12.3+ | 需实现 `SCStreamDelegate` / `SCStreamOutput` 协议（objc2 `define_class!` 手写）、CMSampleBuffer 解析、帧队列背压。在**无法真机验证**的条件下风险过高，且与现有 Java 拉帧模型（每 tick 取最新帧）收益重叠——贴图消费端本来就要重采样到纹理。后续若需要 >15fps，可在此模块加 `stream` 特性而不改线协议（seq 语义不变）。**帧率上限：约 12fps（`TARGET_FPS`）**。 |
 | CGWindowListCreateImage | macOS ≤14（15 起对屏幕内容返回空/失效） | 不作 fallback。macOS 13 及以下统一报 `err:macos14_required`，引导升级而非降级出错误画面。 |
 
@@ -25,7 +25,7 @@ Java (JNI 线程)                     mac-capture 线程
 ────────────────                    ─────────────────────────────
 mac_capture_list        ──同步──▶   CGWindowListCopyWindowInfo + 过滤
 mac_capture_start_window ─同步─▶    权限 preflight/request → SCShareableContent
-                                    （block+Semaphore，≤10s）→ 建 SCContentFilter
+                                    （block+WaitGate，≤10s）→ 建 SCContentFilter
                                     → spawn ─────────────────────▶ 循环：
                                       condvar 等 1000/12ms（stop 可打断）
                                       → captureImage…(block 回调内拷像素
@@ -167,6 +167,29 @@ start 可能阻塞至 ~10 秒（系统弹窗等待授权 + 内容枚举）。Jav
   要真正进入 macOS jar 需要：CI 新增 macos runner 的 `cargo build`（原生
   aarch64/x86_64 各一，或交叉+签名）、`build.gradle` 从 viewerPlatforms 摘掉
   macos、`verify_jar.py` 更新——均在本任务范围外，由维护者排期。
+
+## 5.5 Apple 交叉 check 覆盖面（如实声明）
+
+- **模块级隔离门已通过**：`capture_macos.rs` 以 edition 2024 独立 crate
+  （依赖与本仓库 macos target 段一致）分别在
+  `--target aarch64-apple-darwin` 与 `--target x86_64-apple-darwin` 下
+  `DOCS_RS=1 cargo check -j1` 全新编译 **0 错误**（14 条 warning 全部是绑定
+  0.3.2 把 `CGImageGetWidth`/`CFDictionaryGetValue` 等 C 风格函数改名为方法
+  的 deprecated 提示，属后续打磨项，两种形态当前都存在）。
+- **整库** `cargo check --target *-apple-darwin` **当前过不去，阻塞点与本模块
+  无关**（实测报错：`error: failed to run custom build command for
+  gettext-sys v0.26.0`，链路 `waylandcraft → freedesktop-desktop-entry 0.8.1 →
+  gettext-rs → gettext-sys`，其 build.rs 依赖 pkg-config 的 Linux 桌面环境；
+  合入的主分支还引入了 libspa-sys 等 C 面）。Linux 依赖链按 target cfg 化是
+  独立后续工程；pipewire 已先行门控进
+  `[target.'cfg(any(target_os="linux",target_os="android"))'.dependencies]`。
+- `DOCS_RS=1` 的语义：`objc2-exception-helper` 的 build.rs 用宿主 cc 编译
+  try_catch.m（无 include 的纯 ObjC，本机无 clang）；该 env 使其早退——与
+  cargo check 不做链接的语义一致，不影响类型/签名检查有效性。真机 CI 原生
+  编译时不设该 env，正常参与链接。
+- 实现注记：跨线程等待原语用自写 `WaitGate`（Mutex+Condvar，一次性 signal，
+  先 signal 后 wait 不丢事件）——`std::sync::Semaphore` 在 stable rustc
+  （含 1.100）尚未稳定，禁止使用。
 
 ## 6. 已知风险 / 未验证项（本机 Linux，无法运行 macOS）
 
