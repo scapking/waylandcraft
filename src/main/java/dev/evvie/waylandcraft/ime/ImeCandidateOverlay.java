@@ -475,6 +475,9 @@ public final class ImeCandidateOverlay {
 		if(now - lastTupleMs < 1000) return;
 		lastTupleMs = now;
 		lastLoggedTuple = tuple;
+		// 分级=细节（五元组轮询行）→ verbose 档；节流簿记照常（开档后下一
+		// 翻转立即可见）。首次注入证明行（extract 首次命中）保留——见上方。
+		if(!dev.evvie.waylandcraft.utils.WcLogging.verbose()) return;
 		WaylandCraftCommon.LOGGER.info(
 				"[ime][overlay] 状态五元组 {} | polls={} frames={} incomingVisible={} exceptions={} uploadFails={} reshow={} extracts={} workState={} worldVisible={}",
 				tuple, polls, framesDelivered, incomingVisible, pollExceptions, uploadFails, reshowCount, extractHits, workState,

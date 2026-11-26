@@ -102,7 +102,8 @@ public final class ImeCandidateWorld {
 			target = null;
 			rect = null;
 			anchoredByCursorRect = false;
-			if(was) {
+			if(was && dev.evvie.waylandcraft.utils.WcLogging.verbose()) {
+				// 分级=细节（[ime][world] 显示轨迹行）→ verbose 档。
 				WaylandCraftCommon.LOGGER.info("[ime][world] worldVisible=false（窗口销毁/失焦/会话结束/候选帧消失）");
 			}
 			return;
@@ -150,7 +151,8 @@ public final class ImeCandidateWorld {
 		target = t;
 		rect = r;
 		anchoredByCursorRect = cursor != null;
-		if(!was) {
+		if(!was && dev.evvie.waylandcraft.utils.WcLogging.verbose()) {
+			// 分级=细节（[ime][world] 显示轨迹行）→ verbose 档。
 			WaylandCraftCommon.LOGGER.info(
 					"[ime][world] worldVisible=true 窗口={} anchor={} rect=({},{} {}x{}) seq={}",
 					windowTitle(t.window),
