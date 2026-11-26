@@ -61,6 +61,10 @@ public class WaylandCraftNetworking {
 		// 窗口所有者（owner）授权管理命令
 		PayloadTypeRegistry.serverboundPlay().register(SharedWindowPermCommandPayload.TYPE, SharedWindowPermCommandPayload.CODEC);
 
+		// ACL-2：邀请制（S2C 提示给 owner / C2S owner 应答）
+		PayloadTypeRegistry.clientboundPlay().register(ShareInviteRequestPayload.TYPE, ShareInviteRequestPayload.CODEC);
+		PayloadTypeRegistry.serverboundPlay().register(ShareInviteResponsePayload.TYPE, ShareInviteResponsePayload.CODEC);
+
 		// P1-5：alive_windows 直接写玩家对象状态，原实现整段在 netty 线程执行：
 		// 与服务器线程（give_items 读、物品 tick 读）竞争 ArrayList → CME/丢数据，
 		// 进而误删玩家窗口物品。现在：payload 限长 → 服务端线程上原子替换集合内容。
@@ -113,6 +117,10 @@ public class WaylandCraftNetworking {
 		// 处理窗口所有者授权管理命令
 		ServerPlayNetworking.registerGlobalReceiver(SharedWindowPermCommandPayload.TYPE, (payload, ctx) ->
 			runSafely(ctx, "window_perm_command", () -> SharedWindowServerHandler.handleWindowPermCommand(payload, ctx.player())));
+
+		// ACL-2：处理 owner 对邀请的应答（服务端线程；鉴权在 handler 内）
+		ServerPlayNetworking.registerGlobalReceiver(ShareInviteResponsePayload.TYPE, (payload, ctx) ->
+			runSafely(ctx, "share_invite_response", () -> SharedWindowServerHandler.handleShareInviteResponse(payload, ctx.player())));
 
 		// 处理客户端上传的窗口图像 - 只做权限校验并入最新帧缓存；
 		// 实际转发由服务端 tick（SharedWindowFrameRelay，每 2 tick 批量转发）完成，
@@ -222,6 +230,8 @@ public class WaylandCraftNetworking {
 		SharedWindowServerHandler.reset();
 		InteractionForwarder.reset();
 		ServerWarnThrottle.reset();
+		// ACL-5：审计计数不跨会话残留
+		dev.evvie.waylandcraft.shared.ShareAclAudit.clear();
 	}
 
 }

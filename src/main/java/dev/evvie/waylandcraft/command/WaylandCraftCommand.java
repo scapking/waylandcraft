@@ -151,6 +151,21 @@ public class WaylandCraftCommand {
 						.then(ClientCommands.argument("handle", StringArgumentType.word())
 							.then(ClientCommands.argument("player", StringArgumentType.word())
 								.executes(WaylandCraftCommand::shareGrant)
+								.then(ClientCommands.argument("level", StringArgumentType.word())
+									.suggests((ctx, builder) -> {
+										for (WindowPermission p : new WindowPermission[]{WindowPermission.VIEW, WindowPermission.INTERACT, WindowPermission.CONTROL})
+											builder.suggest(p.name());
+										return builder.buildFuture();
+									})
+									.executes(WaylandCraftCommand::shareGrant)
+									.then(ClientCommands.argument("duration", StringArgumentType.word())
+										.suggests((ctx, builder) -> {
+											builder.suggest("10m"); builder.suggest("1h"); builder.suggest("1d");
+											return builder.buildFuture();
+										})
+										.executes(WaylandCraftCommand::shareGrant)
+									)
+								)
 							)
 						)
 					)
@@ -159,6 +174,43 @@ public class WaylandCraftCommand {
 							.then(ClientCommands.argument("player", StringArgumentType.word())
 								.executes(WaylandCraftCommand::shareRevoke)
 							)
+						)
+					)
+					// ACL-2：新观众默认策略（op 在服务端门控）
+					.then(ClientCommands.literal("default")
+						.then(ClientCommands.argument("policy", StringArgumentType.word())
+							.suggests((ctx, builder) -> {
+								builder.suggest("ask"); builder.suggest("allow"); builder.suggest("deny");
+								return builder.buildFuture();
+							})
+							.executes(WaylandCraftCommand::shareDefaultPolicy)
+						)
+					)
+					// ACL-2：邀请应答（聊天点击按钮生成；也可手打）
+					.then(ClientCommands.literal("invite")
+						.then(ClientCommands.literal("accept")
+							.then(ClientCommands.argument("handle", StringArgumentType.word())
+								.then(ClientCommands.argument("player", StringArgumentType.word())
+									.executes(WaylandCraftCommand::shareInviteAccept)
+									.then(ClientCommands.argument("duration", StringArgumentType.word())
+										.executes(WaylandCraftCommand::shareInviteAccept)
+									)
+								)
+							)
+						)
+						.then(ClientCommands.literal("deny")
+							.then(ClientCommands.argument("handle", StringArgumentType.word())
+								.then(ClientCommands.argument("player", StringArgumentType.word())
+									.executes(WaylandCraftCommand::shareInviteDeny)
+								)
+							)
+						)
+					)
+					// ACL-5：ACL 报表（任意玩家可用；服务端按身份过滤可见行）
+					.then(ClientCommands.literal("acl")
+						.executes(WaylandCraftCommand::shareAcl)
+						.then(ClientCommands.argument("handle", StringArgumentType.word())
+							.executes(WaylandCraftCommand::shareAcl)
 						)
 					)
 					.then(ClientCommands.literal("perms")
@@ -469,7 +521,9 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §e/wl resize <handle> <w> <h>§7 — 调整窗口分辨率§r"));
 		source.sendFeedback(Component.literal(" §e/wl settings list|set <key> <value>§7 — 查看/修改设置§r"));
 		source.sendFeedback(Component.literal(" §e/wl share start|stop|quality|preset|config|reset|info|resolution|stats <handle> [...]§7 — 共享管理（start/stop 支持 all 一键全部）§r"));
-		source.sendFeedback(Component.literal(" §e/wl permission list|default|allow|deny|remove§7 — 共享权限管理§r"));
+		source.sendFeedback(Component.literal(" §e/wl share grant <handle> <player> [level] [时长]§7 / §erevoke <handle> <player>§7 / §eacl [handle]§7 — 按窗口授权（VIEW/INTERACT/CONTROL，限时如 10m/1h）与 ACL 报表§r"));
+		source.sendFeedback(Component.literal(" §e/wl share default ask|allow|deny§7 — 新观众默认策略（op；默认 allow=公开共享自动放行）§r"));
+		source.sendFeedback(Component.literal(" §e/wl permission list|default|allow|deny|remove§7 — 共享权限管理（op ≥2）§r"));
 		source.sendFeedback(Component.literal(" §e/wl pos <handle>§7 — 查看窗口位置/朝向/缩放/分辨率§r"));
 		source.sendFeedback(Component.literal(" §e/wl move <handle> <x> <y> <z>§7 — 设置窗口坐标（绝对如 §e100.5§7 或相对如 §e~0.5§7 / §e~§7）§r"));
 		source.sendFeedback(Component.literal(" §e/wl rotate <handle> <angle>§7 — 设置窗口朝向角（度，绝对如 §e90§7 或相对如 §e~15§7；0=朝+Z, 90=朝+X）§r"));
@@ -2111,8 +2165,34 @@ public class WaylandCraftCommand {
 		String player = StringArgumentType.getString(context, "player");
 		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
 		if(toplevel == null) return 0;
-		SharedWindowClientHandler.sendWindowPermCommand(toplevel.getHandle(), SharedWindowPermCommandPayload.ACTION_GRANT, player);
-		source.sendFeedback(Component.literal("§a✔ 已请求授权 §f" + player + "§a 查看 §f" + getWindowDisplayName(toplevel) + "§r"));
+
+		// ACL-1：可选等级（默认 VIEW）与时长（默认永久；10m/1h/30s/2d/裸秒）
+		WindowPermission level = WindowPermission.VIEW;
+		String levelStr = tryGetString(context, "level");
+		if(levelStr != null) {
+			level = parsePerm(levelStr.toUpperCase(), source);
+			if(level == null) return 0;
+			if(level == WindowPermission.NONE) {
+				source.sendError(Component.literal("§c✘ grant 等级须为 VIEW/INTERACT/CONTROL（撤销请用 /wl share revoke）§r"));
+				return 0;
+			}
+		}
+		long durationSec = 0;
+		String durationStr = tryGetString(context, "duration");
+		if(durationStr != null) {
+			long parsed = dev.evvie.waylandcraft.shared.ShareAcl.parseDurationSeconds(durationStr);
+			if(parsed < 0) {
+				source.sendError(Component.literal("§c✘ 时长格式非法: " + durationStr + "（示例 30s / 10m / 1h / 2d，≤30d）§r"));
+				return 0;
+			}
+			durationSec = parsed;
+		}
+
+		SharedWindowClientHandler.sendWindowPermCommand(toplevel.getHandle(),
+			SharedWindowPermCommandPayload.ACTION_GRANT, player, level, durationSec);
+		String levelName = level.name();
+		String durNote = durationSec > 0 ? "§7（限时 " + durationStr + "§7）" : "";
+		source.sendFeedback(Component.literal("§a✔ 已请求授权 §f" + player + " §f" + levelName + " §f" + getWindowDisplayName(toplevel) + durNote + "§r"));
 		return 1;
 	}
 
@@ -2124,6 +2204,121 @@ public class WaylandCraftCommand {
 		if(toplevel == null) return 0;
 		SharedWindowClientHandler.sendWindowPermCommand(toplevel.getHandle(), SharedWindowPermCommandPayload.ACTION_REVOKE, player);
 		source.sendFeedback(Component.literal("§a✔ 已请求撤销 §f" + player + "§a 对 §f" + getWindowDisplayName(toplevel) + "§a 的查看权限§r"));
+		return 1;
+	}
+
+	// ===== ACL 加固命令组（feat/share-permission-hardening）=====
+
+	/** 可选参数探测（brigadier 未提供 hasArgument 的轻量替代：捕获异常） */
+	private static String tryGetString(CommandContext<FabricClientCommandSource> context, String name) {
+		try {
+			return StringArgumentType.getString(context, name);
+		} catch(IllegalArgumentException e) {
+			return null;
+		}
+	}
+
+	/**
+	 * handle 字符串 → long。先查本地 toplevel（owner 视角），再退化为裸 hex 解析
+	 * （观众查他人窗口 ACL 时本地没有该 toplevel）。
+	 */
+	private static Long resolveHandleOrRaw(FabricClientCommandSource source, String handleStr) {
+		WLCToplevel toplevel = null;
+		try {
+			toplevel = findToplevelByHandleQuiet(source, handleStr);
+		} catch(RuntimeException ignored) {
+		}
+		if(toplevel != null) return toplevel.getHandle();
+		try {
+			return Long.decode(handleStr);
+		} catch(NumberFormatException e) {
+			source.sendError(Component.literal("§c✘ 无法解析句柄: " + handleStr + "（示例 0x1a2b3c 或十进制）§r"));
+			return null;
+		}
+	}
+
+	private static WLCToplevel findToplevelByHandleQuiet(FabricClientCommandSource source, String handleStr) {
+		// findToplevelByHandle 会向 source 报错；这里静默版用于"本地没有也允许"的场景
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.bridge == null) return null;
+		Long handle = null;
+		try {
+			handle = Long.decode(handleStr);
+		} catch(NumberFormatException ignored) {
+		}
+		if(handle == null) return null;
+		WLCToplevel[] toplevels = wlc.bridge.getToplevels();
+		if(toplevels == null) return null;
+		for(WLCToplevel t : toplevels) {
+			if(t.getHandle() == handle) return t;
+		}
+		return null;
+	}
+
+	/** ACL-2：/wl share default <ask|allow|deny> → 全局权限命令 action=5（op 门在服务端） */
+	private static int shareDefaultPolicy(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		String policy = StringArgumentType.getString(context, "policy").toLowerCase();
+		if(!policy.equals("ask") && !policy.equals("allow") && !policy.equals("deny")) {
+			source.sendError(Component.literal("§c✘ 策略须为 ask|allow|deny§r"));
+			return 0;
+		}
+		ClientPlayNetworking.send(new PermissionCommandPayload(
+			PermissionCommandPayload.ACTION_SET_NEW_VIEWER_POLICY, policy, (byte) 0));
+		return 1;
+	}
+
+	/** ACL-2：/wl share invite accept <handle> <player> [时长]（缺时长=始终允许） */
+	private static int shareInviteAccept(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		Long handle = resolveHandleOrRaw(source, StringArgumentType.getString(context, "handle"));
+		if(handle == null) return 0;
+		String player = StringArgumentType.getString(context, "player");
+		String durationStr = tryGetString(context, "duration");
+		long durationSec = 0;
+		byte decision = dev.evvie.waylandcraft.shared.ShareAcl.INVITE_ALLOW_ALWAYS;
+		if(durationStr != null) {
+			durationSec = dev.evvie.waylandcraft.shared.ShareAcl.parseDurationSeconds(durationStr);
+			if(durationSec < 0) {
+				source.sendError(Component.literal("§c✘ 时长格式非法: " + durationStr + "§r"));
+				return 0;
+			}
+			decision = dev.evvie.waylandcraft.shared.ShareAcl.INVITE_ALLOW_TIMED;
+		}
+		if(!SharedWindowClientHandler.sendInviteResponse(handle, player, decision, durationSec)) {
+			source.sendError(Component.literal("§c✘ 未找到该邀请（已过期待处理列表）：/wl share grant 可手动授权§r"));
+			return 0;
+		}
+		source.sendFeedback(Component.literal("§a✔ 已接受 §f" + player + " §a的窗口邀请§r"));
+		return 1;
+	}
+
+	/** ACL-2：/wl share invite deny <handle> <player> */
+	private static int shareInviteDeny(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		Long handle = resolveHandleOrRaw(source, StringArgumentType.getString(context, "handle"));
+		if(handle == null) return 0;
+		String player = StringArgumentType.getString(context, "player");
+		if(!SharedWindowClientHandler.sendInviteResponse(handle, player,
+				dev.evvie.waylandcraft.shared.ShareAcl.INVITE_DENY, 0)) {
+			source.sendError(Component.literal("§c✘ 未找到该邀请（已过期待处理列表）§r"));
+			return 0;
+		}
+		source.sendFeedback(Component.literal("§a✔ 已拒绝 §f" + player + " §a的窗口邀请（墓碑：默认策略不会再放行）§r"));
+		return 1;
+	}
+
+	/** ACL-5：/wl share acl [handle]——服务端按身份过滤可见行 */
+	private static int shareAcl(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		long handle = 0;
+		String handleStr = tryGetString(context, "handle");
+		if(handleStr != null && !handleStr.equalsIgnoreCase("all") && !handleStr.equals("*")) {
+			Long h = resolveHandleOrRaw(source, handleStr);
+			if(h == null) return 0;
+			handle = h;
+		}
+		SharedWindowClientHandler.sendWindowPermCommand(handle, SharedWindowPermCommandPayload.ACTION_ACL, "");
 		return 1;
 	}
 

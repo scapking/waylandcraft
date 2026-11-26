@@ -115,9 +115,14 @@ public class SharedWindowDebug {
 		// 权限统计
 		Map<UUID, WindowPermission> whitelist = server.permissionManager.getWhitelist();
 		sb.append("Whitelist: ").append(whitelist.size()).append(" players\n");
-		
+
 		java.util.Set<UUID> blacklist = server.permissionManager.getBlacklist();
 		sb.append("Blacklist: ").append(blacklist.size()).append(" players\n");
+
+		// ACL-2/5：新观众策略 + 授权生命周期计数（进状态报告）
+		sb.append("Share default: policy=").append(server.permissionManager.getNewViewerPolicy().name().toLowerCase())
+			.append(" level=").append(server.permissionManager.getDefaultPermission().name()).append("\n");
+		sb.append(ShareAclAudit.reportBlock());
 		
 		// P3：帧/音频转发计数（frames/bytes/slow_viewer），排障时直接看出
 		// 是"没帧上来"还是"发不出去（背压/无能力）"
