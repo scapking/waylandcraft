@@ -16,6 +16,9 @@ public abstract class WLCAbstractWindow {
 	protected WLCSurface lastChild;
 	
 	protected boolean wasMapped = false;
+
+	/** v1.4.4：updateSurfaceTree 异常的一次性告警位（恢复健康后重置）。 */
+	boolean treeErrorWarned = false;
 	
 	public SurfaceGeometry geometry;
 	

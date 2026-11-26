@@ -53,6 +53,8 @@ pub(crate) struct PopupImeState {
     /// wl_pointer 事件流水（事件名，Phase 3 断言序列）。
     pub ptr_events: Vec<String>,
     pub buffer_releases: u32,
+    /// wl_callback.done 流水（v1.4.4 帧回调保命线断言用：commit 即兑现）。
+    pub callback_done: Vec<u32>,
     pub compositor: Option<wl_compositor::WlCompositor>,
     pub shm: Option<wl_shm::WlShm>,
     pub seat: Option<wl_seat::WlSeat>,
@@ -215,13 +217,16 @@ impl Dispatch<ZwpInputPopupSurfaceV2, ()> for PopupImeState {
 
 impl Dispatch<wl_callback::WlCallback, ()> for PopupImeState {
     fn event(
-        _: &mut Self,
+        state: &mut Self,
         _: &wl_callback::WlCallback,
-        _: wl_callback::Event,
+        event: wl_callback::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        if let wl_callback::Event::Done { callback_data } = event {
+            state.callback_done.push(callback_data);
+        }
     }
 }
 
@@ -476,6 +481,34 @@ fn popup_with_frame(f: &mut PopupFixture, w: i32, h: i32, seed: u8) -> (wl_surfa
 }
 
 // ═══════════════════════════ 场景测试（Phase 1）═══════════════════════════
+
+/// v1.4.4 协议保命线红线（用户实测病灶：launch 应用后"第一帧即永久冻结、
+/// mapped:0、物品无图标"——报文实证 Chrome 已 attach+commit 但
+/// wl_surface.frame 回调零 done，Chromium dmabuf 池 2-3 槽饿死）：
+/// frame 回调必须在**服务端 commit 分发时**兑现，与 Java 轮询链的
+/// sendFrame 完全解耦——Java 侧树被瞬时异常打断也不许冻结客户端。
+/// 本 fixture 全程不调 sendFrame：done 计数 >0 即证明解耦成立。
+#[test]
+fn commit_drains_frame_callbacks_without_java_polling() {
+    let mut f = setup_popup();
+    let qh = f.ime.qh();
+    let surface = f.ime.state.compositor.as_ref().unwrap().create_surface(&qh, ());
+    let cb = surface.frame(&qh, ());
+    surface.commit();
+    assert!(f.drive(), "commit 不应引发协议错误");
+    assert_eq!(
+        f.ime.state.callback_done.len(),
+        1,
+        "commit 必须当场兑现 frame done（不经 Java sendFrame）"
+    );
+    drop(cb);
+    // 每帧语义：第二个 frame 请求同样在下一 commit 兑现。
+    let cb2 = surface.frame(&qh, ());
+    surface.commit();
+    assert!(f.drive());
+    assert_eq!(f.ime.state.callback_done.len(), 2, "frame done 必须逐次兑现，非一次性");
+    drop(cb2);
+}
 
 /// 完整链路：建 popup → attach/commit shm ARGB8888 → 服务端采到帧、
 /// Java 轮询可见、缓冲被 release（fcitx5 双缓冲驱动条件）、无变化零拷贝。

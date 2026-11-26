@@ -409,16 +409,48 @@ public class WaylandCraftBridge {
 	
 	protected WLCToplevel getOrCreateToplevel(long topLevelHandle) {
 		for(WLCToplevel toplevel : toplevels) {
-			if(toplevel.getHandle() == topLevelHandle) return toplevel;
+			if(toplevel.getHandle() == topLevelHandle) {
+				healDeadRootSurface(toplevel, toplevelSurface(this.instance, topLevelHandle));
+				return toplevel;
+			}
 		}
 		WLCToplevel toplevel = new WLCToplevel(topLevelHandle);
-		
+
 		long surfaceHandle = toplevelSurface(this.instance, topLevelHandle);
 		WLCSurface surface = getOrCreateSurface(surfaceHandle);
 		toplevel.surface = surface;
-		
+
 		toplevels.add(toplevel);
 		return toplevel;
+	}
+
+	/**
+	 * v1.4.4 自愈（用户实测"窗口第一帧后永久冻结、mapped:0、无图标"根因层）：
+	 * updateSurfaceTree 一次瞬时异常会让 root 未标 visited，被同 tick 尾部的
+	 * deleteUnvisitedSurfaces 销毁（handle 置 0）。旧逻辑对已存在窗口的
+	 * 死 root **永不重建**——此后 sendFrame/buffer 消费/图标捕获永远不再触及
+	 * 这个窗口，且全程零日志。这里检测 root 失活就重新向 native 取 root
+	 * surface 重建（framebuffer 一并作废重建，wasMapped 由下轮自然回翻，
+	 * 窗口重新走 newToplevels 注册链）。
+	 */
+	private void healDeadRootSurface(WLCAbstractWindow window, long freshRootHandle) {
+		WLCSurface root = window.getSurfaceTree();
+		if(root != null && root.isAlive()) return;
+		if(freshRootHandle == 0) return; // native 侧窗口已亡：等 deleteNonExisting* 正常回收
+		WLCSurface fresh = getOrCreateSurface(freshRootHandle);
+		if(fresh == root && root != null && !root.isAlive()) {
+			// getOrCreateSurface 复用同一失活对象时强制换新，避免 0 句柄僵尸
+			fresh = new WLCSurface(freshRootHandle);
+			surfaces.add(fresh);
+		}
+		window.surface = fresh;
+		window.lastChild = null;
+		if(window.framebuffer != null) {
+			framebuffers.remove(window.framebuffer);
+			window.framebuffer = null;
+		}
+		WaylandCraftCommon.LOGGER.info("[waylandcraft] healed dead root surface of window 0x{} (rebuilt from native handle 0x{})",
+			Long.toHexString(window.getHandle()), Long.toHexString(freshRootHandle));
 	}
 	
 	public WLCToplevel[] getNewToplevels() {
@@ -430,7 +462,11 @@ public class WaylandCraftBridge {
 	
 	protected WLCPopup getOrCreatePopup(long handle) {
 		for(WLCPopup popup : popups) {
-			if(popup.getHandle() == handle) return popup;
+			if(popup.getHandle() == handle) {
+				// v1.4.4：与 toplevel 同纪律的死 root 自愈
+				healDeadRootSurface(popup, popupSurface(this.instance, handle));
+				return popup;
+			}
 		}
 		WLCPopup popup = new WLCPopup(handle);
 		
@@ -517,6 +553,19 @@ public class WaylandCraftBridge {
 	}
 	
 	private void deleteUnvisitedSurfaces() {
+		// v1.4.4 Fix C（root 免误杀）：树遍历一次瞬时异常≠窗口死亡——所有
+		// 仍在册窗口（deleteNonExisting* 之后存活的）的当前 root 在删除扫描
+		// 前重新标 visited，杜绝"异常→root 销毁→sendFrame/release 永久饥饿"
+		// 的死亡链起点。真死的窗口先被 deleteNonExisting* 摘出列表，其
+		// surface 不再受保护，照常回收，无泄漏面变化。
+		for(WLCAbstractWindow window : toplevels) {
+			WLCSurface root = window.getSurfaceTree();
+			if(root != null && root.isAlive()) root.visited = true;
+		}
+		for(WLCAbstractWindow window : popups) {
+			WLCSurface root = window.getSurfaceTree();
+			if(root != null && root.isAlive()) root.visited = true;
+		}
 		ArrayList<WLCSurface> surfaces_new = new ArrayList<WLCSurface>();
 		for(WLCSurface surface : this.surfaces) {
 			if(surface.visited) {
@@ -601,8 +650,15 @@ public class WaylandCraftBridge {
 			// 真实炸过——日志里"FATAL updateSufaceTree: surface is not alive"）。
 			try {
 				toplevel.lastChild = updateSurfaceTree(this.instance, root);
+				toplevel.treeErrorWarned = false; // 恢复健康后允许再次报警
 			} catch (RuntimeException e) {
-				System.err.println("[waylandcraft] updateSurfaceTree(toplevel) failed: " + e.getMessage() + "（跳过此 toplevel）");
+				// v1.4.4 Fix D：System.err 不进 latest.log——"第一因"从此不可见
+				// 正是这次排障耗掉四轮实测的代价。改为 LOGGER 每窗口一次性 warn。
+				if(!toplevel.treeErrorWarned) {
+					toplevel.treeErrorWarned = true;
+					WaylandCraftCommon.LOGGER.warn("[waylandcraft] updateSurfaceTree(toplevel 0x{}) failed: {}（跳过此 toplevel，下帧自愈重试）",
+						Long.toHexString(toplevel.getHandle()), e.toString());
+				}
 				toplevel.lastChild = null;
 				continue;
 			}
@@ -635,8 +691,13 @@ public class WaylandCraftBridge {
 			// 同上防御：popup surface 暴毙是合法 wayland 事件
 			try {
 				popup.lastChild = updateSurfaceTree(this.instance, root);
+				popup.treeErrorWarned = false;
 			} catch (RuntimeException e) {
-				System.err.println("[waylandcraft] updateSurfaceTree(popup) failed: " + e.getMessage() + "（跳过此 popup）");
+				if(!popup.treeErrorWarned) {
+					popup.treeErrorWarned = true;
+					WaylandCraftCommon.LOGGER.warn("[waylandcraft] updateSurfaceTree(popup 0x{}) failed: {}（跳过此 popup，下帧自愈重试）",
+						Long.toHexString(popup.getHandle()), e.toString());
+				}
 				popup.lastChild = null;
 				continue;
 			}
@@ -682,8 +743,14 @@ public class WaylandCraftBridge {
 			for(WLCSurface surface = root; surface != null; surface = surface.getNextChild()) {
 				try {
 					updateSurfaceData(instance, surface);
+					surface.dataErrorWarned = false;
 				} catch (RuntimeException e) {
-					System.err.println("[waylandcraft] updateSurfaceData failed: " + e.getMessage());
+					// v1.4.4 Fix D：进 latest.log，每 surface 一次（恢复健康后重置）
+					if(!surface.dataErrorWarned) {
+						surface.dataErrorWarned = true;
+						WaylandCraftCommon.LOGGER.warn("[waylandcraft] updateSurfaceData(surface 0x{}) failed: {}",
+							Long.toHexString(surface.getHandle()), e.toString());
+					}
 				}
 				calculateSubpos(surface);
 			}

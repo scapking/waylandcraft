@@ -28,6 +28,7 @@ use smithay::{
         buffer::BufferHandler,
         compositor::{
             CompositorClientState, CompositorHandler, CompositorState,
+            SurfaceAttributes, with_states,
         },
         dmabuf::{
             DmabufFeedbackBuilder, DmabufGlobal, DmabufHandler, DmabufState,
@@ -44,6 +45,7 @@ use smithay::{
     },
 };
 use std::ffi::OsString;
+use std::ops::DerefMut;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -228,11 +230,27 @@ impl CompositorHandler for WLCState {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
-        // Phase 1 候选窗采集：若该 surface 持有 input_popup 角色，
-        // 把 shm 缓冲拷成 ARGB8888 帧并 release。非 popup 极廉价返回
-        // （一次 Option 比较），不影响 xdg/satellite 窗口既有路径——
-        // 它们不经这里取帧（Java update_surface_data 拉取式）。
+        // v1.4.4 协议保命线（用户实测"窗口第一帧后永不刷新/mapped:0/无图标"
+        // 根因修复之一，见 docs 与报告 /tmp/wc-repro/wire-report.md）：
+        // wl_surface.frame 回调必须在 commit 时兑现 done——此前 done 只在
+        // Java 轮询链尾部的 sendFrame 里发，而 Java 侧一次瞬时异常导致
+        // root surface 被 deleteUnvisitedSurfaces 销毁后，sendFrame 永远
+        // 不再触及该 surface，Chromium（ozone，dmabuf 池 2-3 槽）首帧后
+        // 饿死，窗口永久冻结。协议层存活自此与 Java 显示链解耦：
+        // smithay 在 commit 分发时已把 frame 回调并入 current，这里
+        // pending/current 两侧都排空（drain 幂等，与 sendFrame 竞速安全）。
         crate::ime::input_popup::on_popup_commit(self, surface);
+
+        with_states(surface, |states| {
+            let mut guard = states.cached_state.get::<SurfaceAttributes>();
+            let attrs = guard.deref_mut();
+            for c in attrs.pending().frame_callbacks.drain(..) {
+                c.done(crate::utils::get_time());
+            }
+            for c in attrs.current().frame_callbacks.drain(..) {
+                c.done(crate::utils::get_time());
+            }
+        });
     }
 }
 

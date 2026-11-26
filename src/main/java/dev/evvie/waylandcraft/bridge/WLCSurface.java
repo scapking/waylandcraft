@@ -19,6 +19,9 @@ public class WLCSurface {
 	
 	// Used by native code to tag used surfaces
 	protected boolean visited;
+
+	/** v1.4.4：updateSurfaceData 异常的一次性告警位（恢复健康后重置）。 */
+	boolean dataErrorWarned = false;
 	
 	@Nullable
 	private BufferTexture buffer = null;

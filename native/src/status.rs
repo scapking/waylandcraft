@@ -466,10 +466,13 @@ impl StatusReport {
     }
 }
 
-/// 简单的 JSON 字符串转义（不依赖 serde_json——保持 lib 体积小）
+/// 简单的 JSON 字符串**内容**转义（不依赖 serde_json——保持 lib 体积小）。
+/// v1.4.4 修正：此前还负责加外层引号，而全部 5 个调用点的格式串本身已带
+/// `\"{}\"`——产出 `"details": ""0x0""` 双引号嵌套，Java `/wl status` 解析
+/// 整个 Rust 报告段直接 MalformedJsonException（用户实测日志可见）。
+/// 契约=只转义不加引号，引号归格式串管。
 fn escape_json(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
+    let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '"' => out.push_str("\\\""),
@@ -481,7 +484,6 @@ fn escape_json(s: &str) -> String {
             c => out.push(c),
         }
     }
-    out.push('"');
     out
 }
 
