@@ -107,6 +107,8 @@ public class ImageCapture {
 		int tex = 0;
 		int width = 0;
 		int height = 0;
+		// P1-10（子集）：raw diff 路径的源读取 FBO 按窗口复用（旧实现每帧 glGen+glDelete）
+		int readFbo = 0;
 
 		void cleanup() {
 			if(fbo != 0) {
@@ -116,6 +118,10 @@ public class ImageCapture {
 			if(tex != 0) {
 				GL11.glDeleteTextures(tex);
 				tex = 0;
+			}
+			if(readFbo != 0) {
+				GL30.glDeleteFramebuffers(readFbo);
+				readFbo = 0;
 			}
 			width = 0;
 			height = 0;
@@ -130,6 +136,10 @@ public class ImageCapture {
 	// 像素差异检测（per-window：windowHandle -> lastRawFrame）
 	// 之前是 static 单缓存，多个窗口共享时会互相覆盖基准帧，导致 diff 误判
 	private static final java.util.Map<Long, byte[]> lastRawFrames = new java.util.concurrent.ConcurrentHashMap<>();
+	// P1-10（子集）：diff 当前帧 scratch，按窗口复用——旧实现每帧 new byte[needed]（4K≈33MB/帧）
+	// 加 hasSignificantChange 每帧 clone 一次，两个 8MB+ 短命大对象压在渲染线程 GC 上。
+	// 现在尺寸不变不重分配；基准帧更新走 System.arraycopy，零分配。
+	private static final java.util.Map<Long, byte[]> diffScratch = new java.util.concurrent.ConcurrentHashMap<>();
 	
 	/**
 	 * 从WindowFramebuffer捕获图像（主入口，带全部优化）
@@ -289,20 +299,27 @@ public class ImageCapture {
 		var colorTex = target.getColorTexture();
 		if(colorTex == null || colorTex.isClosed()) return null;
 		
-		int readFbo = 0;
 		try {
 			int glTexId = ((com.mojang.blaze3d.opengl.GlTexture) colorTex).glId();
-			
+
 			int dstW = Math.max(1, (int)(srcW * scale));
 			int dstH = Math.max(1, (int)(srcH * scale));
 			dstW = Math.min(dstW, MAX_WIDTH);
 			dstH = Math.min(dstH, MAX_HEIGHT);
-			
-			// 源FBO
-			readFbo = GL30.glGenFramebuffers();
-			GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, readFbo);
+
+			// GPU缩放 FBO（按窗口隔离；先建 ScaleState，源读 FBO 也挂在它上面复用）
+			ensureScaleFbo(windowHandle, dstW, dstH);
+			ScaleState scaleState = scaleStates.get(windowHandle);
+			if(scaleState == null) return null;
+
+			// 源FBO：P1-10（子集）按窗口复用（旧实现每帧 glGenFramebuffers+glDeleteFramebuffers）。
+			// 每帧重新 attach+check：纹理 id 变化（窗口重建）时附加自动跟随，行为与旧版逐帧一致。
+			if(scaleState.readFbo == 0) {
+				scaleState.readFbo = GL30.glGenFramebuffers();
+			}
+			GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, scaleState.readFbo);
 			GL30.glFramebufferTexture2D(GL30.GL_READ_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0, GL11.GL_TEXTURE_2D, glTexId, 0);
-			
+
 			// 检查源FBO完整性：若附加纹理失败（非GL_TEXTURE_2D等），blit 会静默失败，
 			// 导致 scaleFbo 残留旧内容 → diff 永远判定"无变化"→ 永不发帧。
 			int readStatus = GL30.glCheckFramebufferStatus(GL30.GL_READ_FRAMEBUFFER);
@@ -310,16 +327,13 @@ public class ImageCapture {
 				LOGGER.error("Raw capture: source FBO incomplete: 0x{} (falling back to no-diff)", Integer.toHexString(readStatus));
 				return null;
 			}
-			
-			// GPU缩放（按窗口隔离）
-			ensureScaleFbo(windowHandle, dstW, dstH);
+
 			// ensureScaleFbo 重建后会把 READ 解绑成 0，必须重新绑定
-			GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, readFbo);
-			ScaleState scaleState = scaleStates.get(windowHandle);
-			int scaleFboId = (scaleState != null) ? scaleState.fbo : 0;
+			GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, scaleState.readFbo);
+			int scaleFboId = scaleState.fbo;
 			GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, scaleFboId);
 			GL30.glBlitFramebuffer(0, 0, srcW, srcH, 0, 0, dstW, dstH, GL11.GL_COLOR_BUFFER_BIT, GL30.GL_LINEAR);
-			
+
 			// 同步读取（raw模式不用PBO，避免延迟）
 			int needed = dstW * dstH * 4;
 			if(reusableBuffer == null || lastBufferWidth != dstW || lastBufferHeight != dstH) {
@@ -345,22 +359,24 @@ public class ImageCapture {
 				return null;
 			}
 			
-			// 转为byte[]
-			byte[] result = new byte[needed];
+			// 拷入按窗口复用的 scratch 数组（尺寸不变时零分配；调用方仅在本帧内使用返回值）
+			byte[] result = diffScratch.get(windowHandle);
+			if(result == null || result.length != needed) {
+				result = new byte[needed];
+				diffScratch.put(windowHandle, result);
+			}
 			reusableBuffer.rewind();
 			reusableBuffer.get(result);
 			return result;
-			
+
 		} catch(Exception e) {
 			LOGGER.error("Failed to capture raw frame", e);
 			return null;
 		} finally {
+			// 只解绑，不删 FBO——readFbo 已按窗口缓存，随 cleanupScaleFbo 释放
 			GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, 0);
 			GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, 0);
 			GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
-			if(readFbo != 0) {
-				GL30.glDeleteFramebuffers(readFbo);
-			}
 		}
 	}
 	
@@ -396,25 +412,28 @@ public class ImageCapture {
 		}
 		
 		float changeRatio = sampled > 0 ? (float)changed / sampled : 1.0f;
-		
-		// 更新缓存
-		lastRawFrames.put(windowHandle, currentFrame.clone());
-		
+
+		// 更新基准：拷贝进**已缓存**的基准数组（P1-10 子集：旧实现每帧 clone 出一个
+		// 8MB+ 短命大对象；这里 System.arraycopy 原地更新，零分配）。
+		System.arraycopy(currentFrame, 0, last, 0, currentFrame.length);
+
 		return changeRatio > threshold;
 	}
 	
 	/**
-	 * 清除指定窗口的 diff 基准帧（stopSharing 时调用）
+	 * 清除指定窗口的 diff 基准帧与 scratch（stopSharing 时调用）
 	 */
 	public static void clearDiffCache(long windowHandle) {
 		lastRawFrames.remove(windowHandle);
+		diffScratch.remove(windowHandle);
 	}
-	
+
 	/**
-	 * 清除所有 diff 基准帧（断线时调用）
+	 * 清除所有 diff 基准帧与 scratch（断线时调用）
 	 */
 	public static void clearAllDiffCaches() {
 		lastRawFrames.clear();
+		diffScratch.clear();
 	}
 	
 	/**
