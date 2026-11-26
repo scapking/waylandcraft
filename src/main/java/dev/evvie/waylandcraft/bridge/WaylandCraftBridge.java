@@ -1136,6 +1136,72 @@ public class WaylandCraftBridge {
 		return execApp(instance, appId);
 	}
 
+	// ═══ fix/app-launcher-lifecycle：应用收养接口（Rust 实现见 native/src/process.rs）═══
+	// 纪律与 setModVersion 同款：native 缺失（旧 .so/server jar/viewer-only）静默降级，
+	// 绝不把宿主炸进崩溃——收养功能整体退化为"无记录"，行为回到修复前而不是变坏。
+
+	/**
+	 * 本会话收养（spawn）的存活应用进程。返回 "pid|pgid|cmd" 字符串数组（Rust
+	 * 侧已按 /proc 现场回收死条目）。native 不可用时返回空数组。
+	 */
+	public String[] getAdoptedApps() {
+		if(!nativeAvailable || instance == 0) return new String[0];
+		try {
+			String[] apps = getAdoptedAppsNative();
+			return apps != null ? apps : new String[0];
+		} catch(Throwable t) {
+			WaylandCraftCommon.LOGGER.warn("[adopt] getAdoptedApps unavailable: {}", t.toString());
+			return new String[0];
+		}
+	}
+
+	/** 按收养登记精确终止一个应用进程树（force=true 跳过 SIGTERM 宽限）。未登记返回 false。 */
+	public boolean killAdopted(int pid, boolean force) {
+		if(!nativeAvailable || instance == 0) return false;
+		try {
+			return killAdoptedNative(pid, force);
+		} catch(Throwable t) {
+			WaylandCraftCommon.LOGGER.warn("[adopt] killAdopted unavailable: {}", t.toString());
+			return false;
+		}
+	}
+
+	/**
+	 * 会话结束（DISCONNECT/进程退出）：终止全部本会话收养的进程树。
+	 * 非阻塞——SIGTERM→限时→SIGKILL 的升级在 native 后台线程完成，
+	 * 不占客户端 tick/关机路径。
+	 */
+	public void terminateAdoptedAll() {
+		if(!nativeAvailable || instance == 0) return;
+		try {
+			terminateAdoptedAllNative();
+		} catch(Throwable t) {
+			WaylandCraftCommon.LOGGER.warn("[adopt] terminateAdoptedAll unavailable: {}", t.toString());
+		}
+	}
+
+	/** 本会话标记 "<jvmPid>-<wayland-N>"——启动前陈旧实例判定的锚（见 AppLifecycleLogic）。 */
+	public String getSessionMarker() {
+		if(!nativeAvailable || instance == 0) return "";
+		try {
+			String m = sessionMarkerNative(instance);
+			return m != null ? m : "";
+		} catch(Throwable t) {
+			return "";
+		}
+	}
+
+	/** Java 侧诊断写入 status error ring（/wl status 可见）。无 native 时静默丢。 */
+	public static void noteError(String level, String msg) {
+		if(!nativeAvailable) return;
+		try {
+			noteErrorNative(level, msg);
+		} catch(Throwable t) {
+			// error ring 自身写失败不能再进 ring——只落 Java 日志
+			WaylandCraftCommon.LOGGER.warn("[status] noteError unavailable: {}", t.toString());
+		}
+	}
+
 	// upstream f23fdcb: 设置首选终端命令（用于直接启动 Terminal=true 的 desktop entry）
 	public void setPreferredTerminal(String cmd) {
 		setPreferredTerminal(instance, cmd);
@@ -1506,6 +1572,13 @@ public class WaylandCraftBridge {
 	private static native boolean renderSVG(String path, int width, int height, long bufferPtr);
 	
 	private static native boolean execApp(long instance, String appId);
+
+	// fix/app-launcher-lifecycle：应用收养（实现见 native/src/process.rs + bridge.rs）
+	private static native String[] getAdoptedAppsNative();
+	private static native boolean killAdoptedNative(int pid, boolean force);
+	private static native void terminateAdoptedAllNative();
+	private static native String sessionMarkerNative(long instance);
+	private static native void noteErrorNative(String level, String msg);
 
 	// upstream f23fdcb
 	private static native void setPreferredTerminal(long instance, String cmd);
