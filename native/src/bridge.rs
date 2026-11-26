@@ -836,6 +836,32 @@ bind_java_type! {
             fn = portal_capture_stop,
         },
 
+        // macOS ScreenCaptureKit 捕获（docs/CAPTURE_MACOS.md）；非 macos 调用
+        // 抛 unsupported，注册表按条目不可 cfg（同 win_capture_* 的处理）。
+        static extern fn mac_capture_list {
+            sig = (instance: jlong) -> JString[],
+            fn = mac_capture_list,
+        },
+        static extern fn mac_capture_displays {
+            sig = (instance: jlong) -> JString[],
+            fn = mac_capture_displays,
+        },
+        static extern fn mac_capture_start_window {
+            sig = (instance: jlong, window_id: jint) -> byte[],
+            fn = mac_capture_start_window,
+        },
+        static extern fn mac_capture_start_display {
+            sig = (instance: jlong, index: jint) -> byte[],
+            fn = mac_capture_start_display,
+        },
+        static extern fn mac_capture_frame {
+            sig = (instance: jlong, since_seq: jlong) -> byte[],
+            fn = mac_capture_frame,
+        },
+        static extern fn mac_capture_stop {
+            sig = (instance: jlong) -> void,
+            fn = mac_capture_stop,
+        },
         // Windows.Graphics.Capture 窗口/桌面捕获（对称 portal_capture_* 三件套 +
         // 目标枚举）。非 Windows 平台注册保留（bind_java_type! 表不支持按条目 cfg），
         // 调用一律抛 win_capture_unsupported——Java 侧只在 Windows 接线。
@@ -891,6 +917,8 @@ enum BridgeError {
     Null(&'static str),
     #[error("audio capture failed: {0}")]
     AudioCapture(String),
+    #[error("mac capture failed: {0}")]
+    MacCapture(String),
     #[error("Null WLC instance handle given. Function: {0}")]
     NullInstancePtr(&'static str),
     #[error("Null wayland surface handle given. Function: {0}")]
@@ -3345,6 +3373,120 @@ fn portal_capture_stop<'local>(
 }
 
 // ═══════════════════════════════════════════════════════
+// macOS ScreenCaptureKit 捕获（窗口/显示器 → 游戏内贴图）
+// 平台分派在 crate::capture_macos 内部完成：非 macOS 一律返回
+// "macos_capture_unsupported_platform"，此处不做 cfg 特判。
+// 线协议/错误码/接线见 docs/CAPTURE_MACOS.md。
+// ═══════════════════════════════════════════════════════
+
+/// 窗口列表；失败时返回单行 `["err:<code>"]`（权限/版本错误必须透出，
+/// 不能伪装成空列表）。行格式同 get_desktop_windows：id|title|app|pid|hash|x|y|w|h
+fn mac_capture_list<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JObjectArray<'local, JString<'local>>, BridgeError> {
+    let lines = match crate::capture_macos::list() {
+        Ok(windows) => crate::capture_macos::window_lines(&windows),
+        Err(e) => {
+            eprintln!("[mac-capture] list failed: {e}");
+            vec![format!("err:{e}")]
+        }
+    };
+    strings_to_jarray(env, &lines)
+}
+
+/// 显示器列表；行格式 `index|id|WxH|builtin|main|name`，失败同上 err 行。
+fn mac_capture_displays<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<JObjectArray<'local, JString<'local>>, BridgeError> {
+    let lines = match crate::capture_macos::list_displays() {
+        Ok(displays) => crate::capture_macos::display_lines(&displays),
+        Err(e) => {
+            eprintln!("[mac-capture] displays failed: {e}");
+            vec![format!("err:{e}")]
+        }
+    };
+    strings_to_jarray(env, &lines)
+}
+
+fn strings_to_jarray<'local>(
+    env: &mut Env<'local>,
+    lines: &[String],
+) -> Result<JObjectArray<'local, JString<'local>>, BridgeError> {
+    if lines.is_empty() {
+        return Ok(JObjectArray::<JString>::new(env, 0, &JString::null())?);
+    }
+    let result_array = JObjectArray::<JString>::new(env, lines.len(), &JString::null())?;
+    for (i, line) in lines.iter().enumerate() {
+        let jstr = env.new_string(line)?;
+        result_array.set_element(env, i, &jstr)?;
+    }
+    Ok(result_array)
+}
+
+/// 捕获窗口：返回 UTF-8 `"ok:{w}x{h}"`（点尺寸，实际帧见 mac_capture_frame）
+/// 或 `"err:<code>"`（permission_denied / macos14_required / window_not_found:ID / …）。
+/// 阻塞点：SCShareableContent 异步枚举最长 10s（系统权限弹窗期间）——与
+/// portal start 阻塞等待用户确认同一模式，Java 勿在渲染关键线程调用。
+fn mac_capture_start_window<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+    window_id: jint,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    let text = match crate::capture_macos::start_window(window_id as u32) {
+        Ok((w, h)) => format!("ok:{w}x{h}"),
+        Err(e) => {
+            eprintln!("[mac-capture] start_window({window_id}) failed: {e}");
+            format!("err:{e}")
+        }
+    };
+    Ok(env.byte_array_from_slice(text.as_bytes())?)
+}
+
+/// 捕获显示器（index 来自 mac_capture_displays 首列）：返回同上 ok/err 串。
+fn mac_capture_start_display<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+    index: jint,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    let text = match crate::capture_macos::start_display(index as u32) {
+        Ok((w, h)) => format!("ok:{w}x{h}"),
+        Err(e) => {
+            eprintln!("[mac-capture] start_display({index}) failed: {e}");
+            format!("err:{e}")
+        }
+    };
+    Ok(env.byte_array_from_slice(text.as_bytes())?)
+}
+
+/// 拉帧：空 = 无新帧；`[1]` = 会话已终止（清理并 stop）；
+/// 否则 `[w u32][h u32][seq u64][ARGB8888 像素]`（LE）。
+/// ARGB 内存字节序是 B,G,R,A——与 portal 的 RGBA 不同，纹理上传需按此解释。
+fn mac_capture_frame<'local>(
+    env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+    since_seq: jlong,
+) -> Result<JPrimitiveArray<'local, i8>, BridgeError> {
+    let wire = crate::capture_macos::take_frame(if since_seq < 0 { 0 } else { since_seq as u64 });
+    Ok(env.byte_array_from_slice(&wire)?)
+}
+
+/// 停止：确定性回收（置标志→唤醒→join→清帧槽）。幂等。
+fn mac_capture_stop<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    _instance: jlong,
+) -> Result<(), BridgeError> {
+    crate::capture_macos::stop().map_err(BridgeError::MacCapture)?;
+    Ok(())
+}
+
 // Windows.Graphics.Capture 捕获（仅 Windows；见 capture_windows.rs）
 //
 // 与 portal_capture_* 的对称关系：

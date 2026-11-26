@@ -23,7 +23,6 @@ zbus = { version = "5", default-features = false, features = ["tokio", "blocking
 # v0.13.10 撤销 zvariant 显式依赖——gvariant feature 跟 zvariant_utils
 # 不兼容（编译报 E0004 非穷尽模式）。改在 dbus_ibus.rs 跳过
 # SetSurroundingText 调。
-pipewire = "0.8"
 # Wayland client for wlr-foreign-toplevel-management
 wayland-client = "0.31"
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
@@ -34,6 +33,30 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 wayland-backend = { version = "0.3", features = ["client_system", "dlopen"] }
 wayland-protocols = { version = "0.32", features = ["client"] }
 
+# macOS ScreenCaptureKit 捕获后端（capture_macos.rs）。绑定 crate 均为
+# objc2 生态生成绑定，无宿主工具依赖（见 docs/CAPTURE_MACOS.md 维护点）。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", features = ["std", "NSArray", "NSError", "NSString"] }
+objc2-core-foundation = { version = "0.3.2", features = [
+    "std",
+    "CFArray",
+    "CFData",
+    "CFDictionary",
+    "CFNumber",
+    "CFString",
+    "CFCGTypes",
+] }
+objc2-core-graphics = { version = "0.3.2", features = [
+    "std",
+    "CGWindow",
+    "CGImage",
+    "CGDataProvider",
+    "CGDirectDisplay",
+    "CGError",
+] }
+block2 = "0.6.2"
+objc2-screen-capture-kit = { version = "0.3.2", default-features = true }
 # Windows 平台窗口/桌面捕获后端（capture_windows.rs，Windows.Graphics.Capture）。
 # 只在 windows target 上生效——Linux/Android 构建零影响；windows 0.58 满足
 # IGraphicsCaptureItemInterop 所需的 Win32_System_WinRT_Graphics_Capture 面。
@@ -71,3 +94,8 @@ lto = true           # link-time optimization
 codegen-units = 1    # single codegen unit (better optimization)
 strip = true         # strip debug symbols
 panic = "abort"      # smaller binary
+
+# PipeWire 绑定只在真实实现编译的平台生效（stub 模块不需要；
+# 非 Linux 交叉 check 因此不再拉 libspa-sys/pkg-config）。
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+pipewire = "0.8"
