@@ -20,6 +20,10 @@ import dev.evvie.waylandcraft.capture.PipeWireCaptureManager;
 import dev.evvie.waylandcraft.desktop.DesktopEntry;
 import dev.evvie.waylandcraft.grabs.WindowGrab;
 import dev.evvie.waylandcraft.gui.WindowManagerScreen;
+import dev.evvie.waylandcraft.localmode.LocalDirectDisplay;
+import dev.evvie.waylandcraft.localmode.LocalModePolicy;
+import dev.evvie.waylandcraft.localmode.LocalModePolicy.WindowDisplayMode;
+import dev.evvie.waylandcraft.placement.WindowPlacementMemory;
 import dev.evvie.waylandcraft.network.PermissionCommandPayload;
 import dev.evvie.waylandcraft.network.SharedWindowClientHandler;
 import dev.evvie.waylandcraft.network.SharedWindowPermCommandPayload;
@@ -36,6 +40,7 @@ import net.minecraft.client.Minecraft;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.minecraft.commands.CommandBuildContext;
 import net.minecraft.network.chat.Component;
+import net.minecraft.world.phys.Vec3;
 
 public class WaylandCraftCommand {
 
@@ -87,6 +92,14 @@ public class WaylandCraftCommand {
 						.executes(WaylandCraftCommand::grabWindow)
 					)
 				)
+				.then(ClientCommands.literal("place")
+					.then(ClientCommands.argument("handle", StringArgumentType.word())
+						.executes(WaylandCraftCommand::placeWindow)
+						.then(ClientCommands.argument("distance", DoubleArgumentType.doubleArg(1, 6))
+							.executes(WaylandCraftCommand::placeWindow)
+						)
+					)
+				)
 				.then(ClientCommands.literal("show")
 					.then(ClientCommands.argument("handle", StringArgumentType.word())
 						.executes(WaylandCraftCommand::showWindow)
@@ -120,6 +133,16 @@ public class WaylandCraftCommand {
 							)
 						)
 					)
+				)
+				.then(ClientCommands.literal("localitems")
+					.then(ClientCommands.argument("mode", StringArgumentType.word())
+						.suggests((ctx, builder) -> {
+							builder.suggest("auto"); builder.suggest("items"); builder.suggest("display");
+							return builder.buildFuture();
+						})
+						.executes(WaylandCraftCommand::setLocalItems)
+					)
+					.executes(WaylandCraftCommand::showLocalItems)
 				)
 				.then(ClientCommands.literal("settings")
 					.then(ClientCommands.literal("list")
@@ -513,6 +536,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §e/wl take <handle>§7 — 从背包收回窗口物品§r"));
 		source.sendFeedback(Component.literal(" §e/wl capture§7      — 弹出Portal选择，捕获桌面窗口§r"));
 		source.sendFeedback(Component.literal(" §e/wl grab <handle>§7 — 抓取窗口，移动鼠标在世界中拖动§r"));
+		source.sendFeedback(Component.literal(" §e/wl place <handle> [距离1-6]§7 — 无物品摆位到玩家面前（默认 2 格；任何模式可用、绝不触碰背包；布局开启时布局优先，place 为临时偏移）§r"));
 		source.sendFeedback(Component.literal(" §e/wl show <handle|all>§7 — 在世界中显示窗口（all 一键全部）§r"));
 		source.sendFeedback(Component.literal(" §e/wl hide <handle|all>§7 — 从世界中隐藏窗口显示（all 一键全部）§r"));
 		source.sendFeedback(Component.literal(" §e/wl pin <handle>§7  — 钉住窗口（世界中保持显示，不受隐藏/最小化影响）§r"));
@@ -520,6 +544,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §e/wl close <handle>§7— 终止应用进程（关闭窗口）§r"));
 		source.sendFeedback(Component.literal(" §e/wl resize <handle> <w> <h>§7 — 调整窗口分辨率§r"));
 		source.sendFeedback(Component.literal(" §e/wl settings list|set <key> <value>§7 — 查看/修改设置§r"));
+		source.sendFeedback(Component.literal(" §e/wl localitems [auto|items|display]§7 — 显示档：auto=无 mod 服本地直显（默认）；items=可信无 mod 服客户端自维护物品（§c反作弊服可能判定刷物品§c）；display=强制直显；世界内设置按服务器记忆§r"));
 		source.sendFeedback(Component.literal(" §e/wl share start|stop|quality|preset|config|reset|info|resolution|stats <handle> [...]§7 — 共享管理（start/stop 支持 all 一键全部）§r"));
 		source.sendFeedback(Component.literal(" §e/wl share grant <handle> <player> [level] [时长]§7 / §erevoke <handle> <player>§7 / §eacl [handle]§7 — 按窗口授权（VIEW/INTERACT/CONTROL，限时如 10m/1h）与 ACL 报表§r"));
 		source.sendFeedback(Component.literal(" §e/wl share default ask|allow|deny§7 — 新观众默认策略（op；默认 allow=公开共享自动放行）§r"));
@@ -774,12 +799,8 @@ public class WaylandCraftCommand {
 	 * 例: "CCC HHH" -> "ccc_hhh", "Mozilla Firefox" -> "mozilla_firefox"
 	 */
 	static String slugify(String s) {
-		if(s == null) return "";
-		String slug = s.toLowerCase()
-			.replaceAll("[^a-z0-9]+", "_")
-			.replaceAll("_+", "_")
-			.replaceAll("^_+|_+$", "");
-		return slug;
+		// 与摆位记忆（WindowPlacementMemory.slugify）共用同一实现，别名规则唯一
+		return WindowPlacementMemory.slugify(s);
 	}
 
 	/**
@@ -859,7 +880,13 @@ public class WaylandCraftCommand {
 		boolean launched = launchApp(wlc, entry);
 		if(launched) {
 			source.sendFeedback(Component.literal("§a✔ Launched: §f" + (entry.name != null ? entry.name : entry.appId) + "§r"));
-			source.sendFeedback(Component.literal(" §7窗口出现后将自动获得对应物品，右键长按放置到世界中§r"));
+			// 反馈按实际显示模式分流：本地直显不发放物品，旧文案在 vanilla 服上是误导
+			WaylandCraft wl = WaylandCraft.instance;
+			if(wl != null && wl.effectiveDisplayMode() == WindowDisplayMode.LOCAL_DIRECT) {
+				source.sendFeedback(Component.literal(" §7本地直显模式：窗口出现即自动进世界（无需物品）；不在眼前时 §e/wl place <handle>§7，管理按 §eB§r"));
+			} else {
+				source.sendFeedback(Component.literal(" §7窗口出现后将自动获得对应物品，右键长按放置到世界中§r"));
+			}
 		} else {
 			source.sendError(Component.literal("§c✘ Failed to launch: " + entry.appId + "§r"));
 		}
@@ -890,14 +917,38 @@ public class WaylandCraftCommand {
 			return 0;
 		}
 
-		// ⑩ 本地直显模式（服务端无 mod）：物品体系不存在，但窗口本来就已在世界中
-		// 直接显示（WaylandCraft.updateWorld auto-place），give 无意义且会假成功。
-		if(!wlc.serverHasMod) {
-			source.sendFeedback(Component.literal("§e○ 本地模式：窗口已直接显示在世界中（服务端无 mod，物品持久化不可用）: §f" + getWindowDisplayName(toplevel) + "§r"));
+		// ⑩ 显示模式分流（判定收口在 LocalModePolicy，反作弊红线：客户端不写背包）。
+		// 旧文案在无 mod 服无条件宣称"窗口已直接显示在世界中"——那是假成功：
+		// 显示是否真的建立取决于 updateWorld 直显循环，give 无从保证（缺陷 C 症状
+		// "有进程没窗口"当时被这句话掩盖）。现在只在确有显示时报显示，否则引导摆位。
+		WindowDisplayMode mode = wlc.effectiveDisplayMode();
+		if(mode == WindowDisplayMode.LOCAL_DIRECT) {
+			boolean shown = wlc.hasDisplayFor(toplevel);
+			if(shown) {
+				source.sendFeedback(Component.literal("§e○ 本地直显模式：该窗口已在世界中显示: §f" + getWindowDisplayName(toplevel)
+						+ "§7（不在眼前可用 §e/wl place " + wlc.windowAliases.getOrCreate(toplevel.getHandle()) + "§7 摆位）§r"));
+			} else {
+				source.sendFeedback(Component.literal("§e○ 本地直显模式：物品持久化不可用（服务端无 mod，反作弊服不支持物品）——"
+						+ "用 §e/wl place <handle>§e 摆位、§e/wl move§e 微调，交互按 §eG§e、管理按 §eB§r"));
+			}
 			return 1;
 		}
 
+		if(!wlc.serverHasMod) {
+			// 显式 items 档（无 mod、用户自选）：客户端本地物品——唯一被放行的本端背包写入
+			boolean ok = wlc.itemManager.giveItemLocally(toplevel);
+			source.sendFeedback(Component.literal((ok ? "§a✔ [items 档] 客户端物品已放入背包: §f" : "§c✘ [items 档] 背包已满，无法放入: §f")
+					+ getWindowDisplayName(toplevel) + "§r"));
+			if(ok) {
+				source.sendFeedback(Component.literal(" §7手持右键长按放置；服务端背包回同步后会自动补回（§e/wl localitems auto§7 可恢复默认）§r"));
+			}
+			return ok ? 1 : 0;
+		}
+
 		wlc.itemManager.giveItem(toplevel);
+		// C 自愈回查：真实 mod 服务端几 tick 内就会把物品同步回背包；探测虚高
+		// （代理/反作弊服协商噪声、payload 被静默丢弃）时 5 秒无回包自动切本地直显。
+		wlc.armGiveVerification(toplevel.getHandle());
 		source.sendFeedback(Component.literal("§a✔ Gave window item: §f" + getWindowDisplayName(toplevel) + "§r"));
 		return 1;
 	}
@@ -919,6 +970,8 @@ public class WaylandCraftCommand {
 			return 0;
 		}
 
+		// grab 意味着"我要拖动它"：本地直显下解除隐藏标记，避免自动摆位与抓取竞争
+		wlc.localHiddenHandles.remove(toplevel.getHandle());
 		WindowDisplay display = wlc.getOrCreateDisplay(toplevel);
 		wlc.pointerGrabs.startExclusive(new WindowGrab(display, 0));
 
@@ -930,6 +983,122 @@ public class WaylandCraftCommand {
 
 		source.sendFeedback(Component.literal("§a✔ Grabbed: §f" + getWindowDisplayName(toplevel) + "§r"));
 		source.sendFeedback(Component.literal(" §7移动鼠标拖动窗口，滚轮调整距离§r"));
+		return 1;
+	}
+
+	/**
+	 * 无物品摆位（缺陷 2）：把窗口重摆到玩家面前，复用 doGrabMove/anchor 路径。
+	 * **所有模式均可用且绝不触碰背包**——这是本地直显（含服务端 mod 探测虚高
+	 * 时的 give 静默失败面）的最小闭环兜底：launch 出来的窗口按这条命令必定可见。
+	 * 距离默认 2.0 格，可调 1-6。布局开启时本命令只是临时偏移，下一次布局重排
+	 * 会把窗口拉回槽位（需求 A：布局优先，place 为临时偏移）。
+	 */
+	private static int placeWindow(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		String handleStr = StringArgumentType.getString(context, "handle");
+
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.bridge == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		WLCToplevel toplevel = findToplevelByHandle(source, handleStr);
+		if(toplevel == null) return 0;
+
+		double distance = LocalDirectDisplay.DEFAULT_PLACE_DISTANCE;
+		try {
+			distance = DoubleArgumentType.getDouble(context, "distance");
+		} catch(IllegalArgumentException ignored) {
+			// 未提供距离参数：用默认 2.0
+		}
+		distance = LocalDirectDisplay.clampPlaceDistance(distance);
+
+		// place 即"我要看到它"：撤销本连接内的主动隐藏（hide 的逆操作）
+		wlc.localHiddenHandles.remove(toplevel.getHandle());
+
+		WindowDisplay display = wlc.getOrCreateDisplay(toplevel);
+		display.anchorDistance = distance;
+		Minecraft mc = Minecraft.getInstance();
+		Camera camera = mc.gameRenderer.getMainCamera();
+		display.doGrabMove(camera.position(), new Vec3(camera.forwardVector()), new Vec3(camera.upVector()), camera.yRot());
+
+		// 摆位写入按服记忆（布局不活跃时下次重进自动回位；布局活跃时由布局接管）
+		wlc.rememberPlacementFor(display, toplevel);
+
+		String alias = getWindowAlias(toplevel);
+		source.sendFeedback(Component.literal("§a✔ Placed: §f" + getWindowDisplayName(toplevel) + "§r §7面前 " + String.format(java.util.Locale.ROOT, "%.1f", distance) + " 格§r"));
+		if(wlc.effectiveDisplayMode() == WindowDisplayMode.LOCAL_DIRECT) {
+			source.sendFeedback(Component.literal(" §7纯客户端摆位（不依赖物品，任何服务端都安全）§r"));
+		}
+		return 1;
+	}
+
+	// ===== ⑩ localItems 显示档（需求 B）=====
+
+	/**
+	 * /wl localitems —— 查看当前生效档与来源（全局/按服）。
+	 */
+	private static int showLocalItems(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+		String global = wlc.settings != null ? wlc.settings.getLocalItems() : "auto";
+		String effective = wlc.effectiveLocalItems();
+		String serverKey = wlc.currentServerKey();
+		source.sendFeedback(Component.literal("§e§llocalItems: §f" + effective + " §7(全局 " + global + (serverKey.isEmpty() ? "" : " @ " + serverKey) + ")§r"));
+		source.sendFeedback(Component.literal(" §eauto §7— 默认：服务端有 mod 走物品，无 mod 本地直显；§eitems §7— 无 mod 服由客户端自维护窗口物品（§c反作弊服可能判定刷物品§7，仅限可信服）；§edisplay §7— 强制本地直显§r"));
+		source.sendFeedback(Component.literal(" §7在世界内设置时只对当前服务器生效（按服记忆）；标题界面设置的是全局默认§r"));
+		return 1;
+	}
+
+	/**
+	 * /wl localitems <auto|items|display> —— 世界内设置写入按服记忆（用户对可信服
+	 * 选一次 items 后该服默认），标题界面写入全局默认。清运行期直显覆盖，显示模式
+	 * 即时生效；items 档带一次性风险提示。
+	 */
+	private static int setLocalItems(CommandContext<FabricClientCommandSource> context) {
+		FabricClientCommandSource source = context.getSource();
+		String mode = StringArgumentType.getString(context, "mode");
+
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.settingsManager == null || wlc.settings == null) {
+			source.sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+
+		String normalized = LocalModePolicy.normalizeLocalItems(mode);
+		if(!normalized.equals(mode.toLowerCase())) {
+			source.sendError(Component.literal("§c✘ 无效档位: " + mode + "（可选 auto|items|display）§r"));
+			return 0;
+		}
+
+		String serverKey = wlc.currentServerKey();
+		if(serverKey.isEmpty()) {
+			// 不在任何世界：写全局默认
+			wlc.settingsManager.setStringSetting(WaylandCraftSettings.LOCAL_ITEMS, normalized);
+			source.sendFeedback(Component.literal("§a✔ localItems 全局默认已设为 §f" + normalized + "§r"));
+		}
+		else {
+			// 世界内：只写按服记忆，不动全局默认（否则等于给所有服务器换档）。
+			// 清运行期直显覆盖使档位即时生效；落盘走既有 settings.json 持久化。
+			wlc.settings.localItemsByServer().put(serverKey, normalized);
+			wlc.settingsManager.writeSettings();
+			wlc.clearLocalDisplayOverride();
+			source.sendFeedback(Component.literal("§a✔ 本服（§f" + serverKey + "§a）localItems = §f" + normalized
+					+ "§a（已按服记忆，下次进本服默认；全局默认仍为 "
+					+ LocalModePolicy.normalizeLocalItems(wlc.settings.getLocalItems()) + "）§r"));
+		}
+
+		WindowDisplayMode displayMode = wlc.effectiveDisplayMode();
+		source.sendFeedback(Component.literal(" §7当前显示模式: §f" + (displayMode == WindowDisplayMode.LOCAL_DIRECT ? "本地直显（无物品）" : "物品模式")
+				+ " §7| 服务端 mod: §f" + (wlc.serverHasMod ? "installed" : "MISSING") + "§r"));
+		if(normalized.equals(LocalModePolicy.LOCAL_ITEMS_ITEMS) && !wlc.serverHasMod) {
+			source.sendFeedback(Component.literal(" §c⚠ items 档在无 mod 服由客户端本地写入窗口物品——在反作弊服务器可能被判定刷物品。仅在你信任的服务器使用；恢复默认: /wl localitems auto§r"));
+		}
 		return 1;
 	}
 
@@ -955,6 +1124,8 @@ public class WaylandCraftCommand {
 			}
 			Minecraft mc = Minecraft.getInstance();
 			Camera camera = mc.gameRenderer.getMainCamera();
+			// show all 即全部取消本地直显隐藏
+			wlc.localHiddenHandles.clear();
 			int shown = 0, already = 0;
 			for(WLCToplevel toplevel : toplevels) {
 				boolean existed = wlc.hasDisplayFor(toplevel);
@@ -980,6 +1151,8 @@ public class WaylandCraftCommand {
 			return 0;
 		}
 
+		// show 是 hide 的逆操作：本地直显下解除"用户主动隐藏"，否则自动摆位会跳过它
+		wlc.localHiddenHandles.remove(toplevel.getHandle());
 		boolean alreadyShown = wlc.hasDisplayFor(toplevel);
 		WindowDisplay display = wlc.getOrCreateDisplay(toplevel);
 
@@ -1019,8 +1192,12 @@ public class WaylandCraftCommand {
 				source.sendError(Component.literal("§c✘ 当前没有任何在世界中显示的窗口§r"));
 				return 0;
 			}
-			// 批量隐藏时一并解除钉住
+			// 批量隐藏时一并解除钉住；本地直显下把全部 toplevel 记入隐藏集合，
+			// 否则 updateWorld 自动摆位会在下一帧把它们"复活"（hide 失效）
 			wlc.pinnedToplevel = null;
+			if(wlc.bridge != null) {
+				for(WLCToplevel t : wlc.bridge.getToplevels()) wlc.localHiddenHandles.add(t.getHandle());
+			}
 			wlc.displays.clear();
 			source.sendFeedback(Component.literal("§a✔ 已隐藏全部 §f" + hidden + "§a 个窗口§7（钉住已一并解除，窗口管理屏中仍可见）§r"));
 			return 1;
@@ -1039,6 +1216,10 @@ public class WaylandCraftCommand {
 		if(wasPinned) {
 			wlc.pinnedToplevel = null;
 		}
+
+		// 本地直显模式关键修复：自动摆位循环对"已无显示"的映射窗口会立刻重建显示。
+		// 没有隐藏集合时 /wl hide 在本地模式等于无效（下一帧窗口就回来）。
+		wlc.localHiddenHandles.add(toplevel.getHandle());
 
 		boolean removed = wlc.displays.removeIf((w) -> w.window == toplevel);
 		if(removed) {
@@ -1073,6 +1254,7 @@ public class WaylandCraftCommand {
 
 		boolean alreadyPinned = wlc.pinnedToplevel == toplevel;
 		if(!alreadyPinned) {
+			wlc.localHiddenHandles.remove(toplevel.getHandle());
 			// 未显示则先显示并锚定到玩家面前
 			boolean alreadyShown = wlc.hasDisplayFor(toplevel);
 			WindowDisplay display = wlc.getOrCreateDisplay(toplevel);
@@ -1457,6 +1639,13 @@ public class WaylandCraftCommand {
 			return 0;
 		}
 
+		// ⑩ 反作弊红线：服务端无 mod 时，仅显式 items 档（用户手动选择）才允许
+		// 客户端背包操作；auto/display 档直接拒绝，绝不扫描/修改背包。
+		if(!wlc.serverHasMod && wlc.effectiveDisplayMode() != WindowDisplayMode.ITEM) {
+			source.sendError(Component.literal("§c✘ 本地直显模式无背包物品可收回（默认不碰背包，反作弊安全）：用 §e/wl hide§c 隐藏窗口即可"));
+			return 0;
+		}
+
 		long handle = parseWindowHandle(handleStr);
 
 		Minecraft mc = Minecraft.getInstance();
@@ -1631,6 +1820,9 @@ public class WaylandCraftCommand {
 			return 0;
 		}
 
+		// 摆位按 (serverKey, 别名) 落盘：布局不活跃时重进同一服务器自动回位
+		wlc.rememberPlacementFor(display, toplevel);
+
 		String alias = getWindowAlias(toplevel);
 		source.sendFeedback(Component.literal("§a✔ Moved §f" + alias + "§r → §ex " + fmt(display.pivot.x) + "§7, §ey " + fmt(display.pivot.y) + "§7, §ez " + fmt(display.pivot.z) + "§r"));
 		return 1;
@@ -1682,6 +1874,8 @@ public class WaylandCraftCommand {
 			source.sendError(Component.literal("§c✘ 无效角度§r §7(支持绝对如 §e90§7，或相对偏移如 §e~15§7 / §e~§7)§r"));
 			return 0;
 		}
+
+		wlc.rememberPlacementFor(display, toplevel);
 
 		String alias = getWindowAlias(toplevel);
 		source.sendFeedback(Component.literal("§a✔ Rotated §f" + alias + "§r → §e" + fmt(display.yawDegrees()) + "°§r §7(0=朝+Z, 90=朝+X)§r"));
@@ -2837,6 +3031,18 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal("§e§l— WaylandCraft status —§r"));
 		source.sendFeedback(Component.literal("§7serverMod: §f" + (wlc.serverHasMod ? "installed" : "MISSING (local direct-display)")
 			+ " §7| bridge: §f" + (wlc.bridge != null ? "up" : (wlc.isNativeDisabled() ? "disabled" : "down")) + "§r"));
+
+		// ⑩ 显示链路诊断（缺陷 C 排错入口）：toplevel/mapped/display 三个计数一眼
+		// 定位断点——native 有窗口但 Java 列表空=事件同步断；mapped=0 但 display>0=
+		// attach 信号丢（已兜底）；mode 与 serverMod 不一致=探测/档位/覆盖在起作用。
+		WindowDisplayMode statusMode = wlc.effectiveDisplayMode();
+		int statusToplevels = wlc.bridge != null ? wlc.bridge.getToplevels().length : 0;
+		int statusMapped = wlc.bridge != null ? wlc.bridge.getMappedToplevels().length : 0;
+		source.sendFeedback(Component.literal("§7mode: §f" + (statusMode == WindowDisplayMode.LOCAL_DIRECT ? "local-direct" : "item")
+			+ " §7| localItems: §f" + wlc.effectiveLocalItems()
+			+ " §7| toplevels: §f" + statusToplevels
+			+ " §7mapped: §f" + statusMapped
+			+ " §7displays: §f" + wlc.displays.size() + "§r"));
 
 		// ⑦ viewer 侧 playout 缓冲概览（无观众窗口时跳过）
 		if(wlc.remoteWindowRenderer != null) {

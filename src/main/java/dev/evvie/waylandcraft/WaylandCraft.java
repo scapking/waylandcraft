@@ -2,8 +2,11 @@ package dev.evvie.waylandcraft;
 
 import java.io.File;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.stream.Stream;
 
 import org.jetbrains.annotations.Nullable;
@@ -28,6 +31,10 @@ import dev.evvie.waylandcraft.grabs.PointerGrabMap.ImplicitGrab;
 import dev.evvie.waylandcraft.grabs.ResizeGrab;
 import dev.evvie.waylandcraft.gui.WaylandHudRenderer;
 import dev.evvie.waylandcraft.gui.WindowManagerScreen;
+import dev.evvie.waylandcraft.localmode.LocalDirectDisplay;
+import dev.evvie.waylandcraft.localmode.LocalModePolicy;
+import dev.evvie.waylandcraft.localmode.LocalModePolicy.WindowDisplayMode;
+import dev.evvie.waylandcraft.placement.WindowPlacementMemory;
 import dev.evvie.waylandcraft.item.WindowHandle;
 import dev.evvie.waylandcraft.item.WindowItem;
 import dev.evvie.waylandcraft.item.WindowItemManager;
@@ -60,6 +67,7 @@ import net.minecraft.client.Camera;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientPacketListener;
+import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
@@ -485,15 +493,33 @@ public class WaylandCraft implements ClientModInitializer {
 		// ⑩ 服务端无 mod 时物品体系整体不存在（give 被静默丢弃）：改走本地直显——
 		// 不再依赖"手持物品"路径，为新 toplevel 直接建 display 并以初始姿态摆放，
 		// 窗口照样可见/可点/可拖（拖拽走 PointerGrabMap 世界射线，本就纯客户端）。
-		if(serverHasMod) {
-			itemManager.giveItemsIfMissing(mappedToplevelsThisTick());
+		if(effectiveDisplayMode() == WindowDisplayMode.ITEM) {
+			if(serverHasMod) {
+				// 标准档：payload 仅在服务端真有 mod 时发送（反作弊红线：客户端零背包写入）
+				itemManager.giveItemsIfMissing(mappedToplevelsThisTick());
+			}
+			else {
+				// 显式 items 档（无 mod、无反作弊的可信服）：客户端自维护物品，
+				// 服务端每次背包回同步后由本循环补回——风险与语义见 LocalModePolicy。
+				itemManager.giveItemsLocallyIfMissing(mappedToplevelsThisTick());
+			}
 		}
 		else {
-			for(WLCToplevel t : mappedToplevelsThisTick()) {
-				if(hasDisplayFor(t)) continue;
+			// 本地直显。目标判定放宽为"存活 且（mapped 或 Java 层已有 framebuffer）"
+			// 且必须用 toplevelsThisTick 全量枚举——旧实现只看 isMapped 单信号
+			// （缺陷 C：buffer attach 事件丢失/协商噪声时窗口恒不显示且无报错）。
+			for(WLCToplevel t : toplevelsThisTick()) {
+				LocalDirectDisplay.DisplayTarget target = new LocalDirectDisplay.DisplayTarget(
+						t.getHandle(),
+						t.isAlive(),
+						isMappedSafe(t),
+						framebufferReady(t),
+						hasDisplayFor(t),
+						localHiddenHandles.contains(t.getHandle()));
+				if(!LocalDirectDisplay.shouldCreateDisplay(target)) continue;
+
 				WindowDisplay d = getOrCreateDisplay(t);
-				d.anchorDistance = 2.0;
-				d.doGrabMove(camera.position(), new Vec3(camera.forwardVector()), new Vec3(camera.upVector()), camera.yRot());
+				placeNewLocalDisplay(d, t, camera);
 			}
 		}
 		
@@ -536,6 +562,47 @@ public class WaylandCraft implements ClientModInitializer {
 		updateOutputSize(inWMScreen);
 	}
 	
+	/** isMapped() 在 surface 尚未挂上的极早期帧会 NPE；判活 + 判 surface 后再问。 */
+	private static boolean isMappedSafe(WLCToplevel t) {
+		return t.isAlive() && t.getSurfaceTree() != null && t.isMapped();
+	}
+
+	/** Java 渲染层已有真实尺寸 framebuffer：buffer attach 丢失时的兜底可显示信号。 */
+	private static boolean framebufferReady(WLCToplevel t) {
+		return t.isAlive() && t.framebuffer != null && t.geometry != null
+				&& t.geometry.width() > 0 && t.geometry.height() > 0;
+	}
+
+	/**
+	 * 新建本地直显显示的首帧姿态（需求 A：布局优先）。
+	 *  - 布局开启且该窗口参与布局 → 摆到布局中心，下一 tick 由 WindowLayoutManager
+	 *    精排到槽位（与物品窗口同一条布局路径；/wl place 只是临时偏移）。
+	 *  - 布局不活跃但有按服记忆 → 直接回位。
+	 *  - 否则玩家面前默认距离（旧行为）。
+	 */
+	private void placeNewLocalDisplay(WindowDisplay d, WLCToplevel t, Camera camera) {
+		boolean layoutActive = layoutManager != null && layoutManager.isEnabled() && layoutManager.isInitialized()
+				&& (settings == null || settings.getLayoutAutoJoin() || layoutManager.containsHandle(t.getHandle()));
+		WindowPlacementMemory.Placement remembered = layoutActive ? null : lookupRememberedPlacement(t);
+
+		switch(LocalDirectDisplay.chooseInitialPose(layoutActive, remembered != null)) {
+			case LAYOUT -> {
+				d.pivot = layoutManager.centerPos();
+				d.rotateToYawDegrees(settings.getLayoutInitYaw());
+				d.clampVertical();
+			}
+			case REMEMBERED -> {
+				d.pivot = new Vec3(remembered.x(), remembered.y(), remembered.z());
+				d.rotateToYawDegrees(remembered.yawDeg());
+				d.anchorDistance = LocalDirectDisplay.clampPlaceDistance(remembered.distance());
+			}
+			case CAMERA_FRONT -> {
+				d.anchorDistance = LocalDirectDisplay.DEFAULT_PLACE_DISTANCE;
+				d.doGrabMove(camera.position(), new Vec3(camera.forwardVector()), new Vec3(camera.upVector()), camera.yRot());
+			}
+		}
+	}
+
 	public @Nullable ItemStack getPlayerUseWindowItem() {
 		LocalPlayer player = Minecraft.getInstance().player;
 		if(player == null) return null;
@@ -730,6 +797,7 @@ public class WaylandCraft implements ClientModInitializer {
 	public void onClientTick(Minecraft minecraft) {
 		if(minecraft.player == null) return;
 		updateServerModCapability();
+		tickGiveVerification();
 		checkKeybinds(minecraft);
 	}
 	
@@ -742,28 +810,180 @@ public class WaylandCraft implements ClientModInitializer {
 	// 探测结果驱动运行模式：true=标准模式（物品体系），false=本地直显模式。
 	public volatile boolean serverHasMod = true;
 	private int serverModCheckCountdown = 0;
-	
+
+	/**
+	 * 运行期强制本地直显（C 自愈）：give 后窗口物品迟迟不回背包 = 服务端并不会
+	 * 管物品（canSend 探得 true 但实际无响应，典型为反作弊/代理服协商噪声）。
+	 * 仅影响当前连接，重连归零重探；/wl localitems 任一档设置也会清掉。
+	 */
+	private volatile boolean localDisplayOverride = false;
+
+	/** 本地直显模式下被 /wl hide 主动隐藏的窗口：自动摆位不得"复活"它们（否则下帧即重建）。 */
+	public final Set<Long> localHiddenHandles = new HashSet<Long>();
+
+	// give 静默失败探测：记录句柄 + 5s（100 tick）倒计时，到点背包仍无该物品 → 判探测虚高
+	private long giveVerifyHandle = -1;
+	private int giveVerifyTicks = 0;
+
+	/** 命令面在发出 give payload 后调用：安排一次"物品是否真的回来了"的回查。 */
+	public void armGiveVerification(long toplevelHandle) {
+		giveVerifyHandle = toplevelHandle;
+		giveVerifyTicks = 100;
+	}
+
+	private void tickGiveVerification() {
+		if(giveVerifyTicks <= 0) return;
+		if(--giveVerifyTicks > 0) return;
+		long handle = giveVerifyHandle;
+		giveVerifyHandle = -1;
+		if(handle < 0 || !serverHasMod || localDisplayOverride) return;
+		// 只读背包（零写入）：真实 mod 服务端此时应已把物品同步回来
+		if(!itemManager.hasWindowItemFor(handle)) {
+			localDisplayOverride = true;
+			WaylandCraftCommon.LOGGER.info("[servermod] give payload unanswered after 5s despite canSend=true - forcing local direct-display until rejoin");
+			Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("§eWaylandCraft: 服务端声称支持物品但 5 秒无回包（疑似代理/反作弊服协商噪声），本连接已切换本地直显——用 §e/wl place <handle>§e 摆位，重连会重新探测"), false);
+			maybeShowLocalModeTutorial();
+		}
+	}
+
 	private void updateServerModCapability() {
 		if(Minecraft.getInstance().level == null) return;
 		if(serverModCheckCountdown-- > 0) return;
 		serverModCheckCountdown = 20; // 每秒复测一次：容忍配置期注册延迟/换服时序
-		
+
 		boolean has = net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking.canSend(
 				dev.evvie.waylandcraft.network.ServerboundGiveItemsPayload.TYPE);
 		if(has == serverHasMod) return;
-		
+
 		serverHasMod = has;
 		WaylandCraftCommon.LOGGER.info("[servermod] server-side WaylandCraft {}", has ? "PRESENT - item system active" : "MISSING - local direct-display mode");
 		if(!has) {
 			Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("§eWaylandCraft 本地模式：服务端未安装 mod。窗口以本地直显方式运行（可见/可拖/键盘鼠标交互正常）；物品持久化与多人共享需服务端安装 waylandcraft-server.jar"), false);
+			// 教学聊天与上面这条合并呈现：仅本服首次进入本地模式时追加（每服一次，不刷屏）
+			maybeShowLocalModeTutorial();
 		}
 	}
-	
+
 	/** 命令/共享入口的能力守卫：vanilla 服务端下给出明确错误而非静默失败 */
 	public boolean requireServerMod(String feature) {
-		if(serverHasMod) return true;
+		if(LocalModePolicy.serverModFeatureAllowed(serverHasMod)) return true;
 		Minecraft.getInstance().getChatListener().handleSystemMessage(Component.literal("§c✘ " + feature + "需要服务端安装 WaylandCraft mod（waylandcraft-server.jar）；当前为本地模式，该功能静默不可用"), false);
 		return false;
+	}
+
+	// ===== ⑩ 显示模式解析（能力探测 × localItems 档 × 运行期自愈覆盖）=====
+
+	/** 生效显示档：按服务器记忆优先于全局（/wl localitems 在世界内设置时写按服记录）。 */
+	public String effectiveLocalItems() {
+		String global = settings != null ? settings.getLocalItems() : LocalModePolicy.LOCAL_ITEMS_AUTO;
+		Map<String, String> per = settings != null ? settings.localItemsByServer() : Map.of();
+		return WindowPlacementMemory.resolveLocalItems(currentServerKey(), per, global);
+	}
+
+	/** 当前世界内窗口驱动模式（updateWorld/命令面共用；纯读，无副作用）。 */
+	public WindowDisplayMode effectiveDisplayMode() {
+		return LocalModePolicy.resolveDisplayMode(serverHasMod, effectiveLocalItems(), localDisplayOverride);
+	}
+
+	/** give 静默失败自愈触发后清掉运行期覆盖（/wl localitems 设置命令调用；重连也会自动清）。 */
+	public void clearLocalDisplayOverride() {
+		localDisplayOverride = false;
+	}
+
+	/**
+	 * 当前服务器标识：多人=服务器 IP；单人=存档目录名（=经 sanitize 的世界名，
+	 * 跨会话稳定，单人同理）；无法确定（标题界面等）→ ""（不做持久化）。
+	 */
+	public String currentServerKey() {
+		Minecraft mc = Minecraft.getInstance();
+		ServerData sd = mc.getCurrentServer();
+		if(sd != null) {
+			return WindowPlacementMemory.serverKey(sd.ip, null);
+		}
+		var integrated = mc.getSingleplayerServer();
+		if(integrated != null) {
+			try {
+				String folder = integrated.getWorldPath(net.minecraft.world.level.storage.LevelResource.ROOT)
+						.getFileName().toString();
+				return WindowPlacementMemory.serverKey(null, folder);
+			} catch(Exception ignored) {
+				// 存档路径异常不应阻断游戏——退化为"无标识不持久化"
+			}
+		}
+		return "";
+	}
+
+	/**
+	 * handle → 记忆别名（标题 slug + 同名编号）。保存与恢复共用本方法对
+	 * bridge.getToplevels() 的同一枚举顺序，编号才稳定；只在窗口新建/摆位
+	 * 命令/断开时调用，不在每 tick 热路径。
+	 */
+	public Map<Long, String> memoryAliases() {
+		Map<Long, String> out = new HashMap<Long, String>();
+		if(bridge == null) return out;
+		List<Long> handles = new ArrayList<Long>();
+		List<String> titles = new ArrayList<String>();
+		for(WLCToplevel t : bridge.getToplevels()) {
+			handles.add(t.getHandle());
+			titles.add(getWindowName(t));
+		}
+		return WindowPlacementMemory.memoryAliasesByHandle(handles, titles);
+	}
+
+	/** 记一个窗口的摆位并落盘（place/move/rotate/grab 命令与断开清理共用）。 */
+	public void rememberPlacementFor(WindowDisplay d, WLCToplevel t) {
+		if(settings == null || settingsManager == null || d == null || t == null) return;
+		String key = currentServerKey();
+		if(key.isEmpty()) return;
+		String alias = memoryAliases().get(t.getHandle());
+		if(alias == null) return;
+		WindowPlacementMemory.remember(settings.localWindowPlacements(), key, alias,
+				new WindowPlacementMemory.Placement(d.pivot.x, d.pivot.y, d.pivot.z, d.yawDegrees(), d.anchorDistance));
+		settingsManager.writeSettings();
+	}
+
+	/** 断开/换服前把当前全部显示摆位写入按服记忆（单人存档同理）。 */
+	public void saveAllLocalPlacements() {
+		if(settings == null || settingsManager == null || bridge == null) return;
+		String key = currentServerKey();
+		if(key.isEmpty()) return;
+		Map<Long, String> aliases = memoryAliases();
+		boolean touched = false;
+		for(WindowDisplay d : displays) {
+			if(!(d.window instanceof WLCToplevel t)) continue;
+			String alias = aliases.get(t.getHandle());
+			if(alias == null) continue;
+			WindowPlacementMemory.remember(settings.localWindowPlacements(), key, alias,
+					new WindowPlacementMemory.Placement(d.pivot.x, d.pivot.y, d.pivot.z, d.yawDegrees(), d.anchorDistance));
+			touched = true;
+		}
+		if(touched) settingsManager.writeSettings();
+	}
+
+	private WindowPlacementMemory.Placement lookupRememberedPlacement(WLCToplevel t) {
+		if(settings == null) return null;
+		String key = currentServerKey();
+		if(key.isEmpty()) return null;
+		String alias = memoryAliases().get(t.getHandle());
+		if(alias == null) return null;
+		return WindowPlacementMemory.lookup(settings.localWindowPlacements(), key, alias);
+	}
+
+	/** 首次（每服一次）进入本地直显模式的教学聊天；标记持久化在 settings。 */
+	public void maybeShowLocalModeTutorial() {
+		if(settings == null || settingsManager == null || bridge == null) return;
+		if(effectiveDisplayMode() != WindowDisplayMode.LOCAL_DIRECT) return;
+		String key = currentServerKey();
+		if(key.isEmpty() || WindowPlacementMemory.isMarked(settings.localModeTutorialShown(), key)) return;
+		var chat = Minecraft.getInstance().getChatListener();
+		chat.handleSystemMessage(Component.literal("§e▬ WaylandCraft 本地直显模式（服务端无 mod，无需背包物品）▬"), false);
+		chat.handleSystemMessage(Component.literal(" §e1) 启动：§f/wl launch <应用> §7（或 §f/wl capture §7捕获桌面窗口）"), false);
+		chat.handleSystemMessage(Component.literal(" §e2) 摆位：§f窗口出现即自动进世界；§f/wl place <handle> [距离1-6] §e重摆到面前"), false);
+		chat.handleSystemMessage(Component.literal(" §7（布局开启时以布局槽位为准，place 为临时偏移会被布局重排覆盖；位置/朝向按本服务器记忆，重进自动回位）"), false);
+		chat.handleSystemMessage(Component.literal(" §e3) 交互：§7看向窗口按 §fG §7绑定键盘（ESC 退出）；按 §fB §7开窗口管理屏（TAB 切换窗口）"), false);
+		chat.handleSystemMessage(Component.literal(" §7默认不碰背包物品（反作弊安全）。可信服可用 §f/wl localitems items §7启用客户端物品手感——反作弊服开启可能被判定刷物品，风险自负。"), false);
+		WindowPlacementMemory.mark(settings.localModeTutorialShown(), key);
+		settingsManager.writeSettings();
 	}
 		
 	private void checkKeybinds(Minecraft minecraft) {
@@ -808,11 +1028,25 @@ public class WaylandCraft implements ClientModInitializer {
 			return;
 		}
 		minecraft.getChatListener().handleSystemMessage(Component.literal("Wayland compositor running on " + waylandSocket), false);
+		// 换服立即重探能力，且不继承上一连接的运行期状态（直显覆盖/隐藏集合/回查）
+		serverModCheckCountdown = 0;
+		localDisplayOverride = false;
+		localHiddenHandles.clear();
+		giveVerifyTicks = 0;
+		giveVerifyHandle = -1;
 		updateServerModCapability();
-		if(serverHasMod) itemManager.giveItemsIfMissing(bridge.getMappedToplevels());
+		if(effectiveDisplayMode() == WindowDisplayMode.ITEM) {
+			if(serverHasMod) itemManager.giveItemsIfMissing(bridge.getMappedToplevels());
+			else itemManager.giveItemsLocallyIfMissing(bridge.getMappedToplevels());
+		}
+		// 同一进程重进同一 vanilla 服不会发生 serverHasMod 翻转，join 路径必须
+		// 自己负责教学触发（内部按 serverKey 去重，每服一次）
+		maybeShowLocalModeTutorial();
 	}
 	
 	private void onClientDisconnect(ClientPacketListener listener, Minecraft minecraft) {
+		// ⑩ 摆位记忆落盘必须在 displays.clear() 之前（位置数据就存在 display 上）
+		saveAllLocalPlacements();
 		displays.clear();
 		// P1-2：断线必须彻底退出键盘/指针捕获。旧实现只清 displays——
 		// keyboardCaptureMode/sharedKeyboardCapture/sharedPointerCapture/hovered* 全部残留，
@@ -825,6 +1059,9 @@ public class WaylandCraft implements ClientModInitializer {
 		hoveredDisplay = null;
 		hoveredSharedDisplay = null;
 		itemManager.reset();
+		// 清掉仅对当前连接有效的运行期状态（隐藏集合/直显覆盖按服重建）
+		localHiddenHandles.clear();
+		localDisplayOverride = false;
 	}
 	
 	@Nullable
