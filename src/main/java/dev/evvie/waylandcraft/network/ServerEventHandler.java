@@ -43,11 +43,15 @@ public class ServerEventHandler {
 	private static void handlePlayerJoin(ServerPlayer player) {
 		UUID playerUUID = player.getUUID();
 		LOGGER.info("Player {} joined server", playerUUID);
-		
-		// 给新玩家授予所有已注册窗口的VIEW权限
+
+		// ACL-2：按新观众默认策略处理公开窗口（allow=物化 DEFAULT 授权，保持既有
+		// 行为兼容；ask=收集邀请请求发给各 owner；deny=不授权）。不再无条件放行。
 		SharedWindowManager manager = WaylandCraftCommon.instance.sharedWindowManager;
-		manager.grantViewToNewPlayer(playerUUID);
-		
+		var invites = manager.onPlayerJoin(playerUUID);
+		if (!invites.isEmpty()) {
+			SharedWindowServerHandler.sendInviteRequests(invites);
+		}
+
 		// 发送当前共享窗口列表给新加入的玩家
 		sendWindowListToPlayer(player);
 	}
@@ -61,14 +65,23 @@ public class ServerEventHandler {
 		
 		SharedWindowManager manager = WaylandCraftCommon.instance.sharedWindowManager;
 
-		// 清理玩家相关的窗口
-		manager.handlePlayerDisconnect(playerUUID);
+		// 清理玩家相关的窗口。
+		// ACL-4：拿回因 owner 退出而消失的句柄，逐个即时清转发缓存并向观众
+		// 发"权限移除"信号（不等 tick 巡检/列表合并广播）。
+		java.util.List<Long> removed = manager.handlePlayerDisconnect(playerUUID);
+		for (long handle : removed) {
+			WaylandCraftNetworking.onWindowRemoved(handle);
+			for (ServerPlayer viewer : server.getPlayerList().getPlayers()) {
+				if (viewer.getUUID().equals(playerUUID)) continue;
+				SharedWindowServerHandler.notifyPermissionRemoved(handle, viewer);
+			}
+		}
 
 		// 广播更新的窗口列表给所有剩余玩家
 		// P1-7：改走 tick 合并广播（断线重连风暴下不再逐事件全服刷）
 		SharedWindowServerHandler.requestWindowListBroadcast();
 
-		LOGGER.info("Cleaned up shared windows for player {}", playerUUID);
+		LOGGER.info("Cleaned up {} shared window(s) for player {}", removed.size(), playerUUID);
 	}
 	
 	/**
@@ -90,8 +103,10 @@ public class ServerEventHandler {
 		var windowList = new java.util.ArrayList<SharedWindowListPayload.WindowInfo>();
 		UUID playerUUID = player.getUUID();
 
+		// ACL-3：新玩家的首屏列表同样走合成判定（黑名单/未授权不可见）
+		long nowMs = System.currentTimeMillis();
 		for(var entry : manager.getAllWindows()) {
-			var perm = entry.getPermission(playerUUID);
+			var perm = manager.effectivePermission(entry, playerUUID, nowMs);
 			if (perm == dev.evvie.waylandcraft.shared.WindowPermission.NONE) {
 				continue;
 			}
