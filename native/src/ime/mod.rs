@@ -380,7 +380,9 @@ impl ImeState {
         } else {
             self.seed_engines.join(", ")
         };
-        let route = if self.nested_route_live() {
+        let route = if self.effective_source() == builtin::ImeSource::Builtin {
+            "builtin"
+        } else if self.nested_route_live() {
             if self.keyboard_grabbed() { "im2-grab" } else { "im2" }
         } else {
             "host_bridge/raw 回退"
