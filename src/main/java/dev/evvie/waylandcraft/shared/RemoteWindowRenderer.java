@@ -71,6 +71,21 @@ public class RemoteWindowRenderer {
 	private static final int DECODED_QUEUE_CAPACITY = 3;
 	/** 压缩环形队列单窗口字节上限：超限丢最旧（缓冲深度降级，拒绝 OOM） */
 	private static final int MAX_BUFFER_BYTES_PER_WINDOW = 48 * 1024 * 1024;
+	/**
+	 * P1-7：单边像素上限（16384 = GL_MAX_TEXTURE_SIZE 的常见天花板）与总像素上限
+	 * （16384²）。JPEG 头可以声称任意尺寸：1KB 恶意文件解出 40000×40000，
+	 * getRGB/NativeImage 分配即 OOM。解码出尺寸后、分配像素数组前先校验。
+	 */
+	static final int MAX_DECODED_DIMENSION = 16384;
+	static final long MAX_DECODED_PIXELS = 16384L * 16384L;
+	/**
+	 * P1-7：活跃 playout 流的全局上限（= 每 viewer 接受的"不同 windowHandle"上限）。
+	 * 恶意/异常服务端可用海量 handle 撑爆 streamsByWindow（每条流含环形队列，
+	 * 单窗口压缩缓冲最高 48MB），超限的新 handle 直接丢帧，不影响已建立的流。
+	 */
+	static final int MAX_ACTIVE_STREAMS = 64;
+	/** stream 上限告警节流（10s 一条，避免丢帧风暴刷屏） */
+	private volatile long lastStreamCapWarnMs = 0;
 	/** 允许在播放时刻前多久预解码（ms）：更远的帧不占解码线程 */
 	private static final long DECODE_LOOKAHEAD_MS = 150;
 	/** minTransit 向上漂移速率（ms/帧）：容忍发送端变慢，但抗突发尖峰拉高估计 */
@@ -111,8 +126,22 @@ public class RemoteWindowRenderer {
 	 */
 	public void updateTexture(long windowHandle, int x, int y, int width, int height, byte[] jpegData, long captureTimestampMs, int frameSeq) {
 		if(jpegData == null || jpegData.length == 0) return;
-		
-		BufferedStream stream = streamsByWindow.computeIfAbsent(windowHandle, BufferedStream::new);
+
+		// P1-7：handle 数不设限 → 活跃流全局上限。超限的新窗口句柄不建流、直接丢帧
+		//（已建立的流不受影响；陈旧流由 cleanupOldTextures 的 60s 无流量兜底回收）。
+		BufferedStream stream = streamsByWindow.get(windowHandle);
+		if(stream == null) {
+			if(streamsByWindow.size() >= MAX_ACTIVE_STREAMS) {
+				long now2 = System.currentTimeMillis();
+				if(now2 - lastStreamCapWarnMs > 10_000) {
+					lastStreamCapWarnMs = now2;
+					LOGGER.warn("Drop frame for unknown window 0x{}: active stream cap {} reached",
+						Long.toHexString(windowHandle), MAX_ACTIVE_STREAMS);
+				}
+				return;
+			}
+			stream = streamsByWindow.computeIfAbsent(windowHandle, BufferedStream::new);
+		}
 		long now = System.currentTimeMillis();
 		boolean shouldSchedule = false;
 		synchronized(stream) {
@@ -192,6 +221,12 @@ public class RemoteWindowRenderer {
 				}
 				decodedW = bufferedImage.getWidth();
 				decodedH = bufferedImage.getHeight();
+				// P1-7：恶意 JPEG 头可声称 40000×40000（1KB 文件 → 解出 16 亿像素）。
+				// 在分配 int[]/纹理前拒绝超限尺寸（getRGB 与 createTexture 都不做尺寸校验）。
+				if(!decodedDimensionsAllowed(decodedW, decodedH)) {
+					LOGGER.warn("Reject decoded frame {}x{} (over pixel cap) from window stream", decodedW, decodedH);
+					return;
+				}
 				// 批量获取所有像素（1次调用）
 				argbPixels = bufferedImage.getRGB(0, 0, decodedW, decodedH, null, 0, decodedW);
 			} catch(Exception e) {
@@ -212,6 +247,16 @@ public class RemoteWindowRenderer {
 		}
 	}
 	
+	/**
+	 * P1-7 纯函数（可单测）：解码结果尺寸是否允许进入像素分配。
+	 * 拒绝条件：非正尺寸、单边超过 GL 纹理上限、总像素超过 MAX_DECODED_PIXELS。
+	 */
+	static boolean decodedDimensionsAllowed(int width, int height) {
+		if(width <= 0 || height <= 0) return false;
+		if(width > MAX_DECODED_DIMENSION || height > MAX_DECODED_DIMENSION) return false;
+		return (long) width * (long) height <= MAX_DECODED_PIXELS;
+	}
+
 	/**
 	 * 把解码结果放入该窗口的结果队列；窗口已注销/重建则丢弃。
 	 * 队列满（容量 DECODED_QUEUE_CAPACITY）时丢最旧帧。
