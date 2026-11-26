@@ -68,6 +68,32 @@ public final class ImeCandidateLayout {
 	}
 
 	/**
+	 * ARGB8888 wire 字节流 → NativeImage 小端 int 转码（sync15 修复 D 的
+	 * 纯函数半程——uploadFrame 与单测共用，杜绝复刻漂移，同 native 侧
+	 * {@code encode_popup_snapshot} 纪律）。
+	 *
+	 * 输入：{@code d} = wire [B,G,R,A] 字节（每像素 4 字节，共 pixelCount 个）；
+	 * 输出：{@code dst}（capacity ≥ pixelCount*4）内小端 int
+	 * {@code (A<<24)|(B<<16)|(G<<8)|R}——落内存即 MC 26.x NativeImage 的
+	 * RGBA 布局 [R,G,B,A]（RemoteWindowRenderer 取证）。与旧逐像素
+	 * {@code MemoryUtil.memPutInt} 的字节结果逐字节等价（小端平台，MC
+	 * 全部目标平台成立），dst 字节序由本函数强制 LITTLE_ENDIAN 保证。
+	 */
+	public static void transferArgb(byte[] d, int pixelCount, java.nio.ByteBuffer dst) {
+		dst.order(java.nio.ByteOrder.LITTLE_ENDIAN);
+		dst.position(0).limit(pixelCount * 4);
+		java.nio.IntBuffer ib = dst.asIntBuffer();
+		for(int i = 0; i < pixelCount; i++) {
+			int b = i * 4;
+			int b0 = d[b] & 0xFF;
+			int b1 = d[b + 1] & 0xFF;
+			int b2 = d[b + 2] & 0xFF;
+			int b3 = d[b + 3] & 0xFF;
+			ib.put(i, (b3 << 24) | (b0 << 16) | (b1 << 8) | b2);
+		}
+	}
+
+	/**
 	 * 边界钳制定位：
 	 * 垂直：yBelow（输入框正下方）在安全区内 → 用；否则 yAbove（翻转挂框上方）
 	 * 在安全区内 → 用；都不行 → 取 yBelow 钳进安全区（宁可贴边不越界）。
