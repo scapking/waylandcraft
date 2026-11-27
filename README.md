@@ -67,7 +67,7 @@ The feature upstream called impossible, shipped end-to-end (see [docs/IME.md](do
 
 ### 👥 Buffered, stutter-free multiplayer
 
-- **Latency-for-smoothness playout**: viewers buffer `sharePlayoutDelayMs` (default 4000, 0–8000) using measured transfer floors — smooth video under jitter, **resolution never downscaled**.
+- **Latency-for-smoothness playout**: viewers buffer `sharePlayoutDelayMs` (default `auto` = load-adaptive **14–32 s**, or `0` = low-latency, or a manual ms value) on a **single shared audio+video playout clock** — smooth video under jitter, A/V phase locked, **resolution never downscaled**.
 - **Per-window audio**: the shared *application's own* PipeWire stream (not your microphone), synchronized to the same playout clock, with distance falloff (`audioShareRangeBlocks`).
 - **Server-side fairness**: capability-filtered relays (vanilla players receive nothing undecodable) and write backpressure (slow viewers drop frames instead of OOM-ing the server).
 
@@ -350,7 +350,7 @@ Share windows from the X11 desktop (via `xwayland-satellite`) directly, without 
 | `layoutDefaultHeight` | `540` | Resolution applied to windows joining the layout |
 | `groundClearance` | `0.4` | Min clearance of window bottom above floor (blocks) |
 | `moveStep` | `0.5` | Manual move step for Ctrl+arrow key movement |
-| `sharePlayoutDelayMs` | `4000` | Viewer playout buffer 0–8000 (0 = legacy low-latency; higher = smoother) |
+| `sharePlayoutDelayMs` | `auto` (-1) | Viewer playout buffer: `auto` = load-adaptive 14–32 s (congestion deepens, 30 s clean relaxes); `0` = legacy low-latency; `1–32000` = manual ms |
 | `audioShareRangeBlocks` | `32` | Distance falloff radius for shared-window audio (0 = audible everywhere) |
 | `imeSource` | `auto` | IME engine source: `auto` / `fcitx5` / `builtin` |
 | `verboseLogging` | dev-env default | Full diagnostic logging on/off (release builds stay quiet; see [docs/LOGGING.md](docs/LOGGING.md)) |
@@ -388,7 +388,7 @@ A: Yes — pinyin/wubi/shuangpin/… with the **in-game candidate window**, both
 A: Yes. Install `waylandcraft-android-<arch>.jar` and join the server. Windows shared by PC teammates appear automatically — no extra steps on the phone.
 
 **Q: Shared windows stutter on my network.**
-A: Raise the viewer playout buffer: `/wl settings set sharePlayoutDelayMs 6000` (default 4000, range 0–8000; 0 = legacy low-latency mode). The buffer trades latency for zero stutter without touching resolution.
+A: Keep the default `auto` — the viewer playout buffer extends itself from 14 s up to 32 s under congestion evidence (buffer-cap truncation, decode stalls, late audio) and relaxes back after 30 s clean: `/wl settings set sharePlayoutDelayMs auto`. Prefer a fixed depth? `/wl settings set sharePlayoutDelayMs 20000` (range up to 32000; 0 = legacy low-latency). The buffer trades latency for zero stutter without touching resolution.
 
 **Q: Do X11 applications work?**
 A: Yes. `xwayland-satellite` is bundled inside the jar (both `x86_64` and `arm64`), so X11 apps get a `DISPLAY` automatically. The system still needs `Xwayland`, which ships with virtually every Wayland desktop.

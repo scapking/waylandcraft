@@ -1,8 +1,11 @@
 package dev.evvie.waylandcraft.shared;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.RejectedExecutionException;
 
 import org.jetbrains.annotations.Nullable;
 import org.slf4j.Logger;
@@ -15,6 +18,7 @@ import dev.evvie.waylandcraft.network.SharedWindowClientHandler;
 import dev.evvie.waylandcraft.network.SharedWindowImagePayload;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import dev.evvie.waylandcraft.render.SharedWindowDisplay;
+import dev.evvie.waylandcraft.utils.WcLogging;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.minecraft.client.Minecraft;
 import net.minecraft.world.phys.Vec3;
@@ -112,8 +116,29 @@ public class WindowShareManager {
 	 */
 	private AudioCaptureManager audioCapture;
 	
-	/** 当前音频跟随的窗口 handle（0 = 无音频） */
-	private long audioWindowHandle = 0;
+	/** 当前音频跟随的窗口 handle（0 = 无音频）。⑧ 意图值：主线程写，executor 线程读 */
+	private volatile long audioWindowHandle = 0;
+	
+	// ===== ⑧ v1.4.8 异步基础设施（命名/守护/惰性重建规范与 relay 线程池一致） =====
+	//
+	// 音频同步 executor：AudioCaptureManager.start/stop 内含同步 JNI（native PipeWire
+	// boot 预算 10s + ack 15s + 线程 join）+ X11 枚举。旧实现全部在命令线程/渲染线程
+	// 串行执行，`/wl share start all` 就是 N 次"停旧起新"全套阻塞——"瞬间卡一下"的
+	// 主病灶。现在主线程只更新意图（audioWindowHandle），executor 每次 reconcile 只
+	// 应用**最新**意图：N 连发 start 天然合并成 1 次真实启动。
+	private final Object audioExecLock = new Object();
+	private java.util.concurrent.ExecutorService audioSyncExecutor;
+	/** 实际已应用的音频捕获窗口（仅 audioSyncExecutor 线程读写） */
+	private long audioAppliedHandle = 0;
+	
+	// 编码 executor：JPEG/PNG 编码 + 大小保护重编码全部出渲染线程（1080p PNG 编码
+	// 50–200ms/帧在旧路径直接压在渲染线程 = "分享时特别卡"的稳态病灶）。
+	// 每窗口至多一帧在途（帧序 + 过载自然丢新帧，与 viewer 解码管线同范式）。
+	private final Object encodeExecLock = new Object();
+	private java.util.concurrent.ExecutorService encodeExecutor;
+	private static final int ENCODE_THREADS = 2;
+	/** 首帧风暴预算：新窗口首帧每 tick 最多放行这么多个（start all 第二波卡顿的闸门） */
+	static final int FIRST_FRAME_CAPTURES_PER_TICK = 2;
 	
 	public boolean startSharing(long windowHandle, String windowTitle) {
 		return startSharing(windowHandle, windowTitle, null);
@@ -141,7 +166,8 @@ public class WindowShareManager {
 		
 		SharedWindowClientHandler.requestWindowRegister(windowHandle, windowTitle, targetPlayer);
 		
-		// 音频捕获：跟随最近共享的窗口（native 单例，一次一个）
+		// ⑧ 音频捕获意图更新（executor 内实际应用，见 syncAudioState）。
+		// appId 解析留在主线程：一次廉价 JNI 查表，重活（X11 枚举 + PipeWire 会话）在 executor。
 		if(WaylandCraft.instance != null && WaylandCraft.instance.audioCaptureManager != null) {
 			audioCapture = WaylandCraft.instance.audioCaptureManager;
 			long prevAudioHandle = audioWindowHandle;
@@ -149,18 +175,7 @@ public class WindowShareManager {
 			audioCapture.setActiveWindow(windowHandle);
 			WLCToplevel toplevel = getLocalWindow(windowHandle);
 			String appId = toplevel != null ? toplevel.appID : null;
-			boolean audioOk = audioCapture.start(windowHandle, windowTitle, appId);
-			if(audioOk) {
-				LOGGER.info("Audio sharing enabled for 0x{}", Long.toHexString(windowHandle));
-			}
-			else {
-				// P2-18：start 失败回滚跟随目标。旧实现先改 handle 再 start，失败后
-				// audioWindowHandle 指向没有活动捕获的窗口——再停"上一个跟随窗口"时
-				// 停不掉它的音频，共享窗口间音频归属错乱。
-				audioWindowHandle = prevAudioHandle;
-				LOGGER.info("Audio capture start failed for 0x{} (audio stays on 0x{})",
-					Long.toHexString(windowHandle), Long.toHexString(prevAudioHandle));
-			}
+			requestAudioSync(windowHandle, prevAudioHandle, windowTitle, appId);
 		}
 		
 		LOGGER.info("Started sharing window 0x{}: {}", Long.toHexString(windowHandle), windowTitle);
@@ -226,22 +241,14 @@ public class WindowShareManager {
 
 		SharedWindowClientHandler.requestWindowRegister(xid, title, targetPlayer);
 
-		// 音频捕获：X11 窗口有 _NET_WM_PID，直接复用按 PID 捕获的链路
+		// ⑧ 音频捕获意图更新（X11 窗口有 _NET_WM_PID，复用按 PID 捕获链路；
+		// 同步阻塞问题与 wayland 路径同源，异步化方式一致）
 		if(WaylandCraft.instance != null && WaylandCraft.instance.audioCaptureManager != null) {
 			audioCapture = WaylandCraft.instance.audioCaptureManager;
 			long prevAudioHandle = audioWindowHandle;
 			audioWindowHandle = xid;
 			audioCapture.setActiveWindow(xid);
-			boolean audioOk = audioCapture.start(xid, title, appId);
-			if(audioOk) {
-				LOGGER.info("Audio sharing enabled for X11 0x{}", Long.toHexString(xid));
-			}
-			else {
-				// P2-18：同 wayland 路径，start 失败回滚跟随目标
-				audioWindowHandle = prevAudioHandle;
-				LOGGER.info("Audio capture start failed for X11 0x{} (audio stays on 0x{})",
-					Long.toHexString(xid), Long.toHexString(prevAudioHandle));
-			}
+			requestAudioSync(xid, prevAudioHandle, title, appId);
 		}
 
 		LOGGER.info("Started sharing X11 window 0x{}: {} ({}x{} on {})",
@@ -258,12 +265,13 @@ public class WindowShareManager {
 		
 		SharedWindowClientHandler.requestWindowUnregister(windowHandle);
 		
-		// 只停"音频跟随窗口"本身的音频；其他窗口共享不受影响
+		// 只停"音频跟随窗口"本身的音频；其他窗口共享不受影响。
+		// ⑧ stop/fallback 的 native 阻塞（PipeWire join + 新会话 boot）挪入 executor 串行队列
 		if(audioWindowHandle == windowHandle) {
-			if(audioCapture != null) {
-				audioCapture.stop();
-			}
 			audioWindowHandle = 0;
+			if(audioCapture != null) {
+				requestAudioSync(0, 0, null, null);
+			}
 			// P2-18：跟随窗口停止后回落到仍在共享的"最近一个"窗口继续捕获；
 			// 没有候选时明确提示（旧实现直接置 0，其余共享窗口从此无声且无日志线索）。
 			fallbackAudioFollow(windowHandle);
@@ -274,6 +282,8 @@ public class WindowShareManager {
 		ImageCapture.clearDiffCache(windowHandle);
 		ImageCapture.cleanupPbo(windowHandle);
 		ImageCapture.cleanupScaleFbo(windowHandle);
+		// ⑧ 编码在途帧持有的 raw slot / diff 基准缓冲随窗口释放
+		ImageCapture.cleanupRawSlots(windowHandle);
 		
 		LOGGER.info("Stopped sharing window 0x{}", Long.toHexString(windowHandle));
 		return true;
@@ -289,13 +299,54 @@ public class WindowShareManager {
 			currentSecondStart = now;
 		}
 		
-		for(ShareState state : shareStates.values()) {
+		// ⑧ 首帧风暴预算：start all 后 N 个新窗口不再同 tick 全部放行首帧
+		// （旧路径每窗首帧 2–3 次全帧同步回读 + 编码，N 倍同帧执行 = "瞬间卡一下"的
+		// 第二波；预算把错峰摊到后续 tick，稳态老窗口完全不受影响）
+		for(ShareState state : pickCaptureOrder(shareStates.values(), FIRST_FRAME_CAPTURES_PER_TICK)) {
 			updateSharedWindow(state);
 		}
 	}
 	
 	/**
-	 * 更新单个共享窗口（带全部优化）
+	 * ⑧ 纯函数（可单测）：本轮 update() 允许处理的窗口。稳态窗（frameCount&gt;0）直通；
+	 * 首帧窗（frameCount==0）消耗预算，超出者顺延后续 tick。null 元素安全跳过。
+	 */
+	static List<ShareState> pickCaptureOrder(Iterable<ShareState> states, int firstFrameBudget) {
+		List<ShareState> out = new ArrayList<>();
+		int budget = Math.max(0, firstFrameBudget);
+		for(ShareState s : states) {
+			if(s == null) continue;
+			if(s.frameCount == 0) {
+				if(budget <= 0) continue;
+				budget--;
+			}
+			out.add(s);
+		}
+		return out;
+	}
+	
+	/**
+	 * 更新单个共享窗口（⑧ v1.4.8 异步管线版）
+	 *
+	 * 旧实现全程压在渲染线程：回读（diff 时两次）→ JPEG/PNG 编码（1080p PNG
+	 * 可达 50–200ms）→ 降级重编码每轮再回读+再编 → 组包发送。这是
+	 * "分享窗口特别卡"的稳态病灶，start all 首帧风暴时还要 ×N。
+	 *
+	 * 新管线（三条线程职责清晰，帧序由"每窗在途 1 帧"保证）：
+	 *   渲染线程：帧率闸 → 编码在途闸 → GPU blit 缩放 + PBO 回读进窗口自有
+	 *             **双缓冲 raw slot**（一次回读；diff 检测与编码共用同一份数据，
+	 *             旧 diff 路径的第二次全量回读就此消除）→ meta 快照 → 提交编码任务
+	 *   编码线程：JPEG/PNG 编码 + 大小保护降级重编码（纯 CPU，不碰 GL/MC 状态）
+	 *             → 释放 slot → Minecraft.execute 回渲染线程收尾
+	 *   渲染线程：码率闸 / 自适应评估 / 组 payload / 发送 / 统计（与旧路径同样的
+	 *             单线程所有权，计数器无需加锁）
+	 *
+	 * captureTs 语义变化（⑧）：由"发送时刻"改为"**捕获时刻**"——真内容时间，
+	 * 编码排队延迟进 transit 下界观测（SharePlayoutController 共享时钟自然吸收），
+	 * 不再进入排期环节；音频轨 poll 回推的 captureTs 同为内容时刻，两轨同锚。
+	 *
+	 * 底线不变：scale 永不动（大小保护只降 quality）、心跳帧语义、大小保护降级
+	 * 强制 JPEG（v0.2.32 教训）、超限丢帧。
 	 */
 	private void updateSharedWindow(ShareState state) {
 		// X11 窗口走独立抓帧路径（XGetImage，无 framebuffer/toplevel）
@@ -313,6 +364,12 @@ public class WindowShareManager {
 			return;
 		}
 		
+		// ⑧ 每窗口至多一帧编码在途（编码跟不上时自然丢新帧，不堆队列不压渲染线程）
+		if(state.encodeBusy) {
+			state.encodeDroppedFrames++;
+			return;
+		}
+		
 		// 获取本地窗口
 		WLCToplevel toplevel = getLocalWindow(state.windowHandle);
 		if(toplevel == null || !toplevel.isMapped() || toplevel.framebuffer == null) {
@@ -322,38 +379,258 @@ public class WindowShareManager {
 		// scale 锁死为配置值（不再动态缩放 —— 远程跟本地渲染一致是底线）
 		float effectiveScale = effectiveConfig.scale;
 		
-		// === 像素差异检测 ===
-		if(effectiveConfig.diffUpdate) {
-			byte[] rawFrame = ImageCapture.captureFromFramebufferRaw(state.windowHandle, toplevel.framebuffer, effectiveScale);
-			if(rawFrame != null) {
-				if(!ImageCapture.hasSignificantChange(state.windowHandle, rawFrame, effectiveConfig.diffThreshold)) {
-					// 无显著变化，跳过本帧
-					state.skippedFrames++;
-					// 心跳帧：长时间无变化时也强制发一帧，避免接收端纹理一直不刷新
-					// （也兜底 diff 基准帧因某种原因失效导致的永久静默）
-					long nowMs = System.currentTimeMillis();
-					if(nowMs - state.lastFrameSentTime > HEARTBEAT_INTERVAL_MS) {
-						state.skippedFrames = 0;
-					} else {
-						return;
-					}
-				}
-			}
-			// rawFrame == null（捕获失败）：不跳过，继续走完整 JPEG 路径发送
-		}
-		
-		// === 捕获（使用优化的PBO+GPU缩放+直接编码路径，PBO/FBO 按窗口隔离） ===
-		// 带 JPEG 大小保护：编码完成后若超过上限，自动降级重编码（先降 quality 再降 scale，
-		// 最多 maxDegradeRounds 轮）；最后仍超限则丢弃该帧并告警（避免超过 CustomPacketPayload 包上限）。
-		byte[] imageData = captureFrameWithSizeProtection(state, toplevel, effectiveConfig, effectiveScale);
-		
-		if(imageData == null) {
+		// === ⑧ 一次捕获：GPU 缩放 blit + PBO 异步回读进窗口 slot（bottom-up RGBA） ===
+		// slot 归还编码任务释放；双槽交替保证读到的始终是最新完成帧。
+		ImageCapture.RawFrame raw = ImageCapture.captureRawFrame(state.windowHandle, toplevel.framebuffer, effectiveScale);
+		if(raw == null) {
 			return;
 		}
 		
+		// === 像素差异检测（⑧ 直接比对 slot 数据，不再第二次回读） ===
+		if(effectiveConfig.diffUpdate) {
+			if(!ImageCapture.hasSignificantChange(state.windowHandle, raw.buffer, effectiveConfig.diffThreshold)) {
+				// 无显著变化，跳过本帧
+				state.skippedFrames++;
+				// 心跳帧：长时间无变化时也强制发一帧，避免接收端纹理一直不刷新
+				// （也兜底 diff 基准帧因某种原因失效导致的永久静默）
+				long nowMs = System.currentTimeMillis();
+				if(nowMs - state.lastFrameSentTime <= HEARTBEAT_INTERVAL_MS) {
+					ImageCapture.releaseRawFrame(raw);
+					return;
+				}
+				state.skippedFrames = 0;
+			}
+		}
+		
+		// === ⑧ meta 快照：MC/display/settings 状态只允许渲染线程读 ===
+		EncodeJob job = new EncodeJob();
+		job.state = state;
+		job.raw = raw;
+		job.config = effectiveConfig;
+		job.captureTs = System.currentTimeMillis();
+		job.frameSeq = (int) state.frameCount;
+		// 使用 framebuffer 原始尺寸（非缩放），接收端根据这个尺寸计算世界大小。
+		// 注意：必须是 framebuffer 尺寸（含 xoff/yoff 偏移的完整缓冲），
+		// 而不是 geometry 尺寸 —— 否则接收端四边形尺寸与纹理内容对不上，窗口会偏移/缩小。
+		job.originalW = toplevel.framebuffer.getWidth();
+		job.originalH = toplevel.framebuffer.getHeight();
+		// xoff/yoff 随帧传递，接收端用于 bufOffset 对齐（与本地 WindowDisplay.render 一致）
+		job.xOff = toplevel.framebuffer.getXOff();
+		job.yOff = toplevel.framebuffer.getYOff();
+		job.geometryWidth = toplevel.geometry.width();
+		job.geometryHeight = toplevel.geometry.height();
+		// 从本地WindowDisplay获取窗口变换
+		if(clientMod != null) {
+			for(var display : clientMod.displays) {
+				if(display.window.getHandle() == state.windowHandle) {
+					Vec3 pivot = display.pivot;
+					Vec3 normal = display.normal();
+					Vec3 d = display.down();
+					job.pivotX = pivot.x; job.pivotY = pivot.y; job.pivotZ = pivot.z;
+					job.normalX = normal.x; job.normalY = normal.y; job.normalZ = normal.z;
+					job.downX = d.x; job.downY = d.y; job.downZ = d.z;
+					// 视觉缩放倍数必须同步，否则接收端尺寸与本地不一致
+					job.viewScale = display.viewScale;
+					break;
+				}
+			}
+		}
+		// 发送端自己的 pixelsPerBlock：接收端用它渲染，保证世界尺寸与本地一致
+		// （接收端可能使用不同的 PPB 设置或 native 不可用导致 settings==null）
+		if(WaylandCraft.instance != null && WaylandCraft.instance.settings != null) {
+			job.senderPixelsPerBlock = WaylandCraft.instance.settings.getPixelsPerBlock();
+		} else {
+			job.senderPixelsPerBlock = 500;
+		}
+		
+		state.encodeBusy = true;
+		try {
+			ensureEncodeExecutor().submit(() -> runEncode(job));
+		} catch(RejectedExecutionException e) {
+			state.encodeBusy = false;
+			ImageCapture.releaseRawFrame(raw);
+			job.raw = null;
+		}
+	}
+	
+	/** 惰性创建编码线程池（daemon；断线不销毁——任务自校验 shareStates） */
+	private java.util.concurrent.ExecutorService ensureEncodeExecutor() {
+		synchronized(encodeExecLock) {
+			if(encodeExecutor == null || encodeExecutor.isShutdown() || encodeExecutor.isTerminated()) {
+				java.util.concurrent.atomic.AtomicInteger idx = new java.util.concurrent.atomic.AtomicInteger();
+				encodeExecutor = java.util.concurrent.Executors.newFixedThreadPool(ENCODE_THREADS, r -> {
+					Thread t = new Thread(r, "waylandcraft-share-encode-" + idx.getAndIncrement());
+					t.setDaemon(true);
+					return t;
+				});
+			}
+			return encodeExecutor;
+		}
+	}
+	
+	/**
+	 * ⑧ 编码任务：渲染线程填好输入快照，编码线程只读这些字段；
+	 * 结果经 Minecraft.execute 回渲染线程组包发送（netty 入队也留在主线程，
+	 * 与旧路径同线程语义，规避 ClientPlayNetworking 线程约束的不确定性）。
+	 */
+	private static final class EncodeJob {
+		ShareState state;
+		ImageCapture.RawFrame raw;          // wayland 路径：窗口 slot（编码完释放）
+		ImageCapture.CaptureConfig config;
+		long captureTs;
+		int frameSeq;
+		int originalW, originalH, xOff, yOff, geometryWidth, geometryHeight;
+		double pivotX = 0, pivotY = 0, pivotZ = 0;
+		double normalX = 0, normalY = 0, normalZ = 1;
+		double downX = 0, downY = -1, downZ = 0;
+		double viewScale = 1.0;
+		int senderPixelsPerBlock = 500;
+		// X11 专用
+		boolean x11;
+		String x11Display;
+		long x11Xid;
+		java.nio.ByteBuffer x11Buffer;      // 编码线程本地（XGetImage 结果，无 slot 池）
+		int x11SrcW, x11SrcH, x11TargetW, x11TargetH;
+		// 编码结果
+		byte[] result;
+		int degradeRounds;
+		boolean sizeDropped;
+	}
+	
+	/**
+	 * ⑧ 编码线程：JPEG/PNG 编码 + 大小保护（只降 quality，scale 冻结——单槽捕获天然保持）。
+	 * 与旧 captureFrameWithSizeProtection 语义逐条对齐：降级轮强制 JPEG
+	 * （v0.2.32 教训：PNG 无损路径 quality 无效，降级必须能生效）、超限丢帧、每轮 WARN。
+	 */
+	private void runEncode(EncodeJob job) {
+		long frameStart = System.nanoTime();
+		try {
+			ImageCapture.CaptureConfig config = job.config;
+			float quality = config.quality;
+			byte[] imageData;
+			int w, h;
+			if(job.x11) {
+				// X11 抓帧（XGetImage/X 往返同样挪出渲染线程；无 GL 依赖，连接独立）
+				dev.evvie.waylandcraft.utils.X11Capture.Frame frame =
+					dev.evvie.waylandcraft.utils.X11Capture.captureRgba(job.x11Display, job.x11Xid);
+				if(frame == null) {
+					completeEncode(job, null, 0, false); // 窗口最小化/销毁/抓取失败：跳过本帧
+					return;
+				}
+				int srcW = frame.width();
+				int srcH = frame.height();
+				if(srcW <= 0 || srcH <= 0) {
+					completeEncode(job, null, 0, false);
+					return;
+				}
+				float scale = config.scale;
+				int targetW = Math.max(1, Math.round(srcW * scale));
+				int targetH = Math.max(1, Math.round(srcH * scale));
+				java.nio.ByteBuffer rgba = frame.rgba();
+				if(targetW != srcW || targetH != srcH) {
+					rgba = scaleRgbaNearest(rgba, srcW, srcH, targetW, targetH);
+				}
+				// 刷新几何信息（窗口移动/缩放后交互坐标要跟着更新；字段 volatile，主线程只读展示）
+				job.state.x11Width = srcW;
+				job.state.x11Height = srcH;
+				job.state.x11RootX = frame.rootX();
+				job.state.x11RootY = frame.rootY();
+				job.x11SrcW = srcW; job.x11SrcH = srcH;
+				job.x11TargetW = targetW; job.x11TargetH = targetH;
+				job.x11Buffer = rgba;
+				imageData = ImageCapture.compressToJpegDirect(rgba, targetW, targetH, quality, false, false);
+				w = targetW; h = targetH;
+			}
+			else {
+				imageData = ImageCapture.compressToJpegDirect(job.raw.buffer, job.raw.width, job.raw.height, quality, true, false);
+				w = job.raw.width; h = job.raw.height;
+			}
+			
+			int degradeRounds = 0;
+			boolean sizeDropped = false;
+			if(imageData == null) {
+				sizeDropped = true; // 编码失败：与旧路径"返回 null 丢帧"同义
+			}
+			else if(config.maxJpegBytes > 0) {
+				while(imageData.length > config.maxJpegBytes && degradeRounds < config.maxDegradeRounds) {
+					long beforeSize = imageData.length;
+					float nextQuality = nextLadderValue(config.jpegQualityLadder, quality);
+					if(nextQuality < 0) {
+						break; // quality 已到阶梯底，无可降 → 直接走最终超限判定（丢帧）
+					}
+					quality = nextQuality;
+					byte[] reencoded = job.x11
+						? ImageCapture.compressToJpegDirect(job.x11Buffer, w, h, quality, false, true)
+						: ImageCapture.compressToJpegDirect(job.raw.buffer, w, h, quality, true, true);
+					if(reencoded == null) {
+						imageData = null;
+						break;
+					}
+					degradeRounds++;
+					LOGGER.warn("Window 0x{} JPEG over size limit ({} bytes): {} -> {} bytes, degrade round {}: quality={} scale frozen (async encode)",
+						Long.toHexString(job.state.windowHandle), config.maxJpegBytes,
+						beforeSize, reencoded.length, degradeRounds, String.format("%.2f", quality));
+					imageData = reencoded;
+				}
+				if(imageData != null && imageData.length > config.maxJpegBytes) {
+					sizeDropped = true; // quality 到底仍超限 → 丢帧（丢帧允许，尺寸绝不降）
+				}
+			}
+			
+			long frameNanos = System.nanoTime() - frameStart;
+			if(WcLogging.verbose() && frameNanos > ENCODE_WARN_THRESHOLD_NANOS) {
+				LOGGER.debug("Window 0x{} async encode took {} ms ({} bytes, {} degrade round(s))",
+					Long.toHexString(job.state.windowHandle), String.format("%.1f", frameNanos / 1_000_000.0),
+					imageData == null ? 0 : imageData.length, degradeRounds);
+			}
+			completeEncode(job, imageData, degradeRounds, sizeDropped);
+		} finally {
+			if(job.raw != null) {
+				ImageCapture.releaseRawFrame(job.raw);
+			}
+		}
+	}
+	
+	/** ⑧ 编码完回渲染线程收尾（execute 失败=MC 正在关闭，直接清在途标志） */
+	private void completeEncode(EncodeJob job, byte[] data, int degradeRounds, boolean sizeDropped) {
+		job.result = data;
+		job.degradeRounds = degradeRounds;
+		job.sizeDropped = sizeDropped;
+		try {
+			Minecraft.getInstance().execute(() -> finishEncodedFrame(job));
+		} catch(Throwable t) {
+			job.state.encodeBusy = false;
+		}
+	}
+	
+	/**
+	 * ⑧ 渲染线程收尾：码率闸/自适应评估/diff 封装/payload 组包/发送/统计——
+	 * 全部与旧路径同线程同所有权（计数器不加锁的既有约定保持不变）。
+	 */
+	private void finishEncodedFrame(EncodeJob job) {
+		ShareState state = job.state;
+		state.encodeBusy = false;
+		// 停共享/切世界竞态：窗口已不在共享表则结果作废（slot 已在编码线程释放）
+		if(clientMod == null || !sharingEnabled || !shareStates.containsKey(state.windowHandle)) {
+			return;
+		}
+		byte[] imageData = job.result;
+		if(imageData == null || job.sizeDropped) {
+			if(job.sizeDropped) {
+				state.sizeDroppedFrames++;
+				LOGGER.error("Window 0x{} JPEG still over size limit after {} degrade round(s), DROPPING frame (quality floor reached, scale preserved)",
+					Long.toHexString(state.windowHandle), job.degradeRounds);
+			}
+			return;
+		}
+		if(job.degradeRounds > 0) {
+			state.degradedFrames++;
+		}
+		ImageCapture.CaptureConfig config = job.config;
+		
 		// === 码率限速 ===
-		if(effectiveConfig.maxBitrate > 0) {
-			long maxBytesPerSecond = (long)effectiveConfig.maxBitrate * 1000 / 8; // kbps → bytes/sec
+		if(config.maxBitrate > 0) {
+			long maxBytesPerSecond = (long)config.maxBitrate * 1000 / 8; // kbps → bytes/sec
 			if(bytesSentThisSecond + imageData.length > maxBytesPerSecond) {
 				// 超过码率限制，跳过本帧
 				state.rateLimitedFrames++;
@@ -368,75 +645,48 @@ public class WindowShareManager {
 		// === 自适应质量评估 ===
 		adaptiveEvalCounter++;
 		adaptiveFrameBytes += imageData.length;
-		
 		if(adaptiveEvalCounter >= ADAPTIVE_EVAL_INTERVAL) {
-			evaluateAdaptiveQuality(effectiveConfig);
+			evaluateAdaptiveQuality(config);
 			adaptiveEvalCounter = 0;
 			adaptiveFrameBytes = 0;
 		}
 		
-		// 处理差分更新（当前已禁用，JPEG压缩数据diff无意义）
-		byte[] processedData = diffUpdateManager.processFrame(state.windowHandle, imageData);
+		// 处理差分更新（当前已禁用，JPEG压缩数据diff无意义）。
+		// ⑧ X11 路径保持旧行为不经 diff 封装（旧 updateSharedWindowX11 直接发 imageData）
+		byte[] processedData = job.x11 ? imageData : diffUpdateManager.processFrame(state.windowHandle, imageData);
 		if(processedData == null) return;
 		
-		// 使用 framebuffer 原始尺寸（非缩放），接收端根据这个尺寸计算世界大小。
-		// 注意：必须是 framebuffer 尺寸（含 xoff/yoff 偏移的完整缓冲），
-		// 而不是 geometry 尺寸 —— 否则接收端四边形尺寸与纹理内容对不上，窗口会偏移/缩小。
-		int originalW = toplevel.framebuffer.getWidth();
-		int originalH = toplevel.framebuffer.getHeight();
-		// xoff/yoff 随帧传递，接收端用于 bufOffset 对齐（与本地 WindowDisplay.render 一致）
-		int framebufferXOff = toplevel.framebuffer.getXOff();
-		int framebufferYOff = toplevel.framebuffer.getYOff();
-		
-		// 从本地WindowDisplay获取窗口变换
-		double pivotX = 0, pivotY = 0, pivotZ = 0;
-		double normalX = 0, normalY = 0, normalZ = 1;
-		double downX = 0, downY = -1, downZ = 0;
-		double viewScale = 1.0;
-		int geometryWidth = toplevel.geometry.width();
-		int geometryHeight = toplevel.geometry.height();
-		if(clientMod != null) {
-			for(var display : clientMod.displays) {
-				if(display.window.getHandle() == state.windowHandle) {
-					Vec3 pivot = display.pivot;
-					Vec3 normal = display.normal();
-					Vec3 d = display.down();
-					pivotX = pivot.x; pivotY = pivot.y; pivotZ = pivot.z;
-					normalX = normal.x; normalY = normal.y; normalZ = normal.z;
-					downX = d.x; downY = d.y; downZ = d.z;
-					// 视觉缩放倍数必须同步，否则接收端尺寸与本地不一致
-					viewScale = display.viewScale;
-					break;
-				}
-			}
-		}
-		
-		// 发送端自己的 pixelsPerBlock：接收端用它渲染，保证世界尺寸与本地一致
-		// （接收端可能使用不同的 PPB 设置或 native 不可用导致 settings==null）
-		int senderPixelsPerBlock = 500;
-		if(WaylandCraft.instance != null && WaylandCraft.instance.settings != null) {
-			senderPixelsPerBlock = WaylandCraft.instance.settings.getPixelsPerBlock();
-		}
-		
-		// ⑦ captureTs 取发送时刻（与捕获仅隔一次编码，<数十ms，作为 playout 时钟足够）；
-		// frameSeq 用发送前的 frameCount，单调递增，供接收端观测丢帧/乱序。
-		SharedWindowImagePayload imagePayload = new SharedWindowImagePayload(
-			state.windowHandle, 0, framebufferXOff, framebufferYOff,
-			originalW, originalH,
-			processedData,
-			pivotX, pivotY, pivotZ,
-			normalX, normalY, normalZ,
-			downX, downY, downZ,
-			viewScale, geometryWidth, geometryHeight,
-			senderPixelsPerBlock,
-			System.currentTimeMillis(), (int) state.frameCount
-		);
+		long now = System.currentTimeMillis();
+		SharedWindowImagePayload imagePayload = job.x11
+			// X11 无本地 display：默认变换（原点、正对、竖直）。
+			// 接收端用原始窗口尺寸（srcW/srcH）算世界四边形大小，图像是缩放后的
+			// （targetW/targetH），纹理拉伸到原始尺寸。
+			? new SharedWindowImagePayload(
+				state.windowHandle, 0, 0, 0,
+				job.x11TargetW, job.x11TargetH,
+				processedData,
+				0, 0, 0,
+				0, 0, 1,
+				0, -1, 0,
+				1.0, job.x11SrcW, job.x11SrcH,
+				job.senderPixelsPerBlock,
+				job.captureTs, job.frameSeq)
+			: new SharedWindowImagePayload(
+				state.windowHandle, 0, job.xOff, job.yOff,
+				job.originalW, job.originalH,
+				processedData,
+				job.pivotX, job.pivotY, job.pivotZ,
+				job.normalX, job.normalY, job.normalZ,
+				job.downX, job.downY, job.downZ,
+				job.viewScale, job.geometryWidth, job.geometryHeight,
+				job.senderPixelsPerBlock,
+				job.captureTs, job.frameSeq);
 		ClientPlayNetworking.send(imagePayload);
 		
 		// 更新统计
 		bytesSentThisSecond += processedData.length;
-		state.lastUpdateTime = System.currentTimeMillis();
-		state.lastFrameSentTime = state.lastUpdateTime;
+		state.lastUpdateTime = now;
+		state.lastFrameSentTime = now;
 		state.frameCount++;
 		state.totalBytes += processedData.length;
 		state.currentFps = frameRateController.getCurrentFps(state.windowHandle);
@@ -444,12 +694,17 @@ public class WindowShareManager {
 	}
 	
 	/**
-	 * 更新单个 X11 共享窗口：XGetImage 抓帧 → 缩放 → JPEG → 发送。
+	 * 更新单个 X11 共享窗口（⑧ v1.4.8：整段挪进编码线程）。
 	 *
 	 * 与 wayland 路径的区别：
-	 * - 没有 toplevel/framebuffer，直接问 X server 要像素；
+	 * - 没有 toplevel/framebuffer，直接问 X server 要像素（XGetImage 往返）；
 	 * - 没有本地 WindowDisplay，用默认变换（原点正对）；
 	 * - 不做 diff 检测（X11 抓帧已经是整帧开销，diff 收益低，先全帧发送）。
+	 *
+	 * ⑧ X11 抓帧是 X 连接往返 + 逐像素缩放 + 编码，全部无 GL 依赖、连接独立，
+	 * 旧实现把它们压在渲染线程 = X11 窗口共享的稳态卡顿。现在 updateSharedWindowX11
+	 * 只做闸门与意图快照，真实工作由 runEncode(job.x11) 分支完成；几何字段经
+	 * volatile 写回供交互注入读"最近一帧"（抓帧失败仍按旧语义跳过本帧）。
 	 */
 	private void updateSharedWindowX11(ShareState state) {
 		ImageCapture.CaptureConfig effectiveConfig = state.getEffectiveConfig(captureConfig);
@@ -460,90 +715,26 @@ public class WindowShareManager {
 		if(!frameRateController.shouldUpdate(state.windowHandle, effectiveFps)) {
 			return;
 		}
-
-		// 抓帧（同时拿到窗口尺寸与根坐标，供交互注入定位）
-		dev.evvie.waylandcraft.utils.X11Capture.Frame frame =
-			dev.evvie.waylandcraft.utils.X11Capture.captureRgba(state.x11Display, state.x11Xid);
-		if(frame == null) {
-			return; // 窗口最小化/销毁/抓取失败：跳过本帧
-		}
-
-		// 刷新几何信息（窗口移动/缩放后交互坐标要跟着更新）
-		state.x11Width = frame.width();
-		state.x11Height = frame.height();
-		state.x11RootX = frame.rootX();
-		state.x11RootY = frame.rootY();
-
-		int srcW = frame.width();
-		int srcH = frame.height();
-		if(srcW <= 0 || srcH <= 0) {
+		if(state.encodeBusy) {
+			state.encodeDroppedFrames++;
 			return;
 		}
 
-		// scale 锁死为配置值（不再动态缩放 —— 远程跟本地渲染一致是底线）
-		float effectiveScale = effectiveConfig.scale;
-
-		int targetW = Math.max(1, Math.round(srcW * effectiveScale));
-		int targetH = Math.max(1, Math.round(srcH * effectiveScale));
-
-		// 缩放（scale<1 时；最近邻足够，X11 内容缩放本来就糊）
-		java.nio.ByteBuffer rgba = frame.rgba();
-		if(targetW != srcW || targetH != srcH) {
-			rgba = scaleRgbaNearest(rgba, srcW, srcH, targetW, targetH);
+		EncodeJob job = new EncodeJob();
+		job.state = state;
+		job.x11 = true;
+		job.config = effectiveConfig;
+		job.x11Display = state.x11Display;
+		job.x11Xid = state.x11Xid;
+		job.captureTs = System.currentTimeMillis();
+		job.frameSeq = (int) state.frameCount;
+		job.senderPixelsPerBlock = senderPixelsPerBlock();
+		state.encodeBusy = true;
+		try {
+			ensureEncodeExecutor().submit(() -> runEncode(job));
+		} catch(RejectedExecutionException e) {
+			state.encodeBusy = false;
 		}
-
-		// JPEG 编码 + 大小保护（只降 quality，scale 冻结 —— 与 wayland 路径一致）
-		byte[] imageData = encodeJpegWithSizeProtection(state, rgba, targetW, targetH, effectiveConfig);
-		if(imageData == null) {
-			return;
-		}
-
-		// === 码率限速 ===
-		if(effectiveConfig.maxBitrate > 0) {
-			long maxBytesPerSecond = (long)effectiveConfig.maxBitrate * 1000 / 8;
-			if(bytesSentThisSecond + imageData.length > maxBytesPerSecond) {
-				state.rateLimitedFrames++;
-				lastFrameOverLimit = true;
-				adaptiveOverLimitCount++;
-				adaptiveUnderUtilCount = 0;
-				return;
-			}
-			lastFrameOverLimit = false;
-		}
-
-		// === 自适应质量评估 ===
-		adaptiveEvalCounter++;
-		adaptiveFrameBytes += imageData.length;
-		if(adaptiveEvalCounter >= ADAPTIVE_EVAL_INTERVAL) {
-			evaluateAdaptiveQuality(effectiveConfig);
-			adaptiveEvalCounter = 0;
-			adaptiveFrameBytes = 0;
-		}
-
-		// X11 无本地 display：默认变换（原点、正对、竖直）
-		// 接收端用原始窗口尺寸（srcW/srcH）算世界四边形大小，
-		// 图像是缩放后的（targetW/targetH），纹理拉伸到原始尺寸。
-		SharedWindowImagePayload imagePayload = new SharedWindowImagePayload(
-			state.windowHandle, 0, 0, 0,
-			targetW, targetH,
-			imageData,
-			0, 0, 0,
-			0, 0, 1,
-			0, -1, 0,
-			1.0, srcW, srcH,
-			senderPixelsPerBlock(),
-			System.currentTimeMillis(), (int) state.frameCount
-		);
-		ClientPlayNetworking.send(imagePayload);
-
-		// 更新统计
-		bytesSentThisSecond += imageData.length;
-		state.lastUpdateTime = System.currentTimeMillis();
-		state.lastFrameSentTime = state.lastUpdateTime;
-		state.frameCount++;
-		state.totalBytes += imageData.length;
-		state.currentFps = frameRateController.getCurrentFps(state.windowHandle);
-		state.currentBitrate = bytesSentThisSecond * 8 / 1000;
 	}
 
 	/** 发送端自己的 pixelsPerBlock（与 wayland 路径一致） */
@@ -572,149 +763,13 @@ public class WindowShareManager {
 		return dst;
 	}
 
-	/** X11 帧 JPEG 编码 + 大小保护（只降 quality，scale 冻结） */
-	@Nullable
-	private byte[] encodeJpegWithSizeProtection(ShareState state, java.nio.ByteBuffer rgba,
-			int width, int height, ImageCapture.CaptureConfig config) {
-		float quality = config.quality;
-		byte[] imageData = ImageCapture.compressToJpegDirect(rgba, width, height, quality, false);
-		if(imageData == null) {
-			return null;
-		}
+	// ⑧ v1.4.8：旧 encodeJpegWithSizeProtection（渲染线程同步编码 + 每轮 rewind 重编码）
+	// 由 runEncode 的 x11 分支取代——大小保护/降级阶梯/WARN 语义逐条保留，编码挪出渲染线程。
 
-		int degradeRounds = 0;
-		if(config.maxJpegBytes > 0) {
-			while(imageData.length > config.maxJpegBytes && degradeRounds < config.maxDegradeRounds) {
-				float nextQuality = nextLadderValue(config.jpegQualityLadder, quality);
-				if(nextQuality < 0) {
-					break;
-				}
-				quality = nextQuality;
-				rgba.rewind();
-				byte[] reencoded = ImageCapture.compressToJpegDirect(rgba, width, height, quality, false);
-				if(reencoded == null) {
-					return null;
-				}
-				degradeRounds++;
-				LOGGER.warn("X11 window 0x{} JPEG over size limit ({} bytes): {} -> {} bytes, degrade round {}: quality={}",
-					Long.toHexString(state.windowHandle), config.maxJpegBytes,
-					imageData.length, reencoded.length, degradeRounds, String.format("%.2f", quality));
-				imageData = reencoded;
-			}
-
-			if(imageData.length > config.maxJpegBytes) {
-				state.sizeDroppedFrames++;
-				LOGGER.error("X11 window 0x{} JPEG still over size limit after {} degrade round(s): {} bytes > {} bytes, DROPPING frame",
-					Long.toHexString(state.windowHandle), degradeRounds,
-					imageData.length, config.maxJpegBytes);
-				return null;
-			}
-
-			if(degradeRounds > 0) {
-				state.degradedFrames++;
-			}
-		}
-		return imageData;
-	}
-
-	/**
-	 * 捕获并编码一帧 JPEG，带发送端大小保护（自动降级）。
-	 *
-	 * 底线约束：**只允许降低内容画质（JPEG 压缩质量）与丢帧，绝不允许降低 UI 大小**。
-	 * scale（像素尺寸）永远保持 effectiveScale 不变 —— 缩放会改变 UI 尺寸/布局，违反底线。
-	 *
-	 * 流程：
-	 * 1. 按 (effectiveScale, config.quality) 正常捕获+编码；
-	 * 2. 编码结果 &gt; config.maxJpegBytes 时自动降级重编码：
-	 *    - 只降 quality（沿 jpegQualityLadder 取严格更小的下一档，如 1.0 → 0.85 → 0.7），
-	 *      scale 恒等于 effectiveScale，绝不变化；
-	 *    - 每轮降级 LOGGER.warn 记录窗口 handle、原/降后大小、当前 quality；
-	 *    - 最多 config.maxDegradeRounds 轮（默认 2），有界，不会死循环；
-	 * 3. quality 已到阶梯底仍超限 → 丢弃该帧并 LOGGER.error 告警（丢帧允许，避免超过协议包上限）。
-	 *
-	 * 编码耗时统计：整帧 capture+encode（含可能的降级重编码）&gt; 20ms 时 LOGGER.debug 输出。
-	 *
-	 * 说明：降级重编码走与正常路径相同的 captureFromFramebuffer（quality 变化同样重编码），
-	 * PBO/FBO 按窗口隔离，多窗口无串扰；同尺寸重捕获时 PBO 映射到的是本窗口上一帧数据
-	 * （内容一致，无花屏）。diff/raw 捕获路径（captureFromFramebufferRaw）不受影响。
-	 *
-	 * @return 不超过大小上限的 JPEG 数据；捕获失败或超限丢弃时返回 null
-	 */
-	@Nullable
-	private byte[] captureFrameWithSizeProtection(ShareState state, WLCToplevel toplevel,
-			ImageCapture.CaptureConfig config, float effectiveScale) {
-		long frameStart = System.nanoTime();
-		
-		// scale 是底线：任何降级都不允许改变它（UI 大小必须与共享端一致）
-		float scale = effectiveScale;
-		float quality = config.quality;
-		byte[] imageData = ImageCapture.captureFromFramebuffer(
-			state.windowHandle,
-			toplevel.framebuffer,
-			scale,
-			quality
-		);
-		if(imageData == null) {
-			return null;
-		}
-		
-		// === JPEG 大小保护：超限只降 quality 重编码（maxJpegBytes <= 0 表示不限制，直发） ===
-		int degradeRounds = 0;
-		if(config.maxJpegBytes > 0) {
-			while(imageData.length > config.maxJpegBytes && degradeRounds < config.maxDegradeRounds) {
-				long beforeSize = imageData.length;
-				float nextQuality = nextLadderValue(config.jpegQualityLadder, quality);
-				if(nextQuality < 0) {
-					break; // quality 已到阶梯底，无可降 → 直接走最终超限判定（丢帧）
-				}
-				quality = nextQuality;
-				
-				// v0.2.32：降级重编码强制 JPEG（透明像素混合黑背景）。
-				// 原实现走 captureFromFramebuffer：窗口含透明像素时走 PNG 无损路径，
-				// quality 参数无效 → 降级前后字节数相同（如 1139174 -> 1139174）→
-				// 降到阶梯底仍超限 → 全部帧被 DROP。强制 JPEG 后 quality 才真正生效。
-				byte[] reencoded = ImageCapture.captureFromFramebufferJpeg(
-					state.windowHandle,
-					toplevel.framebuffer,
-					scale,      // 保持不变：UI 大小是底线
-					quality
-				);
-				if(reencoded == null) {
-					return null;
-				}
-				
-				degradeRounds++;
-				LOGGER.warn("Window 0x{} JPEG over size limit ({} bytes): {} -> {} bytes, degrade round {}: quality={} scale={} (scale frozen)",
-					Long.toHexString(state.windowHandle), config.maxJpegBytes,
-					beforeSize, reencoded.length, degradeRounds,
-					String.format("%.2f", quality), String.format("%.2f", scale));
-				imageData = reencoded;
-			}
-			
-			// === 最终判定：quality 已降到底仍超限 → 丢弃本帧并告警（丢帧允许） ===
-			if(imageData.length > config.maxJpegBytes) {
-				state.sizeDroppedFrames++;
-				LOGGER.error("Window 0x{} JPEG still over size limit after {} degrade round(s): {} bytes > {} bytes, DROPPING frame (quality floor reached, scale preserved)",
-					Long.toHexString(state.windowHandle), degradeRounds,
-					imageData.length, config.maxJpegBytes);
-				return null;
-			}
-			
-			if(degradeRounds > 0) {
-				state.degradedFrames++;
-			}
-		}
-		
-		// === 编码耗时统计（整帧 capture+encode） ===
-		long frameNanos = System.nanoTime() - frameStart;
-		if(frameNanos > ENCODE_WARN_THRESHOLD_NANOS) {
-			LOGGER.debug("Window 0x{} frame capture+encode took {} ms ({} bytes, {} degrade round(s))",
-				Long.toHexString(state.windowHandle), String.format("%.1f", frameNanos / 1_000_000.0),
-				imageData.length, degradeRounds);
-		}
-		
-		return imageData;
-	}
+	// ⑧ v1.4.8：旧 captureFrameWithSizeProtection（渲染线程"回读→编码→每轮降级再回读再编码"）
+	// 由管线取代：渲染线程只 captureRawFrame 一次进 slot（PBO 异步回读），runEncode 在编码
+	// 线程对同一份 slot 数据做编码与降级重编码（forceJpeg 语义保留，scale 天然冻结——
+	// 重编码不再需要重回读，比旧路径每轮少 1 次全帧回读）。
 	
 	/**
 	 * 在降级阶梯中取严格小于 current 的最大档位；阶梯为 null 或无更小档位时返回 -1。
@@ -783,6 +838,8 @@ public class WindowShareManager {
 			return;
 		}
 		if(audioCapture == null) return;
+		// ⑧ 只更新意图+提交 reconcile；真正的 start（PipeWire boot/join）在 executor 里跑。
+		// 意图被更新的任务覆盖时旧任务自动 no-op，stop all 的 N 次停/起不再串行阻塞。
 		audioWindowHandle = next.windowHandle;
 		audioCapture.setActiveWindow(next.windowHandle);
 		String appId;
@@ -792,10 +849,97 @@ public class WindowShareManager {
 			WLCToplevel t = getLocalWindow(next.windowHandle);
 			appId = t != null ? t.appID : null;
 		}
-		boolean ok = audioCapture.start(next.windowHandle, next.windowTitle, appId);
-		if(!ok) audioWindowHandle = 0;
-		LOGGER.info("Audio follow fell back to shared window 0x{} (start ok={})",
-			Long.toHexString(next.windowHandle), ok);
+		requestAudioSync(next.windowHandle, 0, next.windowTitle, appId);
+		LOGGER.info("Audio follow falls back to shared window 0x{} (async start scheduled)",
+			Long.toHexString(next.windowHandle));
+	}
+	
+	// ===== ⑧ v1.4.8 音频意图合并 reconcile（executor 单线程串行） =====
+	
+	/** 惰性创建/重建音频同步 executor（断线 shutdownNow 后再次共享可恢复） */
+	private java.util.concurrent.ExecutorService ensureAudioSyncExecutor() {
+		synchronized(audioExecLock) {
+			if(audioSyncExecutor == null || audioSyncExecutor.isShutdown() || audioSyncExecutor.isTerminated()) {
+				audioSyncExecutor = java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+					Thread t = new Thread(r, "waylandcraft-share-audio");
+					t.setDaemon(true);
+					return t;
+				});
+			}
+			return audioSyncExecutor;
+		}
+	}
+	
+	/**
+	 * 提交一次音频意图 reconcile。target=0 表示"应无捕获"；
+	 * prev 为该意图生效前的跟随目标（start 失败回滚语义，P2-18）。
+	 */
+	private void requestAudioSync(long target, long prev, @Nullable String title, @Nullable String appId) {
+		if(audioCapture == null) return;
+		try {
+			ensureAudioSyncExecutor().submit(() -> syncAudioState(target, prev, title, appId));
+		} catch(java.util.concurrent.RejectedExecutionException e) {
+			// 关停风暴（断线竞态）：意图已入 volatile，下一次 start/stop 会再提交 reconcile
+			LOGGER.debug("Audio sync executor rejected (target 0x{}), deferred to next sync",
+				Long.toHexString(target));
+		}
+	}
+	
+	/**
+	 * executor 线程：把实际捕获会话对齐到**最新**意图。
+	 * 去抖关键：audioWindowHandle != target 的任务直接 no-op——start all 连发 N 个
+	 * 意图时只有最后一个真正执行 PipeWire 会话建立（旧实现 N 次全套同步 stop+boot，
+	 * 每次最坏 25s 预算）；重复提交天然幂等（已应用且仍在运行则跳过）。
+	 */
+	/** ⑧ reconcile 单任务动作（decideAudioSync 返回值） */
+	enum AudioSyncAction { SKIP, STOP, START, ALREADY }
+	
+	/**
+	 * ⑧ 纯函数（可单测）：executor 任务在执行时刻的裁决——
+	 * 意图已被更新的任务接管 → SKIP（去抖核心）；
+	 * 目标 0 且正在捕获 → STOP；目标 0 且无捕获 → ALREADY；
+	 * 目标==已应用且仍在捕获 → ALREADY（幂等，start all 只 boot 一次）；
+	 * 其余 → START。
+	 */
+	static AudioSyncAction decideAudioSync(long intentAtRun, long taskTarget, long applied, boolean capturing) {
+		if(intentAtRun != taskTarget) return AudioSyncAction.SKIP;
+		if(taskTarget == 0) return capturing ? AudioSyncAction.STOP : AudioSyncAction.ALREADY;
+		if(taskTarget == applied && capturing) return AudioSyncAction.ALREADY;
+		return AudioSyncAction.START;
+	}
+	
+	private void syncAudioState(long target, long prev, @Nullable String title, @Nullable String appId) {
+		AudioCaptureManager capture = audioCapture;
+		if(capture == null) return;
+		// 以执行时刻的意图为准（coalesce）——见 decideAudioSync 裁决表
+		switch(decideAudioSync(audioWindowHandle, target, audioAppliedHandle, capture.isStarted())) {
+			case SKIP:
+			case ALREADY:
+				return;
+			case STOP: {
+				capture.stop();
+				audioAppliedHandle = 0;
+				return;
+			}
+			case START: {
+				boolean ok = capture.start(target, title, appId);
+				if(ok) {
+					audioAppliedHandle = target;
+					LOGGER.info("Audio sharing enabled for 0x{}", Long.toHexString(target));
+				}
+				else {
+					// P2-18 语义（start 失败回滚跟随目标）平移进 executor。
+					// 旧实现回滚后并不重启捕获，语义保持：回滚仅修正归属，不做第二次 boot。
+					if(audioWindowHandle == target) {
+						audioWindowHandle = prev;
+					}
+					audioAppliedHandle = 0;
+					LOGGER.info("Audio capture start failed for 0x{} (audio stays on 0x{})",
+						Long.toHexString(target), Long.toHexString(prev));
+				}
+				return;
+			}
+		}
 	}
 
 	@Nullable
@@ -814,11 +958,14 @@ public class WindowShareManager {
 		bytesSentThisSecond = 0;
 		ImageCapture.clearAllDiffCaches();
 		ImageCapture.cleanupAllWindowResources();
-		if(audioCapture != null) {
-			audioCapture.stop();
-			audioCapture = null;
-		}
+		ImageCapture.cleanupAllRawSlots();
 		audioWindowHandle = 0;
+		if(audioCapture != null) {
+			// ⑧ 断线时的 PipeWire 停会话同样走 executor（旧实现在客户端网络线程同步 join，
+			// 卡顿断线界面）。audioCapture 不再置 null：置 null 会让 executor 里的
+			// stop 任务读到 null 而跳过，PipeWire 会话泄漏——幂等 stop 由 isStarted 把关。
+			requestAudioSync(0, 0, null, null);
+		}
 		LOGGER.info("Cleared all share states due to disconnect");
 	}
 	
@@ -921,6 +1068,10 @@ public class WindowShareManager {
 		public long frameCount = 0;
 		public long totalBytes = 0;
 		public long skippedFrames = 0;      // diff检测跳过的帧数
+		/** ⑧ v1.4.8：编码在途帧占位时丢弃的新帧数（编码跟不上的自然背压计数，诊断用） */
+		public long encodeDroppedFrames = 0;
+		/** ⑧ 每窗口至多一帧在途编码（仅渲染线程读写） */
+		volatile boolean encodeBusy = false;
 		public long rateLimitedFrames = 0;   // 码率限制跳过的帧数
 		public long degradedFrames = 0;      // 因超限降级后实际发送的帧数
 		public long sizeDroppedFrames = 0;   // 降级后仍超限被丢弃的帧数

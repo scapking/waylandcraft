@@ -127,7 +127,16 @@ public class WaylandCraftSettingsManager {
 	
 	public void readSettings() {
 		try(FileReader reader = new FileReader(settingsFile)) {
-			wlc.settings = gson.fromJson(reader, WaylandCraftSettings.class);
+			WaylandCraftSettings loaded = gson.fromJson(reader, WaylandCraftSettings.class);
+			// ⑧ v1.4.8 迁移：固定 4000（旧"预缓冲 4s"默认值）→ -1 auto（按负载 14–32s 自适应）。
+			// 4000 恰为旧默认，用户显式钉死这一精确值的可能性可忽略；其余显式值原样保留
+			// （0=低延迟、>0=手动档语义不变）。loaded==null（空/损坏文件）不覆盖现有实例。
+			if(loaded != null && loaded.sharePlayoutDelayMs == 4000) {
+				loaded.sharePlayoutDelayMs = -1;
+			}
+			if(loaded != null) {
+				wlc.settings = loaded;
+			}
 		} catch(IOException e) {
 			e.printStackTrace();
 		}

@@ -48,7 +48,9 @@ public class AudioCaptureManager {
 	/** handle -> 发送序号 */
 	private long lastPollTime = 0;
 	private int seqCounter = 0;
-	private boolean started = false;
+	/** ⑧ v1.4.8：start/stop 挪到 waylandcraft-share-audio executor 线程，
+	 *  tick()/isStarted() 仍在主线程读 —— 跨线程可见性必须 volatile */
+	private volatile boolean started = false;
 	private boolean firstAudioLogged = false;
 	private long totalAudioBytes = 0;
 	private long nextAudioLogBytes = 1_000_000;

@@ -1489,20 +1489,28 @@ public class WaylandCraftCommand {
 					source.sendFeedback(Component.literal("§a✔ §eimeNested§r = §e" + v + "§r  §8(下一帧生效；/wl ime nested status 看裁决)§r"));
 					return 1;
 				}
-				// ⑦ 共享接收端预缓冲深度：用延迟换零卡顿
+				// ⑦/⑧ 共享接收端预缓冲深度：用延迟换零卡顿。
+				// ⑧ v1.4.8 语义升级：auto（-1）= 按负载 14–32s 自适应延伸（新默认）；
+				// 0 = 低延迟旧行为；1..32000 = 手动档。旧校验上限 8000 已过时。
 				case "sharePlayoutDelayMs" -> {
 					int ms;
-					try { ms = Integer.parseInt(value); }
-					catch(NumberFormatException e) {
-						source.sendError(Component.literal("§c✘ sharePlayoutDelayMs 需要整数（毫秒）§r"));
-						return 0;
+					if(value.equalsIgnoreCase("auto")) {
+						ms = -1;
 					}
-					if(ms < 0 || ms > 8000) {
-						source.sendError(Component.literal("§c✘ sharePlayoutDelayMs 范围 0..8000；0=低延迟旧行为，4000=默认（预缓冲 4s 换流畅）§r"));
+					else {
+						try { ms = Integer.parseInt(value); }
+						catch(NumberFormatException e) {
+							source.sendError(Component.literal("§c✘ sharePlayoutDelayMs 需要整数（毫秒）或 auto§r"));
+							return 0;
+						}
+					}
+					if(ms < -1 || ms > 32000) {
+						source.sendError(Component.literal("§c✘ sharePlayoutDelayMs 范围 -1..32000；-1/auto=按负载自适应 14–32s，0=低延迟旧行为，>0=手动毫秒§r"));
 						return 0;
 					}
 					wlc.settingsManager.setIntSetting(WaylandCraftSettings.SHARE_PLAYOUT_DELAY_MS, ms);
-					source.sendFeedback(Component.literal("§a✔ §esharePlayoutDelay§r = §e" + ms + "ms§r（接收端立即生效）"));
+					source.sendFeedback(Component.literal("§a✔ §esharePlayoutDelay§r = §e"
+						+ (ms == -1 ? "auto（14–32s 按负载自适应）" : ms + "ms") + "§r（接收端立即生效）"));
 					return 1;
 				}
 				// ⑦ 共享窗口声音可听范围（格）

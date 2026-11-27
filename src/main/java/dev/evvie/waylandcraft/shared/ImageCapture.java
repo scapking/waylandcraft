@@ -133,13 +133,9 @@ public class ImageCapture {
 	private static int lastBufferWidth = 0;
 	private static int lastBufferHeight = 0;
 	
-	// 像素差异检测（per-window：windowHandle -> lastRawFrame）
-	// 之前是 static 单缓存，多个窗口共享时会互相覆盖基准帧，导致 diff 误判
-	private static final java.util.Map<Long, byte[]> lastRawFrames = new java.util.concurrent.ConcurrentHashMap<>();
-	// P1-10（子集）：diff 当前帧 scratch，按窗口复用——旧实现每帧 new byte[needed]（4K≈33MB/帧）
-	// 加 hasSignificantChange 每帧 clone 一次，两个 8MB+ 短命大对象压在渲染线程 GC 上。
-	// 现在尺寸不变不重分配；基准帧更新走 System.arraycopy，零分配。
-	private static final java.util.Map<Long, byte[]> diffScratch = new java.util.concurrent.ConcurrentHashMap<>();
+	// ⑧ v1.4.8：diff 基准帧与当前帧的 byte[] 地图（lastRawFrames/diffScratch）已随
+	// byte[] 旧 API 删除——ByteBuffer 版（lastRawBuffers）与窗口双槽（slotPools）接管，
+	// 结构上不再有"每帧 clone 8MB 基准"的可能。per-window 隔离语义不变。
 	
 	/**
 	 * 从WindowFramebuffer捕获图像（主入口，带全部优化）
@@ -280,160 +276,225 @@ public class ImageCapture {
 		}
 	}
 	
+	// ⑧ v1.4.8：旧 captureFromFramebufferRaw（同步全帧回读 + 共享 scratch 返回值）
+	// 由 captureRawFrame（PBO 异步回读进窗口双槽）取代——无调用方，删除防死代码。
+	
+	// ⑧ v1.4.8：旧 byte[] 版 hasSignificantChange（依赖第二次同步回读）删除；
+	// ByteBuffer 版（与 captureRawFrame 共享同一份数据）是当前唯一 diff 入口。
+	
 	/**
-	 * 从WindowFramebuffer捕获原始RGBA数据（用于diff检测）
-	 * 
-	 * @param windowHandle 窗口句柄（缩放FBO按窗口隔离，多窗口互不重建/串扰）
+	 * 清除指定窗口的 diff 基准帧与 scratch（stopSharing 时调用）
+	 */
+	public static void clearDiffCache(long windowHandle) {
+		// ⑧ v1.4.8：byte[] 基准帧/scratch 地图已随旧 API 删除，这里清 ByteBuffer 版基准
+		lastRawBuffers.remove(windowHandle);
+	}
+	
+	/**
+	 * 清除所有窗口的 diff 基准帧与 scratch（断线时调用）
+	 */
+	public static void clearAllDiffCaches() {
+		// ⑧ 旧 byte[] 地图已删除；ByteBuffer 基准 + 窗口双槽一起回收
+		lastRawBuffers.clear();
+		slotPools.clear();
+	}
+	
+	// ===== ⑧ v1.4.8 异步捕获/编码管线：按窗口 raw 双槽 + ByteBuffer diff =====
+	
+	/**
+	 * 捕获结果：从窗口自有池借出的 RGBA slot（bottom-up，与 PBO 路径同一数据布局）。
+	 * 归编码任务独占，releaseRawFrame 归还（数组身份校验防尺寸重建后双还）。
+	 */
+	public static final class RawFrame {
+		public final long windowHandle;
+		public final ByteBuffer buffer;
+		public final int width, height;
+		final int slot;
+		
+		RawFrame(long windowHandle, ByteBuffer buffer, int width, int height, int slot) {
+			this.windowHandle = windowHandle;
+			this.buffer = buffer;
+			this.width = width;
+			this.height = height;
+			this.slot = slot;
+		}
+	}
+	
+	private static final class SlotPool {
+		ByteBuffer[] bufs = new ByteBuffer[2];
+		final boolean[] inUse = new boolean[2];
+		int width = -1, height = -1;
+	}
+	private static final java.util.Map<Long, SlotPool> slotPools = new java.util.concurrent.ConcurrentHashMap<>();
+	/** ⑧ ByteBuffer 版 diff 基准（bulk copy 更新，零短命大对象） */
+	private static final java.util.Map<Long, ByteBuffer> lastRawBuffers = new java.util.concurrent.ConcurrentHashMap<>();
+	
+	/**
+	 * ⑧ 异步管线的单次捕获：GPU blit 缩放 + PBO 异步回读进空闲 slot。
+	 *
+	 * 与旧 captureFromFramebufferRaw（同步 glReadPixels 全帧阻塞 + 返回共享 scratch
+	 * "本帧内有效"）的关键区别：
+	 * - 回读走 PBO 管线（含 seed 与 Mesa 失败降级 sync），sync 兜底也只拷贝进 slot，
+	 *   所有权交给调用方直到 release —— 异步编码的数据前提；
+	 * - slot 每窗固定 2 块，稳态零分配（旧 PBO 路径每帧 allocateDirect ~8MB，
+	 *   渲染线程 GC 压力是病灶之一）；
+	 * - 双槽全占 = 编码器未消化 → 返回 null，调用方丢帧，天然不会打爆池。
+	 * 仅渲染线程调用（GL 上下文约束）。
 	 */
 	@Nullable
-	public static byte[] captureFromFramebufferRaw(long windowHandle, WindowFramebuffer framebuffer, float scale) {
+	public static RawFrame captureRawFrame(long windowHandle, WindowFramebuffer framebuffer, float scale) {
 		if(!framebuffer.isValid()) return null;
-		
 		var target = framebuffer.getRenderTarget();
 		if(target == null) return null;
-		
 		int srcW = framebuffer.getWidth();
 		int srcH = framebuffer.getHeight();
 		if(srcW <= 0 || srcH <= 0) return null;
-		
 		var colorTex = target.getColorTexture();
 		if(colorTex == null || colorTex.isClosed()) return null;
 		
+		int dstW = Math.min(Math.max(1, (int)(srcW * scale)), MAX_WIDTH);
+		int dstH = Math.min(Math.max(1, (int)(srcH * scale)), MAX_HEIGHT);
+		int needed = dstW * dstH * 4;
+		
+		SlotPool pool = slotPools.computeIfAbsent(windowHandle, k -> new SlotPool());
+		int slotIdx;
+		ByteBuffer slotBuf;
+		synchronized(pool) {
+			if(pool.width != dstW || pool.height != dstH || pool.bufs[0] == null
+					|| pool.bufs[1] == null || pool.bufs[0].capacity() < needed) {
+				// 尺寸变化：重建双槽（罕见事件，一次性分配；旧 in-flight 帧经身份校验安全失效）
+				for(int i = 0; i < 2; i++) {
+					pool.bufs[i] = ByteBuffer.allocateDirect(needed);
+				}
+				pool.inUse[0] = false;
+				pool.inUse[1] = false;
+				pool.width = dstW;
+				pool.height = dstH;
+			}
+			slotIdx = pool.inUse[0] ? 1 : 0;
+			if(pool.inUse[slotIdx]) {
+				slotIdx = slotIdx == 0 ? 1 : 0;
+				if(pool.inUse[slotIdx]) {
+					return null; // 双槽在途：编码器没消化，调用方丢帧
+				}
+			}
+			pool.inUse[slotIdx] = true;
+			slotBuf = pool.bufs[slotIdx];
+		}
+		
 		try {
 			int glTexId = ((com.mojang.blaze3d.opengl.GlTexture) colorTex).glId();
-
-			int dstW = Math.max(1, (int)(srcW * scale));
-			int dstH = Math.max(1, (int)(srcH * scale));
-			dstW = Math.min(dstW, MAX_WIDTH);
-			dstH = Math.min(dstH, MAX_HEIGHT);
-
-			// GPU缩放 FBO（按窗口隔离；先建 ScaleState，源读 FBO 也挂在它上面复用）
+			
+			// GPU 缩放（与 raw 路径同款按窗缓存 readFbo/scaleFbo）
 			ensureScaleFbo(windowHandle, dstW, dstH);
 			ScaleState scaleState = scaleStates.get(windowHandle);
-			if(scaleState == null) return null;
-
-			// 源FBO：P1-10（子集）按窗口复用（旧实现每帧 glGenFramebuffers+glDeleteFramebuffers）。
-			// 每帧重新 attach+check：纹理 id 变化（窗口重建）时附加自动跟随，行为与旧版逐帧一致。
+			if(scaleState == null) {
+				freeSlot(pool, slotIdx);
+				return null;
+			}
+			
 			if(scaleState.readFbo == 0) {
 				scaleState.readFbo = GL30.glGenFramebuffers();
 			}
 			GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, scaleState.readFbo);
 			GL30.glFramebufferTexture2D(GL30.GL_READ_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0, GL11.GL_TEXTURE_2D, glTexId, 0);
-
-			// 检查源FBO完整性：若附加纹理失败（非GL_TEXTURE_2D等），blit 会静默失败，
-			// 导致 scaleFbo 残留旧内容 → diff 永远判定"无变化"→ 永不发帧。
 			int readStatus = GL30.glCheckFramebufferStatus(GL30.GL_READ_FRAMEBUFFER);
 			if(readStatus != GL30.GL_FRAMEBUFFER_COMPLETE) {
-				LOGGER.error("Raw capture: source FBO incomplete: 0x{} (falling back to no-diff)", Integer.toHexString(readStatus));
+				LOGGER.error("Raw slot capture: source FBO incomplete: 0x{}", Integer.toHexString(readStatus));
+				freeSlot(pool, slotIdx);
 				return null;
 			}
-
-			// ensureScaleFbo 重建后会把 READ 解绑成 0，必须重新绑定
+			// ensureScaleFbo 重建会把 READ 解绑成 0，blit 前必须重绑（与旧路径同教训）
 			GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, scaleState.readFbo);
-			int scaleFboId = scaleState.fbo;
-			GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, scaleFboId);
+			GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, scaleState.fbo);
 			GL30.glBlitFramebuffer(0, 0, srcW, srcH, 0, 0, dstW, dstH, GL11.GL_COLOR_BUFFER_BIT, GL30.GL_LINEAR);
-
-			// 同步读取（raw模式不用PBO，避免延迟）
-			int needed = dstW * dstH * 4;
-			if(reusableBuffer == null || lastBufferWidth != dstW || lastBufferHeight != dstH) {
-				reusableBuffer = ByteBuffer.allocateDirect(needed);
-				lastBufferWidth = dstW;
-				lastBufferHeight = dstH;
-			} else {
-				reusableBuffer.clear();
-			}
-			
-			// 从缩放FBO读取
-			// 关键：MC 26.x 渲染器在 pass 之间会把 GL_READ_BUFFER 设成 GL_NONE，
-			// 必须显式指向 COLOR_ATTACHMENT0，否则 glReadPixels 报 GL_INVALID_OPERATION(0x502)。
-			// 同时解绑 PIXEL_PACK_BUFFER，避免残留 PBO 导致客户端指针被当成 offset。
-			GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, scaleFboId);
-			GL30.glReadBuffer(GL30.GL_COLOR_ATTACHMENT0);
-			GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
-			GL11.glReadPixels(0, 0, dstW, dstH, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, reusableBuffer);
-			
-			int readErr = GL11.glGetError();
-			if(readErr != GL11.GL_NO_ERROR) {
-				LOGGER.error("Raw capture glReadPixels error: 0x{}", Integer.toHexString(readErr));
+			int blitError = GL11.glGetError();
+			if(blitError != GL11.GL_NO_ERROR) {
+				LOGGER.error("Raw slot capture: glBlitFramebuffer error: 0x{}", Integer.toHexString(blitError));
+				freeSlot(pool, slotIdx);
 				return null;
 			}
 			
-			// 拷入按窗口复用的 scratch 数组（尺寸不变时零分配；调用方仅在本帧内使用返回值）
-			byte[] result = diffScratch.get(windowHandle);
-			if(result == null || result.length != needed) {
-				result = new byte[needed];
-				diffScratch.put(windowHandle, result);
+			// 回读：PBO 路径拷进 slot；sync 兜底（Mesa 降级/seed 帧）拷回共享缓冲后 toTarget 复制
+			if(readPixelsViaPbo(windowHandle, dstW, dstH, slotBuf) == null) {
+				freeSlot(pool, slotIdx);
+				return null;
 			}
-			reusableBuffer.rewind();
-			reusableBuffer.get(result);
-			return result;
-
+			slotBuf.position(0);
+			slotBuf.limit(needed);
+			return new RawFrame(windowHandle, slotBuf, dstW, dstH, slotIdx);
 		} catch(Exception e) {
-			LOGGER.error("Failed to capture raw frame", e);
+			LOGGER.error("Failed to capture raw slot frame", e);
+			freeSlot(pool, slotIdx);
 			return null;
 		} finally {
-			// 只解绑，不删 FBO——readFbo 已按窗口缓存，随 cleanupScaleFbo 释放
 			GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, 0);
 			GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, 0);
 			GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
 		}
 	}
 	
+	/** ⑧ 归还 slot（编码线程调用；与 captureRawFrame 的池锁互斥安全） */
+	public static void releaseRawFrame(RawFrame f) {
+		if(f == null) return;
+		SlotPool pool = slotPools.get(f.windowHandle);
+		if(pool == null) return;
+		synchronized(pool) {
+			if(pool.bufs[f.slot] == f.buffer) {
+				pool.inUse[f.slot] = false;
+			}
+		}
+	}
+	
+	private static void freeSlot(SlotPool pool, int idx) {
+		synchronized(pool) {
+			pool.inUse[idx] = false;
+		}
+	}
+	
+	/** ⑧ 停共享：释放该窗槽位（在途帧经身份校验自行失效） */
+	public static void cleanupRawSlots(long windowHandle) {
+		slotPools.remove(windowHandle);
+	}
+	
+	/** ⑧ 断线/卸载：全部槽位释放 */
+	public static void cleanupAllRawSlots() {
+		slotPools.clear();
+	}
+	
 	/**
-	 * 检测像素帧是否有显著变化
-	 * 采样1/16像素，计算变化百分比
-	 * 
-	 * @param windowHandle 窗口句柄（diff 基准帧按窗口隔离）
-	 * @param currentFrame 当前帧RGBA数据
-	 * @param threshold 变化阈值（0.0-1.0），默认0.02（2%）
-	 * @return true if significant change detected
+	 * ⑧ ByteBuffer 版 diff 检测（异步管线数据源 = 捕获 slot，杜绝旧路径的第二次回读）。
+	 * 采样步长/比较通道与 byte[] 版一致（行为连续性优先），基准更新用 bulk copy——
+	 * byte[] 版每帧 clone 8MB+ 的教训（P1-10）在这条路径从结构上不存在。
 	 */
-	public static boolean hasSignificantChange(long windowHandle, byte[] currentFrame, float threshold) {
-		byte[] last = lastRawFrames.get(windowHandle);
-		if(last == null || last.length != currentFrame.length) {
-			lastRawFrames.put(windowHandle, currentFrame.clone());
+	public static boolean hasSignificantChange(long windowHandle, ByteBuffer currentFrame, float threshold) {
+		int size = currentFrame.remaining();
+		ByteBuffer last = lastRawBuffers.get(windowHandle);
+		if(last == null || last.capacity() < size) {
+			last = ByteBuffer.allocateDirect(size);
+			lastRawBuffers.put(windowHandle, last);
+			last.put(currentFrame.duplicate());
 			return true;
 		}
 		
-		int totalPixels = currentFrame.length / 4;
-		int sampleStep = 4; // 采样间隔，1/16像素
+		int totalBytes = size;
 		int sampled = 0;
 		int changed = 0;
-		
-		for(int i = 0; i < currentFrame.length; i += 4 * sampleStep) {
+		for(int i = 0; i < totalBytes; i += 4 * 4) {
 			sampled++;
-			// 比较RGB（跳过Alpha）
-			if(currentFrame[i] != last[i] ||
-			   currentFrame[i+1] != last[i+1] ||
-			   currentFrame[i+2] != last[i+2]) {
+			// 比较RGB（跳过Alpha），与 byte[] 版同款绝对索引
+			if(currentFrame.get(i) != last.get(i) ||
+			   currentFrame.get(i + 1) != last.get(i + 1) ||
+			   currentFrame.get(i + 2) != last.get(i + 2)) {
 				changed++;
 			}
 		}
 		
 		float changeRatio = sampled > 0 ? (float)changed / sampled : 1.0f;
-
-		// 更新基准：拷贝进**已缓存**的基准数组（P1-10 子集：旧实现每帧 clone 出一个
-		// 8MB+ 短命大对象；这里 System.arraycopy 原地更新，零分配）。
-		System.arraycopy(currentFrame, 0, last, 0, currentFrame.length);
-
+		// 更新基准（duplicate 绝对读，不动调用方 position）
+		last.clear();
+		last.put(currentFrame.duplicate());
 		return changeRatio > threshold;
-	}
-	
-	/**
-	 * 清除指定窗口的 diff 基准帧与 scratch（stopSharing 时调用）
-	 */
-	public static void clearDiffCache(long windowHandle) {
-		lastRawFrames.remove(windowHandle);
-		diffScratch.remove(windowHandle);
-	}
-
-	/**
-	 * 清除所有 diff 基准帧与 scratch（断线时调用）
-	 */
-	public static void clearAllDiffCaches() {
-		lastRawFrames.clear();
-		diffScratch.clear();
 	}
 	
 	/**
@@ -446,12 +507,23 @@ public class ImageCapture {
 	 */
 	@Nullable
 	private static ByteBuffer readPixelsViaPbo(long windowHandle, int width, int height) {
+		return readPixelsViaPbo(windowHandle, width, height, null);
+	}
+	
+	/**
+	 * ⑧ v1.4.8 target 变体：把回读结果拷贝进调用方提供的 slot 缓冲（异步编码管线
+	 * 的所有权前提——旧实现每帧 allocateDirect(~8MB)，且 sync 兜底返回共享
+	 * reusableBuffer，两者都不能交给别的线程）。target==null 保持旧行为逐字节不变
+	 * （captureFromFramebufferInternal 等同步调用方不受影响）。
+	 */
+	@Nullable
+	private static ByteBuffer readPixelsViaPbo(long windowHandle, int width, int height, @Nullable ByteBuffer target) {
 		int dataSize = width * height * 4;
 		
 		// 永久降级检查：该窗口已连续失败过阈值次数，直接走 sync，不再尝试 PBO
 		Integer failCount = pboFailures.get(windowHandle);
 		if(failCount != null && failCount >= PBO_MAX_CONSECUTIVE_FAILURES) {
-			return readPixelsSync(windowHandle, width, height);
+			return toTarget(readPixelsSync(windowHandle, width, height), target);
 		}
 		
 		PboState state = pboStates.computeIfAbsent(windowHandle, k -> new PboState());
@@ -475,7 +547,7 @@ public class ImageCapture {
 						state.ids[0] + "," + state.ids[1], failures, PBO_MAX_CONSECUTIVE_FAILURES);
 				}
 				state.ids = null;
-				return readPixelsSync(windowHandle, width, height);
+				return toTarget(readPixelsSync(windowHandle, width, height), target);
 			}
 			
 			boolean pboAllocOk = true;
@@ -497,7 +569,7 @@ public class ImageCapture {
 						Long.toHexString(windowHandle), failures);
 				}
 				state.cleanup();
-				return readPixelsSync(windowHandle, width, height);
+				return toTarget(readPixelsSync(windowHandle, width, height), target);
 			}
 			
 			// PBO 初始化成功：清除失败计数（环境可能已恢复）
@@ -534,7 +606,8 @@ public class ImageCapture {
 			// 移动索引到下一帧（让 mapIndex = 上一帧，刚好是我们刚 seed 的那个）
 			state.index = seedPbo;
 			state.seedStage++;
-			return current;
+			// ⑧ current 是共享 reusableBuffer：交给 target 时拷贝，旧路径原样返回
+			return toTarget(current, target);
 		}
 		
 		int readIndex = state.index;        // 当前帧写入这个PBO
@@ -562,11 +635,17 @@ public class ImageCapture {
 			// 首帧或映射失败 — 回退到同步读取
 			GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
 			LOGGER.debug("PBO map returned null (first frame?), falling back to sync read");
-			return readPixelsSync(windowHandle, width, height);
+			return toTarget(readPixelsSync(windowHandle, width, height), target);
 		}
 		
-		// 复制数据出来
-		ByteBuffer result = ByteBuffer.allocateDirect(dataSize);
+		// 复制数据出来（⑧ target 非空=拷进调用方 slot 零分配；null=旧行为每帧新分配）
+		ByteBuffer result;
+		if(target != null && target.capacity() >= dataSize) {
+			result = target;
+			result.clear();
+		} else {
+			result = ByteBuffer.allocateDirect(dataSize);
+		}
 		result.put(mapped);
 		result.rewind();
 		
@@ -574,6 +653,17 @@ public class ImageCapture {
 		GL15.glBindBuffer(GL21.GL_PIXEL_PACK_BUFFER, 0);
 		
 		return result;
+	}
+	
+	/** ⑧ 把结果缓冲落到调用方 slot（target==null 时原样返回=旧行为；src==null 传播失败） */
+	@Nullable
+	private static ByteBuffer toTarget(@Nullable ByteBuffer src, @Nullable ByteBuffer target) {
+		if(target == null) return src;
+		if(src == null) return null;
+		target.clear();
+		target.put(src);
+		target.rewind();
+		return target;
 	}
 	
 	/**
@@ -967,7 +1057,8 @@ public class ImageCapture {
 	 */
 	public static void cleanup() {
 		cleanupAllWindowResources();
-		lastRawFrames.clear();
+		lastRawBuffers.clear();
+		slotPools.clear();
 		reusableBuffer = null;
 	}
 	

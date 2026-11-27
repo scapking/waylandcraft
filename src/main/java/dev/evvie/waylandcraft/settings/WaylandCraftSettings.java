@@ -59,9 +59,15 @@ public class WaylandCraftSettings {
 	/** Ctrl+方向键在布局中切换核心窗口（0上 1下 2左 3右 由按键决定，见代码） */
 	double moveStep = 0.5;
 	
-	/* ---- ⑦ 多人共享 playout / 音频范围 ---- */
-	/** 接收端预缓冲深度（ms）：0=低延迟（旧行为，最新帧直传），默认 4000=用 4s 延迟换零卡顿 */
-	int sharePlayoutDelayMs = 4000;
+	/* ---- ⑦/⑧ 多人共享 playout / 音频范围 ---- */
+	/**
+	 * 接收端预缓冲深度（ms）。⑧ v1.4.8 语义：
+	 * -1 = auto（新默认）：按负载在 14000..32000 自适应延伸（SharePlayoutController，
+	 *      用户裁定"4–8s 太短，延迟换流畅"）；
+	 *  0 = 低延迟（旧行为，最新帧直传）；
+	 * >0 = 手动档（1..32000）。旧默认 4000 在 readSettings 迁移为 -1。
+	 */
+	int sharePlayoutDelayMs = -1;
 	/** 共享窗口声音的可听范围（格）：窗口位置超过该距离衰减到 0；0=全局恒响（旧行为） */
 	double audioShareRangeBlocks = 32.0;
 

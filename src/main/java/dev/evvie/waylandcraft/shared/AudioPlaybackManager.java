@@ -44,12 +44,19 @@ public class AudioPlaybackManager {
 	
 	/** source 上排队超过该数量（~6s @10包/s）时丢新包，保持实时（D=0 低延迟模式） */
 	private static final int MAX_QUEUED_BUFFERS = 60;
-	/** 预缓冲模式下 pending chunk 上限（~30s @10包/s）：超限丢最旧 */
-	private static final int MAX_PENDING_CHUNKS = 300;
+	/** ⑧ pending 上限改由 SharePlayoutController.audioPendingChunks(目标深度) 动态给出 */
+	private static final int MAX_PENDING_CHUNKS = 300; // 兜底下限（controller 公式同源钳制）
 	/** 喂入 lookahead：播放时刻前这么多毫秒即可预排队进 OpenAL */
 	private static final long FEED_LOOKAHEAD_MS = 150;
-	/** minTransit 向上漂移速率（ms/包） */
-	private static final double MIN_TRANSIT_DRIFT_MS = 2.0;
+	/**
+	 * ⑧ 迟到判据：到点 chunk 若已过期超过该毫秒数，丢弃而非补灌。
+	 * 旧实现把欠账期间全部到点 chunk 一次性灌进 OpenAL 串行队列，断流恢复后
+	 * 音频永久落后 playout 时钟（"疑似同步很久才好"的机制根源）；
+	 * 丢弃重对齐 = 听感上一小段缺失，但音画相位不再累积。
+	 */
+	private static final long STALE_FEED_MS = 2000;
+	/** ⑧ OpenAL 连续异常达到该次数才永久降级（旧版一次异常即毒杀整个会话音频） */
+	private static final int AL_FATAL_CONSECUTIVE_FAILURES = 50;
 	
 	/** windowHandle -> 播放流 */
 	private final Map<Long, StreamHandle> streams = new ConcurrentHashMap<>();
@@ -60,6 +67,10 @@ public class AudioPlaybackManager {
 	private long nextAudioLogBytes = 1_000_000;
 	private long receivedPackets = 0;
 	private long droppedStalePackets = 0;
+	/** ⑧ 迟到丢弃的 chunk 总数（自适应采样的拥塞输入；渲染线程跨线程读 → volatile） */
+	private volatile long lateDroppedPackets = 0;
+	/** ⑧ OpenAL 连续失败计数（成功一次清零；达到阈值才永久降级） */
+	private int consecutiveAlFailures = 0;
 	
 	/**
 	 * 网络线程调用：入队到主线程播放。
@@ -118,15 +129,20 @@ public class AudioPlaybackManager {
 			long now = System.currentTimeMillis();
 			long playoutDelayMs = RemoteWindowRenderer.playoutDelayMs();
 			boolean hasTs = captureTimestampMs > 0;
+			// ⑧ 每窗口共享 playout 时钟：音频 transit 样本同样喂入（min-tracking 收敛
+			// 更快，首包恰逢中继批量到达的尖峰会被后续好样本立即拉回——"音频卡很久
+			// 才出现"的接收端放大器就此消除）
+			long clockTransit = SharePlayoutController.transitMs(windowHandle);
+			if(clockTransit < 0) clockTransit = 0;
 			
 			if(hasTs && playoutDelayMs > 0) {
-				// === 预缓冲模式：与视频同一 playout 时钟 ===
-				long transit = Math.max(0, now - captureTimestampMs);
-				stream.minTransitMs = stream.minTransitMs < 0
-					? transit
-					: (long)Math.min(transit, stream.minTransitMs + MIN_TRANSIT_DRIFT_MS);
+				// === 预缓冲模式：与视频同一 playout 时钟（同一 X + 同一 D → 同刻播） ===
+				SharePlayoutController.observeTransit(windowHandle, Math.max(0, now - captureTimestampMs), now);
+				clockTransit = Math.max(clockTransit, 0); // 首样本后本包按新估计排期
 				stream.pending.addLast(new PendingChunk(pcm, sampleRate, channels, captureTimestampMs));
-				while(stream.pending.size() > MAX_PENDING_CHUNKS) {
+				// ⑧ pending 上限随目标深度伸缩（32s 档 ≈360 包；固定 300 会把最深档钳回 30s）
+				int pendingCap = SharePlayoutController.audioPendingChunks((int)Math.min(playoutDelayMs, Integer.MAX_VALUE));
+				while(stream.pending.size() > pendingCap) {
 					stream.pending.removeFirst(); // 极端积压：丢最旧（音画一起滞后不如局部丢）
 					droppedStalePackets++;
 				}
@@ -143,9 +159,15 @@ public class AudioPlaybackManager {
 			if(!stream.pending.isEmpty()) {
 				while(!stream.pending.isEmpty()) {
 					PendingChunk head = stream.pending.peekFirst();
-					long dueAt = head.captureTimestampMs + Math.max(0, stream.minTransitMs) + playoutDelayMs;
+					long dueAt = head.captureTimestampMs + clockTransit + playoutDelayMs;
 					if(now + FEED_LOOKAHEAD_MS < dueAt) break;
 					stream.pending.removeFirst();
+					// ⑧ 迟到超过 STALE_FEED_MS 的 chunk 丢弃重对齐（旧：全部补灌 → OpenAL
+					// 串行队列永久落后 playout 时钟 = 断流一次、错拍到天荒地老）
+					if(now - dueAt > STALE_FEED_MS) {
+						lateDroppedPackets++;
+						continue;
+					}
 					queueToOpenAL(stream, head.pcm, head.sampleRate, head.channels);
 				}
 			}
@@ -158,10 +180,21 @@ public class AudioPlaybackManager {
 			if(state != AL10.AL_PLAYING && !stream.buffers.isEmpty()) {
 				AL10.alSourcePlay(stream.source);
 			}
+			consecutiveAlFailures = 0;
 		} catch(Throwable t) {
-			// OpenAL 不可用（如某些环境未初始化）→ 静默降级，不影响共享画面
-			LOGGER.warn("Audio playback unavailable: {}", t.toString());
-			alAvailable = false;
+			// ⑧ 一次性异常不再永久毒杀本会话音频（旧行为：任何 Throwable →
+			// alAvailable=false 且无恢复路径，一次瞬时 AL 错误=整局无声）。
+			// 仅 LinkageError（OpenAL 真不存在）或连续 ≥50 次失败才降级。
+			consecutiveAlFailures++;
+			if(t instanceof LinkageError || consecutiveAlFailures >= AL_FATAL_CONSECUTIVE_FAILURES) {
+				LOGGER.warn("Audio playback unavailable (degraded after {} consecutive failures): {}",
+					consecutiveAlFailures, t.toString());
+				alAvailable = false;
+			}
+			else if(consecutiveAlFailures == 1 || consecutiveAlFailures % 20 == 0) {
+				LOGGER.warn("Audio playback hiccup ({} consecutive): {} — retrying",
+					consecutiveAlFailures, t.toString());
+			}
 		}
 	}
 	
@@ -245,6 +278,7 @@ public class AudioPlaybackManager {
 		sb.append("  packets received: ").append(receivedPackets).append("\n");
 		sb.append("  bytes received: ").append(totalAudioBytes).append("\n");
 		sb.append("  stale dropped: ").append(droppedStalePackets).append("\n");
+		sb.append("  ⑧ late dropped (realign): ").append(lateDroppedPackets).append("\n");
 		sb.append("  playoutDelayMs: ").append(RemoteWindowRenderer.playoutDelayMs()).append("\n");
 		sb.append("  audioRangeBlocks: ").append(audioRangeBlocks()).append("\n");
 		sb.append("  active streams: ").append(streams.size()).append("\n");
@@ -254,10 +288,16 @@ public class AudioPlaybackManager {
 				.append(": ").append(h.sampleRate).append("Hz/").append(h.channels)
 				.append("ch, queued buffers=").append(h.buffers.size())
 				.append(", pending=").append(h.pending.size())
-				.append(", minTransit=").append(h.minTransitMs).append("ms")
+				// ⑧ minTransit 来自每窗口共享 playout 时钟（视频/音频同估计=同锚）
+				.append(", sharedTransit=").append(SharePlayoutController.transitMs(e.getKey())).append("ms")
 				.append("\n");
 		}
 		return sb.toString();
+	}
+	
+	/** ⑧ 自适应采样输入：迟到丢弃累计（渲染线程读，主线程写，volatile 语义足够） */
+	public long lateDroppedPackets() {
+		return lateDroppedPackets;
 	}
 	
 	private static class PendingChunk {
@@ -279,7 +319,8 @@ public class AudioPlaybackManager {
 		final ArrayDeque<PendingChunk> pending = new ArrayDeque<>();
 		int sampleRate;
 		int channels;
-		long minTransitMs = -1;
+		// ⑧ v1.4.8：逐轨 minTransit 估计已废除——视频/音频共用
+		// SharePlayoutController 的每窗口共享 playout 时钟（音画同锚，消除恒定错拍）
 		
 		StreamHandle(int sampleRate, int channels) {
 			this.source = AL10.alGenSources();

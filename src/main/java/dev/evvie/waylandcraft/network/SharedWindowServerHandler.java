@@ -46,11 +46,22 @@ public class SharedWindowServerHandler {
 
 	private static final Logger LOGGER = LoggerFactory.getLogger("waylandcraft-server-handler");
 
-	/** P1-7：单玩家最多同时共享的窗口数 */
-	static final int MAX_WINDOWS_PER_PLAYER = 8;
+	/**
+	 * P1-7：单玩家最多同时共享的窗口数。
+	 * ⑧ v1.4.8：8 → 24。8 会把 `/wl share start all` 静默截断（超出者注册被拒），
+	 * 与一键全部共享的产品语义冲突；entry 本身轻量，viewer 侧另有 MAX_ACTIVE_STREAMS
+	 * 与缓冲总额封顶，放大该上限不引入新的无界资源。
+	 */
+	static final int MAX_WINDOWS_PER_PLAYER = 24;
 
-	/** P1-7：单玩家注册速率门（每秒请求数上限） */
-	static final int MAX_REGISTERS_PER_SECOND = 4;
+	/**
+	 * P1-7：单玩家注册速率门（每秒请求数上限）。
+	 * ⑧ v1.4.8：4 → 24。start all 的 N 个注册包在同一速率窗口内一次性到达，
+	 * 旧值 4 会静默丢弃第 5 个起的所有注册（"一键全部只成了几个"的上游真凶）；
+	 * 上限与 MAX_WINDOWS_PER_PLAYER 对齐后，合法的全部共享恰好放行，
+	 * 恶意刷注册仍被窗口数硬上限约束（重注册走同 owner 替换路径不计数膨胀）。
+	 */
+	static final int MAX_REGISTERS_PER_SECOND = 24;
 
 	/** P1-7：窗口标题服务端截断长度 */
 	static final int MAX_TITLE_LENGTH = 64;

@@ -100,14 +100,20 @@ public class SharedWindowClientHandler {
 	}
 
 	/**
-	 * P2-14：清理"未出现在列表且队头已过期"的暂存队列（列表内窗口由 flushPendingAudio 负责）。
+	 * P2-14：清理"未出现在列表且队头已过期"的暂存队列。
+	 * ⑧ v1.4.8：列表内窗口不再跳过——顺手补放。旧实现 flush 只挂在列表广播事件上，
+	 * 竞态窗口（音频包在"列表未含"状态下被 netty 线程暂存，列表随后更新但再无广播）
+	 * 的暂存包会一直压到 15s TTL 整批丢弃——观众中途进服首段音频消失的直接机制。
 	 * 测试接缝：now 注入。返回被移除的窗口数。
 	 */
 	static int sweepPendingAudioAt(long now) {
 		lastPendingSweepMs = now;
 		int removed = 0;
 		for(Long handle : new ArrayList<>(pendingAudio.keySet())) {
-			if(remoteWindows.containsKey(handle)) continue;
+			if(remoteWindows.containsKey(handle)) {
+				flushPendingAudioFor(handle, now);
+				continue;
+			}
 			java.util.ArrayDeque<HeldAudio> q = pendingAudio.get(handle);
 			if(q == null) continue;
 			synchronized(q) {
@@ -146,8 +152,6 @@ public class SharedWindowClientHandler {
 	
 	/** 列表更新后补放暂存音频；过期整批丢弃 */
 	private static void flushPendingAudio() {
-		WaylandCraft wlc = WaylandCraft.instance;
-		if(wlc == null || wlc.audioPlaybackManager == null) return;
 		long now = System.currentTimeMillis();
 		for(Long handle : new ArrayList<>(pendingAudio.keySet())) {
 			if(!remoteWindows.containsKey(handle)) {
@@ -160,18 +164,30 @@ public class SharedWindowClientHandler {
 				}
 				continue;
 			}
-			java.util.ArrayDeque<HeldAudio> q = pendingAudio.remove(handle);
-			if(q == null) continue;
-			int flushed = 0;
-			synchronized(q) {
-				HeldAudio held;
-				while((held = q.pollFirst()) != null) {
-					if(now - held.arrivalMs() > PENDING_AUDIO_TTL_MS) continue;
-					SharedWindowAudioPayload p = held.payload();
-					wlc.audioPlaybackManager.enqueue(p.windowHandle(), p.sampleRate(), p.channels(), p.pcmData(), p.captureTimestampMs());
-					flushed++;
-				}
+			flushPendingAudioFor(handle, now);
+		}
+	}
+	
+	/**
+	 * ⑧ 单窗口补放（列表广播与周期 sweep 两条路径共用）：过期整批丢，
+	 * 未过期的按序 enqueue。播放管理器缺席（单测/服务器侧）时不动队列。
+	 */
+	private static void flushPendingAudioFor(long handle, long now) {
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.audioPlaybackManager == null) return;
+		java.util.ArrayDeque<HeldAudio> q = pendingAudio.remove(handle);
+		if(q == null) return;
+		int flushed = 0;
+		synchronized(q) {
+			HeldAudio held;
+			while((held = q.pollFirst()) != null) {
+				if(now - held.arrivalMs() > PENDING_AUDIO_TTL_MS) continue;
+				SharedWindowAudioPayload p = held.payload();
+				wlc.audioPlaybackManager.enqueue(p.windowHandle(), p.sampleRate(), p.channels(), p.pcmData(), p.captureTimestampMs());
+				flushed++;
 			}
+		}
+		if(flushed > 0) {
 			LOGGER.info("[audio] flushed {} held packets for window 0x{}", flushed, Long.toHexString(handle));
 		}
 	}
