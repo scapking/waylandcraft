@@ -7,6 +7,7 @@ import org.slf4j.LoggerFactory;
 import dev.evvie.waylandcraft.item.ServerItemManager;
 import dev.evvie.waylandcraft.item.WindowItem;
 import dev.evvie.waylandcraft.item.WindowItemInteractionProvider;
+import dev.evvie.waylandcraft.network.ImmerseServer;
 import dev.evvie.waylandcraft.network.ServerEventHandler;
 import dev.evvie.waylandcraft.network.WaylandCraftNetworking;
 import dev.evvie.waylandcraft.shared.SharedWindowManager;
@@ -46,6 +47,10 @@ public class WaylandCraftCommon implements ModInitializer {
 		
 		// 注册服务器事件处理器
 		ServerEventHandler.register();
+
+		// v1.5.0 沉浸模式服务端权威层（payload 注册 + tick 冻结/超时 + 受伤强退 +
+		// 交互阻断 + 断线清理全部在其 register 内完成；客户端 S2C 接收由渲染侧注册）
+		ImmerseServer.register();
 
 		// P2-7：原 START_LEVEL_TICK 每维度每 tick 全扫；改单次 END_SERVER_TICK
 		ServerTickEvents.END_SERVER_TICK.register(serverItemManager::onServerTick);

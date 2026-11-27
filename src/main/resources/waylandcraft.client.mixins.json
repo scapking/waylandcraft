@@ -18,7 +18,8 @@
 		"IGlTextureMixin",
 		"IGuiGraphicsExtractor",
 		"FramerateLimitTrackerMixin",
-		"ScreenRenderMixin"
+		"ScreenRenderMixin",
+		"LevelRendererImmerseMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

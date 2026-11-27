@@ -407,6 +407,22 @@ public class WaylandCraftCommand {
 						)
 					)
 				)
+				// ⑩ v1.5.0 沉浸模式（VR 特效空间：宇宙穹顶，专注用窗口不被打扰；
+				// still=他人看到原地不动的你（服务端冻结），ghost=他人完全看不到（服务端 vanish））
+				.then(ClientCommands.literal("immerse")
+					.then(ClientCommands.literal("on")
+						.executes(c -> immerse(c, true, "still"))
+						.then(ClientCommands.argument("mode", StringArgumentType.word())
+							.executes(c -> immerse(c, true, StringArgumentType.getString(c, "mode")))
+						)
+					)
+					.then(ClientCommands.literal("off")
+						.executes(c -> immerse(c, false, null))
+					)
+					.then(ClientCommands.literal("status")
+						.executes(WaylandCraftCommand::immerseStatus)
+					)
+				)
 				// ⑥ 全局状态摘要进聊天（此前 status 报告只写文件；排错要开游戏翻目录）
 				.then(ClientCommands.literal("status")
 					.executes(WaylandCraftCommand::statusSummary)
@@ -541,6 +557,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §e/wl give <handle>§7 — 把窗口变为物品放入背包§r"));
 		source.sendFeedback(Component.literal(" §e/wl take <handle>§7 — 从背包收回窗口物品§r"));
 		source.sendFeedback(Component.literal(" §e/wl capture§7      — 弹出Portal选择，捕获桌面窗口§r"));
+		source.sendFeedback(Component.literal(" §e/wl immerse on [still|ghost]§7 — 沉浸模式：星空穹顶专注空间（off 退出，status 看状态）§r"));
 		source.sendFeedback(Component.literal(" §e/wl grab <handle>§7 — 抓取窗口，移动鼠标在世界中拖动§r"));
 		source.sendFeedback(Component.literal(" §e/wl place <handle> [距离1-6]§7 — 无物品摆位到玩家面前（默认 2 格；任何模式可用、绝不触碰背包；布局开启时布局优先，place 为临时偏移）§r"));
 		source.sendFeedback(Component.literal(" §e/wl show <handle|all>§7 — 在世界中显示窗口（all 一键全部）§r"));
@@ -3137,6 +3154,36 @@ public class WaylandCraftCommand {
 			source.sendError(Component.literal("§c✘ Invalid permission: " + permStr + " (NONE/VIEW/INTERACT/CONTROL)§r"));
 			return null;
 		}
+	}
+
+	// ===== ⑩ v1.5.0 沉浸模式（/wl immerse）=====
+	//
+	// 进入"特效空间"专注用窗口：世界内容隐藏、星空穹顶包裹、窗口照常渲染。
+	// 隐私由服务端权威执行（still 冻结原地 / ghost 取消追踪），vanilla 服降级
+	// local-only 纯特效（无隐私承诺，状态行如实标注）。
+
+	private static int immerse(CommandContext<FabricClientCommandSource> context, boolean enable, String mode) {
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.immerseManager == null) {
+			context.getSource().sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+		String feedback = wlc.immerseManager.toggle(enable, mode);
+		if(feedback != null) {
+			context.getSource().sendFeedback(Component.literal(feedback));
+		}
+		return 1;
+	}
+
+	private static int immerseStatus(CommandContext<FabricClientCommandSource> context) {
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null || wlc.immerseManager == null) {
+			context.getSource().sendError(Component.literal("§c✘ WaylandCraft not initialized§r"));
+			return 0;
+		}
+		context.getSource().sendFeedback(Component.literal("§7immerse: §f" + wlc.immerseManager.statusLine()
+			+ " §8(/wl immerse on [still|ghost] | off)§r"));
+		return 1;
 	}
 
 	// ===== ⑥ 全局状态摘要（/wl status）=====

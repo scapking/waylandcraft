@@ -41,6 +41,8 @@ import dev.evvie.waylandcraft.item.WindowItemManager;
 import dev.evvie.waylandcraft.render.WindowInHandRenderer;
 import dev.evvie.waylandcraft.render.WindowInItemFrameRenderer;
 import dev.evvie.waylandcraft.render.model.WindowItemModel;
+import dev.evvie.waylandcraft.immerse.ImmerseManager;
+import dev.evvie.waylandcraft.immerse.ImmerseSkyRenderer;
 import dev.evvie.waylandcraft.render.SharedWindowDisplay;
 import dev.evvie.waylandcraft.shared.WindowShareManager;
 import dev.evvie.waylandcraft.shared.AudioCaptureManager;
@@ -113,6 +115,8 @@ public class WaylandCraft implements ClientModInitializer {
 	// 共享窗口音频：发送端捕获（PipeWire 按进程）+ 接收端播放（OpenAL）
 	public AudioCaptureManager audioCaptureManager;
 	public AudioPlaybackManager audioPlaybackManager = new AudioPlaybackManager();
+	/** ⑩ v1.5.0 沉浸模式（/wl immerse）：星空穹顶 + 世界隐藏 + still/ghost 隐私档位 */
+	public final ImmerseManager immerseManager = ImmerseManager.instance();
 	
 	public WindowItemManager itemManager = new WindowItemManager();
 	public XDGDesktopManager xdgManager;
@@ -213,10 +217,12 @@ public class WaylandCraft implements ClientModInitializer {
 		WindowItemModel.register();
 		hudRenderer.register();
 		SharedWindowClientHandler.register();
-		
+
 		// 初始化窗口共享管理器
 		windowShareManager = new WindowShareManager(this);
 		audioCaptureManager = new AudioCaptureManager(this);
+		// ⑩ v1.5.0 沉浸模式（星空穹顶 + 世界隐藏 + 服务端权威隐私档位）
+		immerseManager.register();
 		WaylandCraftCommand.register();
 	}
 	
@@ -349,6 +355,9 @@ public class WaylandCraft implements ClientModInitializer {
 		if(audioCaptureManager != null) {
 			audioCaptureManager.tick();
 		}
+
+		// ⑩ 沉浸模式：PENDING 超时降级检测（vanilla 服 → local-only，视觉保留）
+		immerseManager.clientTick();
 		
 		// 更新 Portal 桌面捕获帧
 		if(captureManager != null) {
@@ -410,6 +419,8 @@ public class WaylandCraft implements ClientModInitializer {
 	}
 	
 	public void renderWorld(LevelRenderContext ctx) {
+		// ⑩ 沉浸模式星空穹顶（先于窗口提交：穹顶在底，窗口在上；未激活时零开销返回）
+		ImmerseSkyRenderer.renderSky(ctx);
 		// 本地窗口需要 bridge（native）才能渲染；共享窗口走网络层数据，
 		// 不依赖本地 bridge —— Android 手机端（native 不可用）也能查看共享窗口。
 		if(bridge != null) {

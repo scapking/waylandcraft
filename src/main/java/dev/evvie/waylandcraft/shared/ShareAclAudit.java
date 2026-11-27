@@ -44,6 +44,9 @@ public final class ShareAclAudit {
 	/** handle 重注册清空旧 ACL 次数（正常同 owner 重建窗口；越权复用被拒也计） */
 	public static final AtomicLong reregisterCleared = new AtomicLong();
 	public static final AtomicLong reregisterRejected = new AtomicLong();
+	/** 沉浸模式（v1.5.0）：进入次数 / 强制退出次数（伤害/超时/总开关关闭） */
+	public static final AtomicLong immerseEnter = new AtomicLong();
+	public static final AtomicLong immerseForceExit = new AtomicLong();
 
 	private ShareAclAudit() {}
 
@@ -90,6 +93,8 @@ public final class ShareAclAudit {
 			.append(" state=").append(deniedState.get()).append("\n");
 		sb.append("ACL reregister: cleared=").append(reregisterCleared.get())
 			.append(" rejected=").append(reregisterRejected.get()).append("\n");
+		sb.append("Immerse: enter=").append(immerseEnter.get())
+			.append(" force_exit=").append(immerseForceExit.get()).append("\n");
 		return sb.toString();
 	}
 
@@ -110,5 +115,7 @@ public final class ShareAclAudit {
 		deniedState.set(0);
 		reregisterCleared.set(0);
 		reregisterRejected.set(0);
+		immerseEnter.set(0);
+		immerseForceExit.set(0);
 	}
 }
