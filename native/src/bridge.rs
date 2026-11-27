@@ -1849,9 +1849,18 @@ fn update_surface_tree<'local>(
             let surface = match this.get_or_create_surface(env, handle) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!(
-                        "[waylandcraft][bridge] updateSurfaceTrees: get_or_create_surface 失败: {e:?}（跳过此 surface）"
-                    );
+                    // v1.4.7：2s 节流。此错误此前每 surface×每 tick 裸打（用户
+                    // 日志被同一 NoSuchMethod 刷屏）。根因（Java native 声明缺失）
+                    // 已在 Java 侧补齐，这里保留可见性但封顶频率。
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static LAST_LOG: AtomicU64 = AtomicU64::new(0);
+                    let now = crate::utils::get_time() as u64;
+                    if now.saturating_sub(LAST_LOG.load(Ordering::Relaxed)) > 2000 {
+                        LAST_LOG.store(now, Ordering::Relaxed);
+                        eprintln!(
+                            "[waylandcraft][bridge] updateSurfaceTrees: get_or_create_surface 失败: {e:?}（跳过此 surface；同类日志 2s 节流）"
+                        );
+                    }
                     return;
                 }
             };

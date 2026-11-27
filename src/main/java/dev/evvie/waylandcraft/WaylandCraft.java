@@ -808,6 +808,10 @@ public class WaylandCraft implements ClientModInitializer {
 		updateServerModCapability();
 		tickGiveVerification();
 		appLifecycle.tick();
+		// v1.4.7 光影兼容：刷新一帧补偿系数（内部对 Iris API 探测 2s 节流，
+		// settings 为 null/未装 Iris 恒恒等，零成本）。渲染侧读 current() 无锁。
+		dev.evvie.waylandcraft.render.ShaderCompatPolicy.refresh(
+			settings != null ? settings.getShaderCompat() : "auto");
 		checkKeybinds(minecraft);
 	}
 	

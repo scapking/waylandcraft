@@ -5,6 +5,7 @@ import java.util.ArrayList;
 import java.util.OptionalInt;
 
 import org.joml.Matrix4fc;
+import org.joml.Vector4f;
 
 import com.mojang.blaze3d.buffers.GpuBuffer;
 import com.mojang.blaze3d.buffers.GpuBufferSlice;
@@ -170,8 +171,13 @@ public class WindowFramebuffer {
 		}
 		
 		ensureUniformStorage();
-		GpuBufferSlice alphaUniforms = uniformStorage.writeUniform(new WindowInfoUniform(poseStack.last().pose(), true));
-		GpuBufferSlice opaqueUniforms = uniformStorage.writeUniform(new WindowInfoUniform(poseStack.last().pose(), false));
+		// v1.4.7 光影兼容：离屏合成是本 mod 唯一可控的颜色出口（世界层提交后
+		// 的 tonemap/色彩处理发生在其上游/下游，我们改不了），因此把**预补偿**
+		// 烘进窗口纹理：shader 压暗一点、我们提前亮一点。参数数据驱动
+		// （ShaderCompatPolicy 按光影包名匹配，新光影=加一行表，不动代码路径）。
+		float[] compat = ShaderCompatPolicy.current();
+		GpuBufferSlice alphaUniforms = uniformStorage.writeUniform(new WindowInfoUniform(poseStack.last().pose(), true, compat));
+		GpuBufferSlice opaqueUniforms = uniformStorage.writeUniform(new WindowInfoUniform(poseStack.last().pose(), false, compat));
 		
 		try {
 			try(RenderPass pass = RenderSystem.getDevice().createCommandEncoder().createRenderPass(() -> "window framebuffer", tempTarget.getColorTextureView(), OptionalInt.of(0x00000000))) {
@@ -363,13 +369,17 @@ public class WindowFramebuffer {
 		
 	}
 	
-	private static record WindowInfoUniform(Matrix4fc mat, boolean alpha) implements DynamicUniform {
+	// compat = 光影预补偿系数 (brightness, saturation, contrast, gamma)，
+	// 由 ShaderCompatPolicy 数据表给出；恒等 (1,1,1,1) = 不干预（非光影模式默认）。
+	// std140: mat4(64) + float(16 对齐槽) + vec4(16) = 96。
+	private static record WindowInfoUniform(Matrix4fc mat, boolean alpha, float[] compat) implements DynamicUniform {
 		
-		public static final int SIZE = new Std140SizeCalculator().putMat4f().putFloat().get();
+		public static final int SIZE = new Std140SizeCalculator().putMat4f().putFloat().putVec4().get();
 		
 		@Override
 		public void write(ByteBuffer byteBuffer) {
-			Std140Builder.intoBuffer(byteBuffer).putMat4f(mat).putFloat(alpha ? 0.0f : 1.0f);
+			Std140Builder.intoBuffer(byteBuffer).putMat4f(mat).putFloat(alpha ? 0.0f : 1.0f)
+					.putVec4(new Vector4f(compat[0], compat[1], compat[2], compat[3]));
 		}
 		
 	}

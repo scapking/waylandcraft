@@ -93,6 +93,14 @@ public class WaylandCraftSettings {
 	 * 只在用户显式选择时生效，默认 auto 绝不自动启用）。
 	 */
 	String localItems = "auto";
+
+	/* ---- v1.4.7 光影兼容 ---- */
+	/**
+	 * 窗口光影预补偿档：auto|off。auto=检测到光影包启用时按包名 profile
+	 * 对窗口纹理做轻度亮度/饱和/对比/gamma 预补偿（对抗 composite tonemap
+	 * 的发灰压暗）；off=完全不干预。见 render.ShaderCompatPolicy。
+	 */
+	String shaderCompat = "auto";
 	/**
 	 * 按服务器记忆显示档：serverKey → auto|items|display。
 	 * 用户在可信服选一次 items 后该服默认（/wl localitems 在世界内设置时写入）。
@@ -142,6 +150,7 @@ public class WaylandCraftSettings {
 	public static final String IME_SOURCE = "imeSource";
 	public static final String VERBOSE_LOGGING = "verboseLogging";
 	public static final String LOCAL_ITEMS = "localItems";
+	public static final String SHADER_COMPAT = "shaderCompat";
 	
 	/* This is where the getters go */
 	
@@ -251,6 +260,10 @@ public class WaylandCraftSettings {
 
 	public String getLocalItems() {
 		return localItems;
+	}
+
+	public String getShaderCompat() {
+		return shaderCompat;
 	}
 
 	// 以下三个容器字段由 WindowPlacementMemory 纯函数读写（编码/键派生规则见该类），

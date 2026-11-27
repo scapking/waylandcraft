@@ -42,4 +42,52 @@ public final class IrisCompat {
 		return IRIS_LOADED;
 	}
 	
+	// ── v1.4.7 运行时探测（ShaderCompatPolicy 用）──────────────────────
+	// Iris 官方 API（net.irisshaders.iris.api.v0.IrisApi）：
+	//   isShaderPackInUse() / getCurrentShaderPackName()。
+	// 用反射避免对 iris 的编译期依赖（viewer jar 三端通用），并 2s 节流缓存
+	// （tick 热路径零反射开销）。API 缺失/异常一律保守回退（未启用/无名字），
+	// 最坏结果=不补偿或走 GENERIC 档，不会崩。
+	
+	private static volatile long probeAt = 0;
+	private static volatile boolean packInUse = false;
+	private static volatile String packName = null;
+	
+	private static final long PROBE_INTERVAL_MS = 2000;
+	
+	public static boolean isShaderPackInUse() {
+		probeIfNeeded();
+		return packInUse;
+	}
+	
+	/** 当前光影包名（含 zip 后缀的显示名），未知/未启用返回 null。 */
+	public static @org.jetbrains.annotations.Nullable String shaderPackName() {
+		probeIfNeeded();
+		return packName;
+	}
+	
+	private static void probeIfNeeded() {
+		if(!IRIS_LOADED) return;
+		long now = System.currentTimeMillis();
+		if(now - probeAt < PROBE_INTERVAL_MS) return;
+		probeAt = now;
+		try {
+			Class<?> apiCls = Class.forName("net.irisshaders.iris.api.v0.IrisApi");
+			Object api = apiCls.getMethod("getInstance").invoke(null);
+			Object inUse = apiCls.getMethod("isShaderPackInUse").invoke(api);
+			packInUse = inUse instanceof Boolean b && b;
+			String name = null;
+			try {
+				Object n = apiCls.getMethod("getCurrentShaderPackName").invoke(api);
+				name = n instanceof String s && !s.isEmpty() ? s : null;
+			} catch(NoSuchMethodException ignored) {
+				// 老版 Iris 无此方法：只有开关，无包名 → GENERIC 档
+			}
+			packName = name;
+		} catch(Throwable t) {
+			packInUse = false;
+			packName = null;
+		}
+	}
+	
 }

@@ -1681,6 +1681,26 @@ public class WaylandCraftBridge {
 	private static native byte[] portalCaptureFrame(long instance);
 	private static native void portalCaptureStop(long instance);
 	
+	// v1.4.7 P0 修复（用户日志：大量 "get_or_create_surface 失败:
+	// NoSuchMethod(...macCaptureList...)"）：1.4.0 跨平台捕获批在 Rust
+	// bind_java_type 注册表登记了 macCapture*/winCapture* 共 11 个方法，
+	// 但 Java 侧 native 声明一个都没加——JNI 类方法表解析被缺失条目污染，
+	// 报错串位到 get_or_create_surface 等核心调用上，**surface 树创建从
+	// 1.4.0 起持续失败**（这也正是鼠标命中链/自适应光标问题的上游病根，
+	// 之前被 System.err 遮蔽不可见）。声明必须与注册表 name/sig 逐一对应；
+	// 非对应平台的运行调用由 Java 接线层的 OS 门把守（这里只为方法表存在）。
+	private static native String[] macCaptureList(long instance);
+	private static native String[] macCaptureDisplays(long instance);
+	private static native byte[] macCaptureStartWindow(long instance, int windowId);
+	private static native byte[] macCaptureStartDisplay(long instance, int index);
+	private static native byte[] macCaptureFrame(long instance, long sinceSeq);
+	private static native void macCaptureStop(long instance);
+	private static native String winCaptureTargets(long instance);
+	private static native byte[] winCaptureStartWindow(long instance, long hwnd);
+	private static native byte[] winCaptureStartMonitor(long instance, int index);
+	private static native byte[] winCaptureFrame(long instance);
+	private static native String winCaptureStop(long instance);
+	
 	/** 启动 Portal 捕获会话（会弹出确认对话框） */
 	public byte[] portalCaptureStart() { return portalCaptureStart(this.instance); }
 	/** 获取当前帧: [width(4), height(4), rgba...] */

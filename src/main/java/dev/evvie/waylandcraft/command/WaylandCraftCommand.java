@@ -1385,6 +1385,7 @@ public class WaylandCraftCommand {
 		source.sendFeedback(Component.literal(" §emoveStep§7 = §e" + wlc.settingsManager.getDoubleSetting(WaylandCraftSettings.MOVE_STEP) + "§r  §8(double, 手动 Ctrl+方向键平移步长格)§r"));
 		// v0.14 嵌套输入法守护进程
 		source.sendFeedback(Component.literal(" §eimeNested§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.IME_NESTED) + "§r  §8(auto|on|off, 嵌套 WAYLAND_DISPLAY 上拉起独立 fcitx5/ibus；/wl ime nested status 看裁决)§r"));
+		source.sendFeedback(Component.literal(" §eshaderCompat§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.SHADER_COMPAT) + "§r  §8(auto|off, 光影激活时窗口纹理预补偿抗发灰压暗；当前光影: " + (dev.evvie.waylandcraft.render.IrisCompat.shaderPackName() != null ? dev.evvie.waylandcraft.render.IrisCompat.shaderPackName() : "无") + ")§r"));
 		source.sendFeedback(Component.literal(" §eimeSource§7 = §e" + wlc.settingsManager.getStringSetting(WaylandCraftSettings.IME_SOURCE) + "§r  §8(auto|fcitx5|builtin, 内置拼音引擎来源档；/wl ime source <mode> 即时切档)§r"));
 		source.sendFeedback(Component.literal(" §everboseLogging§7 = §e" + wlc.settingsManager.getBooleanSetting(WaylandCraftSettings.VERBOSE_LOGGING)
 				+ "§r  §8(bool, 详细日志开关；默认=开发环境开。发布档只留启动摘要/WARN-ERROR/IME 里程碑/共享 start-stop；-Dwc.verbose 可覆盖。分级表 docs/LOGGING.md)§r"));
@@ -1458,6 +1459,24 @@ public class WaylandCraftCommand {
 							? "（-Dwc.verbose 系统属性覆盖中，settings 已保存但生效档不变）"
 							: "（即时生效，已同步 Rust）";
 					source.sendFeedback(Component.literal("§a✔ §everboseLogging§r = §e" + b + "§r  §8" + note + "§r"));
+					return 1;
+				}
+				// v1.4.7 光影兼容档：auto=检测到光影包时按包 profile 预补偿
+				// 窗口纹理（抗 tonemap 压暗/发灰）；off=完全不干预。
+				case "shaderCompat" -> {
+					String v = value.toLowerCase();
+					if(!v.equals("auto") && !v.equals("off")) {
+						source.sendError(Component.literal("§c✘ shaderCompat 只能是 auto|off（当前: " + value + "）§r"));
+						return 0;
+					}
+					wlc.settingsManager.setStringSetting(WaylandCraftSettings.SHADER_COMPAT, v);
+					dev.evvie.waylandcraft.render.ShaderCompatPolicy.refresh(v);
+					String pack = dev.evvie.waylandcraft.render.IrisCompat.shaderPackName();
+					source.sendFeedback(Component.literal("§a✔ §eshaderCompat§r = §e" + v + "§r  §8(" +
+							(v.equals("off") ? "已关闭，窗口纹理零改动"
+									: dev.evvie.waylandcraft.render.IrisCompat.isShaderPackInUse()
+										? "光影激活" + (pack != null ? "，当前包: " + pack : "") + "，补偿已生效"
+										: "未检测到激活的光影包，暂为恒等") + ")§r"));
 					return 1;
 				}
 				case "imeNested", "nestedIme" -> {
