@@ -1,5 +1,11 @@
 package dev.evvie.waylandcraft.immerse;
 
+import java.util.concurrent.ThreadLocalRandom;
+
+import com.mojang.blaze3d.pipeline.BlendFunction;
+import com.mojang.blaze3d.pipeline.ColorTargetState;
+import com.mojang.blaze3d.platform.DestFactor;
+import com.mojang.blaze3d.platform.SourceFactor;
 import com.mojang.blaze3d.pipeline.DepthStencilState;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
@@ -9,24 +15,28 @@ import com.mojang.blaze3d.vertex.VertexFormat;
 
 import dev.evvie.waylandcraft.WaylandCraftCommon;
 import net.minecraft.client.renderer.RenderPipelines;
-import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.client.renderer.rendertype.RenderSetup;
 import net.minecraft.client.renderer.rendertype.RenderType;
+import net.minecraft.client.renderer.SubmitNodeCollector;
 import net.minecraft.resources.Identifier;
+import net.minecraft.world.phys.Vec3;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelRenderContext;
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
 
 /**
- * ⑩ v1.5.0 沉浸模式星空穹顶渲染器。
+ * ⑩ v1.5.1 沉浸模式星空渲染器（双层结构，与用户验收的 HTML 预览 v3.2 同源）：
  *
- * 结构（沿用本项目 1.4.x 渲染基建的既有范式）：
- * - 管线：POSITION_TEX + QUADS、无纹理无自定义 uniform——时间经 UV0.x 传入
- *   fragment（submit 路径没有 setUniform 时机，顶点属性是零依赖通道）；
- * - 几何：相机为中心的**立方壳**（6 面 ×4 顶点），COLLECT_SUBMITS 的 poseStack
- *   基准就是相机原点（WindowDisplay.render 同款 ctx），顶点位置即方向向量×半径，
- *   fragment normalize 后全向采样——任意朝向都是星空；
- * - 提交：WaylandCraft.renderWorld 开头调用（先于窗口提交 → 穹顶在底），
- *   深度近于天空盒（覆盖 vanilla 天空）、远于窗口（窗口自然覆盖穹顶）；
- * - 关闭时零开销：isVisualActive() 一次 volatile 读。
+ * 1. 远景天球（sky.vsh/fsh）：相机为中心的立方壳，方向场——银河（动态自转+尘埃
+ *    流动）、星云、月亮、双远景恒星、黑洞吸积盘。方向场对位置无感 = 无限远，
+ *    玩家移动时远景不动是物理正确的。
+ * 2. 近星星点层（star.vsh/fsh）：**世界固定的 3D 星域**（以进入沉浸时的锚点为
+ *    中心，半径 30..260 球壳体积；相对相机坐标按周期 520 折返 = 朝任何方向飞都
+ *    有真实视差且永无边界）。星点为屏幕对齐 billboard（右/上取相机 orientation），
+ *    加色混合，柔核+微辉+亮度驱动衍射尖峰。
+ *
+ * 提交：COLLECT_SUBMITS 里先于窗口提交（穹顶在底、星点其次、窗口最上）。
+ * 关闭时零开销：一次 volatile 读。
  */
 public final class ImmerseSkyRenderer {
 	
@@ -34,6 +44,10 @@ public final class ImmerseSkyRenderer {
 	
 	/** 立方壳半径（格）：远于一切窗口交互距离，近于 vanilla 天空盒深度 */
 	private static final float SKY_RADIUS = 150.0f;
+	/** 星域周期（格）：相对相机坐标按此折叠（无限环绕折返） */
+	private static final float STAR_PERIOD = 520.0f;
+	private static final int STAR_COUNT = 1400;
+	private static final int BRIGHT_STAR_COUNT = 40;
 	
 	public static final RenderPipeline SKY_PIPELINE = RenderPipelines.register(
 		RenderPipeline.builder()
@@ -46,34 +60,100 @@ public final class ImmerseSkyRenderer {
 		.build()
 	);
 	
-	/** RenderType = 管线 + 无纹理绑定（星空全程序化，fragment 不采样） */
+	public static final RenderPipeline STAR_PIPELINE = RenderPipelines.register(
+		RenderPipeline.builder()
+		.withLocation(Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "pipeline/immerse_star"))
+		.withVertexShader(Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "immerse/star"))
+		.withFragmentShader(Identifier.fromNamespaceAndPath(WaylandCraftCommon.MOD_ID, "immerse/star"))
+		.withVertexFormat(DefaultVertexFormat.POSITION_TEX_COLOR, VertexFormat.Mode.QUADS)
+		.withDepthStencilState(DepthStencilState.DEFAULT)
+		.withColorTargetState(new ColorTargetState(
+			new BlendFunction(
+				SourceFactor.ONE,
+				DestFactor.ONE)))
+		.withCull(false)
+		.build()
+	);
+	
 	private static final class SkyTypeHolder {
 		static final RenderType INSTANCE = RenderType.create("immerse_sky",
 			RenderSetup.builder(SKY_PIPELINE).createRenderSetup());
+		static final RenderType STAR_INSTANCE = RenderType.create("immerse_star",
+			RenderSetup.builder(STAR_PIPELINE).createRenderSetup());
 	}
 	
 	private static RenderType skyRenderType() {
 		return SkyTypeHolder.INSTANCE;
 	}
 	
+	private static RenderType starRenderType() {
+		return SkyTypeHolder.STAR_INSTANCE;
+	}
+	
+	// ===== 近星星域（世界固定；锚点变更时重新生成） =====
+	/** 每星 8 float：世界 x/y/z、尺寸（格）、tint r/g/b、亮度（尖峰强度） */
+	private static float[] starField = null;
+	private static double anchorX, anchorY, anchorZ;
+	
 	/**
-	 * COLLECT_SUBMITS 入口（WaylandCraft.renderWorld 开头调用，渲染线程）。
+	 * 以锚点为中心重新生成星域（进入沉浸/锚点变更时由 ImmerseManager 调用，
+	 * 任意线程——只写不可变数组后换引用）。
+	 */
+	public static void regenerateStarField(double ax, double ay, double az) {
+		anchorX = ax;
+		anchorY = ay;
+		anchorZ = az;
+		ThreadLocalRandom rnd = ThreadLocalRandom.current();
+		float[] field = new float[(STAR_COUNT + BRIGHT_STAR_COUNT) * 8];
+		int f = 0;
+		for(int i = 0; i < STAR_COUNT + BRIGHT_STAR_COUNT; i++) {
+			boolean bright = i >= STAR_COUNT;
+			double th = rnd.nextDouble() * Math.PI * 2;
+			double ph = Math.acos(2 * rnd.nextDouble() - 1);
+			double rr = bright ? 40 + rnd.nextDouble() * 180 : 30 + Math.pow(rnd.nextDouble(), 0.6) * 230;
+			float x = (float)(ax + rr * Math.sin(ph) * Math.cos(th));
+			float y = (float)(ay + rr * Math.cos(ph));
+			float z = (float)(az + rr * Math.sin(ph) * Math.sin(th));
+			float size = bright ? (float)(0.5 + rnd.nextDouble() * 0.4) : (float)(0.12 + rnd.nextDouble() * 0.16);
+			float t = rnd.nextFloat();
+			float r, g, b;
+			if(t < 0.20f)      { r = 0.72f; g = 0.82f; b = 1.00f; }  // 蓝白
+			else if(t < 0.85f) { r = 0.93f; g = 0.95f; b = 1.00f; }  // 白
+			else               { r = 1.00f; g = 0.85f; b = 0.62f; }  // 金橙
+			float bright2 = bright ? 0.55f + rnd.nextFloat() * 0.45f : 0.10f + rnd.nextFloat() * 0.30f;
+			field[f++] = x; field[f++] = y; field[f++] = z;
+			field[f++] = size;
+			field[f++] = r; field[f++] = g; field[f++] = b;
+			field[f++] = bright2;
+		}
+		starField = field;
+	}
+	
+	/**
+	 * COLLECT_SUBMITS 入口（WaylandCraft.renderWorld 开头调用，渲染线程）：
+	 * 先穹顶、后星点（窗口在更后提交 → 最上层）。
 	 */
 	public static void renderSky(LevelRenderContext ctx) {
 		if(!ImmerseManager.isVisualActive()) return;
 		float timeSec = (System.currentTimeMillis() % 3_600_000L) / 1000.0f;
-		ctx.submitNodeCollector().submitCustomGeometry(ctx.poseStack(), skyRenderType(), new SkyInstance(timeSec));
+		SubmitNodeCollector collector = ctx.submitNodeCollector();
+		collector.submitCustomGeometry(ctx.poseStack(), skyRenderType(), new SkyInstance(timeSec));
+		Vec3 cam = ctx.levelState().cameraRenderState.pos;
+		Quaternionf rot = ctx.levelState().cameraRenderState.orientation;
+		if(cam != null && rot != null && starField != null) {
+			collector.submitCustomGeometry(ctx.poseStack(), starRenderType(),
+				new StarFieldInstance(starField, cam, rot, timeSec));
+		}
 	}
 	
 	/**
-	 * 穹顶几何实例：6 面立方壳。顶点位置 = 相机相对坐标，UV0.x = 时间（秒）。
+	 * 穹顶几何实例：6 面立方壳。顶点位置 = 相机相对世界坐标，UV0.x = 时间（秒）。
 	 */
 	public record SkyInstance(float timeSec) implements SubmitNodeCollector.CustomGeometryRenderer {
 		
 		@Override
 		public void render(Pose pose, VertexConsumer buffer) {
 			float r = SKY_RADIUS;
-			// 6 面立方壳（cull=false，绕序仅影响诊断）
 			quad(buffer, pose, timeSec, -r, -r,  r,  r, -r,  r,  r,  r,  r, -r,  r,  r);
 			quad(buffer, pose, timeSec,  r, -r, -r, -r, -r, -r, -r,  r, -r,  r,  r, -r);
 			quad(buffer, pose, timeSec,  r, -r,  r,  r, -r, -r,  r,  r, -r,  r,  r,  r);
@@ -89,6 +169,54 @@ public final class ImmerseSkyRenderer {
 			buffer.addVertex(pose, bx, by, bz).setUv(time, 0.0f);
 			buffer.addVertex(pose, cx, cy, cz).setUv(time, 0.0f);
 			buffer.addVertex(pose, dx, dy, dz).setUv(time, 0.0f);
+		}
+	}
+	
+	/**
+	 * 近星星点实例：每星一个屏幕对齐 billboard quad。
+	 * 相对相机坐标按 STAR_PERIOD 折返（无限星域）；右/上取相机 orientation
+	 * （世界空间 billboard —— 星点在世界中固定朝向不随滚转）。
+	 */
+	public record StarFieldInstance(float[] field, Vec3 camPos, Quaternionf orientation, float timeSec)
+			implements SubmitNodeCollector.CustomGeometryRenderer {
+		
+		@Override
+		public void render(Pose pose, VertexConsumer buffer) {
+			Vector3f right = new Vector3f(1, 0, 0).rotate(orientation);
+			Vector3f up = new Vector3f(0, 1, 0).rotate(orientation);
+			float halfPeriod = STAR_PERIOD * 0.5f;
+			for(int i = 0; i < field.length; i += 8) {
+				float relX = (float)(field[i] - camPos.x);
+				float relY = (float)(field[i + 1] - camPos.y);
+				float relZ = (float)(field[i + 2] - camPos.z);
+				// 无限环绕折返（对称 mod）：飞多远都有星，永无边界
+				relX = wrap(relX, halfPeriod);
+				relY = wrap(relY, halfPeriod);
+				relZ = wrap(relZ, halfPeriod);
+				float size = field[i + 3];
+				float rx = right.x * size, ry = right.y * size, rz = right.z * size;
+				float ux = up.x * size, uy = up.y * size, uz = up.z * size;
+				float r = field[i + 4], g = field[i + 5], b = field[i + 6];
+				float bright = field[i + 7];
+				// 世界相对坐标直接进 Position（该 poseStack 基准=相机原点，无旋转；
+				// MVP 由 ModelViewMat/ProjMat 在 vsh 完成）
+				addStar(buffer, pose, relX, relY, relZ, rx, ry, rz, ux, uy, uz, r, g, b, bright);
+			}
+		}
+		
+		private static float wrap(float v, float half) {
+			return ((v + half) % (half * 2) + half * 2) % (half * 2) - half;
+		}
+		
+		private static void addStar(VertexConsumer buffer, Pose pose,
+				float x, float y, float z, float rx, float ry, float rz,
+				float ux, float uy, float uz, float r, float g, float b, float bright) {
+			// 屏幕对齐 billboard：position(x,y,z) + corner(right,up) —— 但 poseStack 无旋转，
+			// 需要世界空间右/上 —— 直接以世界偏移叠加（经 ModelViewMat 旋转后即屏幕对齐）
+			buffer.addVertex(pose, x - rx - ux, y - ry - uy, z - rz - uz).setUv(0.0f, 0.0f).setColor(r, g, b, bright);
+			buffer.addVertex(pose, x + rx - ux, y + ry - uy, z + rz - uz).setUv(1.0f, 0.0f).setColor(r, g, b, bright);
+			buffer.addVertex(pose, x + rx + ux, y + ry + uy, z + rz + uz).setUv(1.0f, 1.0f).setColor(r, g, b, bright);
+			buffer.addVertex(pose, x - rx + ux, y - ry + uy, z - rz + uz).setUv(0.0f, 1.0f).setColor(r, g, b, bright);
 		}
 	}
 }

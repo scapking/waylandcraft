@@ -11,6 +11,7 @@ import net.fabricmc.api.Environment;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.minecraft.client.Minecraft;
+import net.minecraft.world.phys.Vec3;
 
 /**
  * ⑩ v1.5.0 沉浸模式客户端管理器（单例）。
@@ -94,6 +95,15 @@ public final class ImmerseManager {
 			syncMirror();
 			sendToggle(true, state.modeName());
 			if(!wasActive) {
+				// ⑩ v1.5.1 近星星域以"进入点"为世界锚点铺设（飞出边界自动环绕折返，
+				// 永有真实视差）；每次全新进入都重锚到当前玩家位置
+				Minecraft mc = Minecraft.getInstance();
+				if(mc != null && mc.player != null) {
+					Vec3 p = mc.player.getEyePosition();
+					ImmerseSkyRenderer.regenerateStarField(p.x, p.y, p.z);
+				} else {
+					ImmerseSkyRenderer.regenerateStarField(0, 64, 0);
+				}
 				if(!firstEnableLogged) {
 					firstEnableLogged = true;
 					LOGGER.info("Immerse first enable (mode={}) — awaiting server confirm (3s timeout → local-only)",
