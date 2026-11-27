@@ -1472,6 +1472,12 @@ public class WaylandCraft implements ClientModInitializer {
 
 		if(pointerCapture != null) {
 			if(action == 1 && !pointerCapture.pressedButtons.contains(button)) {
+				// v1.4.5：button 自足——按下前强制 refocus 当前虚拟光标位。
+				// button 只在 pointer 已有焦点时才发出（seat.rs），而 enter 靠
+				// hover 轮询建立；任何一次 hover 中断（切屏/树重建）都会让
+				// 随后的点击静默丢弃（用户症状"点击几乎不可用"）。重发
+				// motion_refocus 使 enter→frame→button 永远成序。
+				bridge.sendMotionRefocus(pointerCapture.surface, pointerCapture.x, pointerCapture.y);
 				bridge.sendButton(0x110 + button, 1);
 				pointerCapture.pressedButtons.add(button);
 			}
@@ -1529,6 +1535,13 @@ public class WaylandCraft implements ClientModInitializer {
 		if(action == 1) {
 			// Start new implicit grab when conditions are met
 			if(!pointerGrabs.isImplicitActive() && hoveredDisplay != null && hoveredDisplay.dist >= 0) {
+				// v1.4.5：按下前强制 enter（同 pointerCapture 分支的理由）——
+				// button 只在 pointer 有焦点时才发，enter 依赖上一 tick 的
+				// hover；树重建/hover 中断后的第一次点击最易整颗丢失。
+				if(hoveredDisplay.surface != null && hoveredDisplay.surfaceLocalRelative != null) {
+					bridge.sendMotionRefocus(hoveredDisplay.surface,
+							hoveredDisplay.surfaceLocalRelative.x, hoveredDisplay.surfaceLocalRelative.y);
+				}
 				pointerGrabs.startImplicit(hoveredDisplay);
 				WLCAbstractWindow window = hoveredDisplay.target.window;
 				if(window instanceof WLCToplevel) bridge.focusSurface((WLCToplevel) window);

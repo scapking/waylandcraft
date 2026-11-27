@@ -482,6 +482,39 @@ fn popup_with_frame(f: &mut PopupFixture, w: i32, h: i32, seed: u8) -> (wl_surfa
 
 // ═══════════════════════════ 场景测试（Phase 1）═══════════════════════════
 
+/// v1.4.5 红线（用户实测"窗口键盘可用但模拟鼠标几乎不可用"）：
+/// pointer_motion_focus 必须把 enter(+frame)+motion(+frame) 送达同 client
+/// 的已绑定 wl_pointer——这是 button 能被应用接受的前提（button 只在
+/// pointer 有 focus 时发出）。链路任何一环静默丢失都会复现该症状。
+#[test]
+fn pointer_motion_focus_delivers_enter_and_motion() {
+    use wayland_client::Proxy;
+    let mut f = setup_popup();
+    let qh = f.ime.qh();
+    // ime 客户端自己的 surface（与其 pointer 同 client，enter 合法）
+    let csurface = f.ime.state.compositor.as_ref().unwrap().create_surface(&qh, ());
+    csurface.commit();
+    assert!(f.drive());
+    let proto = csurface.id().protocol_id();
+    let srv_surface = f
+        .ime_client
+        .object_from_protocol_id::<
+            smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        >(&f.display.handle(), proto)
+        .expect("服务端可见该 surface");
+
+    f.server.seat.pointer_motion_focus(Some(&srv_surface), 12.0, 7.0);
+    assert!(f.drive());
+    assert!(f.drive());
+
+    let evs = &f.ime.state.ptr_events;
+    let enter_at = evs.iter().position(|e| e == "enter").expect("必须送达 enter");
+    let motion_at = evs.iter().position(|e| e == "motion").expect("必须送达 motion");
+    assert!(enter_at < motion_at, "enter 必须先于 motion: {evs:?}");
+    // wl_pointer v5+：enter/motion 各自必须带 frame 定界（Chromium 依赖）
+    assert!(evs.iter().filter(|e| *e == "frame").count() >= 2, "enter/motion 后都要有 frame: {evs:?}");
+}
+
 /// v1.4.4 协议保命线红线（用户实测病灶：launch 应用后"第一帧即永久冻结、
 /// mapped:0、物品无图标"——报文实证 Chrome 已 attach+commit 但
 /// wl_surface.frame 回调零 done，Chromium dmabuf 池 2-3 槽饿死）：

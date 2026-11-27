@@ -36,7 +36,7 @@ use smithay::{
     },
     utils::SealedFile,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::ops::DerefMut;
 use std::os::fd::AsFd;
@@ -73,6 +73,8 @@ pub struct WLCSeatState {
     pub cursor_shape: Option<u32>,
     /// 诊断：kb_active 但所有 keyboard 都无 focus 时只 warn 一次，避免刷屏
     pub no_focus_warned: std::cell::Cell<bool>,
+    /// v1.4.5：pointer 注入链诊断的按标签节流表（2s/条，写 kb.log）。
+    pub pointer_diag_last: std::cell::RefCell<HashMap<&'static str, std::time::Instant>>,
 }
 
 pub struct WLCPointerData {
@@ -230,7 +232,24 @@ impl WLCSeatState {
             xkb_state,
             cursor_shape: None,
             no_focus_warned: std::cell::Cell::new(false),
+            pointer_diag_last: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    /// v1.4.5：pointer 注入诊断按标签节流（2 秒/条）写 kb.log——
+    /// enter/leave/button 的静默丢弃路径必须可见（本轮排查"鼠标不可用"
+    /// 的最大障碍就是零线索；纪律对齐 v1.4.4 Fix D）。
+    pub(crate) fn diag_throttle(&self, tag: &'static str, f: impl FnOnce()) {
+        let now = std::time::Instant::now();
+        let mut map = self.pointer_diag_last.borrow_mut();
+        if let Some(last) = map.get(tag) {
+            if now.duration_since(*last).as_secs() < 2 {
+                return;
+            }
+        }
+        map.insert(tag, now);
+        drop(map);
+        f();
     }
 
     pub fn create_globals(&self, disp: &DisplayHandle) {
@@ -281,16 +300,32 @@ impl WLCSeatState {
             None => return,
         };
 
+        // v1.4.5（用户实测"窗口键盘可用但模拟鼠标几乎不可用"）：enter 的两个
+        // 静默丢弃路径（无 pointer 绑定 / surface 与 pointer 不同 client）过去
+        // 在用户日志和协议报文里都零线索。现在 2s 节流写 waylandcraft-kb.log。
+        // 同时把 assert_eq! 换成显式 leave 兜底——JNI 边界 panic 会打断本帧全部
+        // 事件处理（v1.4.4 frame 修复同纪律：协议路径永不 panic）。
+        let client = surface.client();
+        let mut entered = 0usize;
+        let mut mismatch = 0usize;
+
         // Generate pointer enter events
         self.for_all_pointers(|pointer, data| {
             // Already correct focus
             if self.pointer_focus_eq(data, surface) {
+                entered += 1;
                 return;
             }
-            assert_eq!(data.focus, None);
+            if let Some(old) = data.focus.take() {
+                pointer.leave(serial, &old);
+                self.pointer_frame(pointer);
+                data.last_enter = None;
+                data.last_motion = None;
+            }
 
             // Client does not own surface
-            if surface.client() != pointer.client() {
+            if client.is_none() || pointer.client() != client {
+                mismatch += 1;
                 return;
             }
 
@@ -299,7 +334,31 @@ impl WLCSeatState {
             data.focus = Some(surface.clone());
             data.last_enter = Some(serial);
             data.last_motion = None;
+            entered += 1;
         });
+
+        if self.pointers.is_empty() {
+            self.diag_throttle("ptr:no_pointers", || {
+                kb_log!("[kb-debug] pointer_focus: 该客户端未绑定 wl_pointer —— enter/motion/button 无处可发 (NO_POINTERS)");
+            });
+        } else if entered == 0 && mismatch > 0 {
+            self.diag_throttle("ptr:mismatch", || {
+                kb_log!(
+                    "[kb-debug] pointer_focus: surface(client {:?}) 与全部 {} 个已绑定 pointer 不同 client —— enter 被跳 (CLIENT_MISMATCH)",
+                    client.as_ref().map(|c| c.id()),
+                    mismatch
+                );
+            });
+        } else if entered > 0 {
+            self.diag_throttle("ptr:enter", || {
+                kb_log!(
+                    "[kb-debug] pointer_focus: enter ok client={:?} pointers={} entered={}（2s 节流）",
+                    client.as_ref().map(|c| c.id()),
+                    self.pointers.len(),
+                    entered
+                );
+            });
+        }
     }
 
     // Focus the pointer on the given surface and register movement
@@ -362,14 +421,31 @@ impl WLCSeatState {
 
     pub fn pointer_button(&mut self, button: u32, state: ButtonState) -> u32 {
         let serial = new_serial();
+        let mut sent = 0usize;
+        let mut idle = 0usize;
         self.for_all_pointers(|pointer, data| {
             if data.focus.is_none() {
+                idle += 1;
                 return;
             }
 
             pointer.button(serial, get_time(), button, state);
             self.pointer_frame(pointer);
+            sent += 1;
         });
+        // v1.4.5 诊断：button 无焦点即被丢 = "点击没反应"的直接形态。
+        // 根因几乎总是 enter 从未成功（见 pointer_focus 的 NO_POINTERS/
+        // CLIENT_MISMATCH 行），这里只补果侧的可见性。
+        if sent == 0 && idle > 0 {
+            self.diag_throttle("ptr:button_drop", || {
+                kb_log!(
+                    "[kb-debug] pointer_button({} {}): {} 个 pointer 全部无焦点 —— button 被丢（先查 pointer_focus 行）",
+                    button,
+                    if state == ButtonState::Pressed { "press" } else { "release" },
+                    idle
+                );
+            });
+        }
         serial
     }
 

@@ -1918,6 +1918,19 @@ fn pointer_motion_focus<'local>(
 ) -> Result<(), BridgeError> {
     let instance = jptr_to_instance!(instance, "pointerMotionFocus")?;
     let surface = jptr_to_ref(surface_handle);
+    // v1.4.5 诊断：Java 递来的 surface 句柄在 native 已不存在时（树与 native
+    // 脱同步），此调用等价于 pointer_leave——过去完全静默，正是"鼠标不可用"
+    // 零线索的果侧之一。节流 2s 写 kb.log。
+    if surface.is_none() && surface_handle != 0 {
+        instance.state.seat.diag_throttle("ptr:dead_handle", || {
+            let msg = format!(
+                "[kb-debug] pointer_motion_focus: surface_handle={} 在 native 已不存在（Java 树脱同步，等效 leave）",
+                surface_handle
+            );
+            kb_log_write(&msg);
+            eprintln!("{msg}");
+        });
+    }
     instance.state.seat.pointer_motion_focus(surface, x, y);
 
     Ok(())
