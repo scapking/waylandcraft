@@ -608,8 +608,23 @@ public class WindowLayoutManager {
 		}
 
 		layerSizes.addAll(sizes);
+		// ⑨ v1.5.0 修复"向上堆叠时窗口重叠"：上面 sizes/maxHeights 按 **layoutAltIndex
+		// 序号** 分层，而 applyLayerHeights 按 **list 顺序** 连续切层。窗口关闭后序号
+		// 保留（空洞），新窗口复用低序号追加在 list 尾部 → list（创建序）≠ 序号序，
+		// 两者错位 = 层错乱（高层的窗被放进低层中心线）→ 垂直重叠。排序对齐后再切层：
+		// 稳定排序只调整交给 applyLayerHeights 的副本顺序（层内保持序号序，与水平
+		// 摆位循环同口径），调用方的 displays 顺序不受影响。
+		List<WindowDisplay> ordered = new ArrayList<>(list);
+		final int fs = layerSize;
+		ordered.sort(java.util.Comparator.comparingInt(d -> cubeLayerOf(d.layoutAltIndex, fs)));
 		// 第一层窗口中心 = 眼睛高度（center.y = /wl layout init 存的 y + 1.62）
-		applyLayerHeights(list, sizes, maxHeights, center.y, stackSpacing);
+		applyLayerHeights(ordered, sizes, maxHeights, center.y, stackSpacing);
+	}
+	
+	/** ⑨ 纯函数（可单测）：cube 模板交替序号 → 层号（负序号钳 0，与水平摆位/分组循环同口径） */
+	static int cubeLayerOf(int layoutAltIndex, int layerSize) {
+		int si = layoutAltIndex < 0 ? 0 : layoutAltIndex;
+		return si / layerSize;
 	}
 
 	// ==================== sphere 圆球模板（VR） ====================
