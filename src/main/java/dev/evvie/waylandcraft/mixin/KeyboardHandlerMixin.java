@@ -65,6 +65,12 @@ public class KeyboardHandlerMixin {
 		// 第一步：xkb 状态先行（PRESS/RELEASE 才更新，REPEAT 不重复触发 Caps Lock 切换）
 		if((action == GLFW.GLFW_PRESS || action == GLFW.GLFW_RELEASE)
 				&& WaylandCraft.instance.bridge != null) {
+			// v1.4.6（大小写反转修复）：每键先用 GLFW 读到的**平台 Caps Lock
+			// 真值**校准 seat xkb 的 locked 位——用户在其他应用/聊天框切 caps
+			// 时我们不经过按键事件，locked 会与真实状态漂移，窗口里 en 模式
+			// 大小写整体反转。syncCapsLock 幂等（一致时零事件零开销）。
+			boolean capsOn = GLFW.glfwGetKey(windowHandle, GLFW.GLFW_KEY_CAPS_LOCK) == GLFW.GLFW_TRUE;
+			WaylandCraft.instance.bridge.syncCapsLock(capsOn);
 			WaylandCraft.instance.bridge.internalKeyUpdate(scancode, action == GLFW.GLFW_PRESS);
 		}
 		

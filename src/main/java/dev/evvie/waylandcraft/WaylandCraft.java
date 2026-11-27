@@ -171,6 +171,8 @@ public class WaylandCraft implements ClientModInitializer {
 	private double lastSharedMouseX = Double.NaN;
 	private double lastSharedMouseY = Double.NaN;
 	private long lastSharedMouseSend = 0;
+	/** v1.4.6：hover 全 miss 诊断行的 2s 节流时间戳。 */
+	private long lastHoverDiagMs = 0;
 
 	// v0.13.4：状态日志——一个文件包含所有子系统状态（覆盖式）
 	// 写入：每 STATUS_REFRESH_INTERVAL_MS 刷一次；初始化时立即刷一次。
@@ -1361,6 +1363,29 @@ public class WaylandCraft implements ClientModInitializer {
 				hoveredSharedY = finalSharedHit.y();
 			}
 		}
+
+		// v1.4.6 hover 诊断（用户反馈"点击还是 Minecraft 十字架"）：有窗口却
+		// 始终命中不了时，2s 节流打一行各 display 的命中要素——plane 是否相交、
+		// surface 链/尺寸、区域判定结果。第一因从"零线索"变成一行日志。
+		if(finalHitResult == null && !displays.isEmpty() && bridge != null) {
+			long now = System.currentTimeMillis();
+			if(now - lastHoverDiagMs >= 2000) {
+				lastHoverDiagMs = now;
+				StringBuilder sb = new StringBuilder();
+				int i = 0;
+				for(WindowDisplay d : displays) {
+					if(i++ >= 4) { sb.append(" +").append(displays.size() - 4).append(" more"); break; }
+					WLCAbstractWindow w = d.window;
+					WLCSurface root = w.getSurfaceTree();
+					sb.append('[').append(i).append(" geom=").append(w.geometry)
+							.append(" root=").append(root == null ? "null"
+									: (root.isAlive() ? "ok" : "DEAD") + "/" + root.width() + "x" + root.height())
+							.append(" last=").append(w.getSurfaceTreeLast() == null ? "null" : "chain")
+							.append(']');
+				}
+				WaylandCraftCommon.LOGGER.info("[wlcraft][hover-diag] displays={} misses: {}", displays.size(), sb);
+			}
+		}
 		
 		// Check for pointer grab and short-circuit if any
 		if(pointerGrabs.isGrabActive()) {
@@ -1647,7 +1672,19 @@ public class WaylandCraft implements ClientModInitializer {
 			pointerGrabs.onScroll(scrollX, scrollY);
 			return true;
 		}
-		
+
+		// v1.4.6（用户反馈"部分场景 app 无法滑动但可点击，过一会又自己恢复"）：
+		// axis 与 button 同款前提——pointer 有焦点才发；焦点被 hover 中断/leave
+		// 清掉后 scroll 静默丢弃，而点击路径 v1.4.5 已有 refocus 兜底所以"能点
+		// 不能滚"，下一次 hover/点击重建焦点后又"自己恢复"。此分支把 J 模式
+		// 的滚轮按最后虚拟光标位强制 refocus 后再发，滚动从此自足。
+		if(pointerCapture != null && pointerCapture.surface.isAlive()) {
+			bridge.sendMotionRefocus(pointerCapture.surface, pointerCapture.x, pointerCapture.y);
+			bridge.sendScroll(0, -scrollY);
+			bridge.sendScroll(1, -scrollX);
+			return true;
+		}
+
 		// 共享窗口"游戏模式"：滚轮发往绑定窗口（即使不 hover）
 		if(sharedPointerCapture != null) {
 			int data = ((int) Math.round(scrollX * 100) & 0xFFFF) | (((int) Math.round(scrollY * 100) & 0xFFFF) << 16);
@@ -1698,6 +1735,12 @@ public class WaylandCraft implements ClientModInitializer {
 		if(hoveredDisplay != null) {
 			if(hoveredDisplay.dist < 0) return true;
 			
+			// v1.4.6：滚动自足（与点击同款）——axis 需要 pointer focus，hover 曾
+			// 中断（leave 已发）时直接滚会静默丢；先按当前命中位 refocus 再发。
+			if(hoveredDisplay.surface != null && hoveredDisplay.surfaceLocalRelative != null) {
+				bridge.sendMotionRefocus(hoveredDisplay.surface,
+						hoveredDisplay.surfaceLocalRelative.x, hoveredDisplay.surfaceLocalRelative.y);
+			}
 			bridge.sendScroll(0, -scrollY);
 			bridge.sendScroll(1, -scrollX);
 			

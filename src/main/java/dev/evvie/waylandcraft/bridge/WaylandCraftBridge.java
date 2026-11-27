@@ -1007,6 +1007,12 @@ public class WaylandCraftBridge {
 		keyboardUpdate(instance, scancode, pressed);
 	}
 	
+	/** v1.4.6：把平台 Caps Lock 真值（glfwGetKey CAPS_LOCK）同步进 seat 的 xkb
+	 * locked 位并给已聚焦键盘重发 modifiers（大小写反转修复）。 */
+	public void syncCapsLock(boolean capsOn) {
+		syncCapsLock(instance, capsOn);
+	}
+	
 	/** 让 Rust 侧 [kb-debug] 日志同时写入指定文件（默认只进 stderr）。
 	 * bridge 初始化后立即调用，路径用 .minecraft/waylandcraft-kb.log，
 	 * 用户上传该文件即可定位 Rust 侧键盘链路。 */
@@ -1561,6 +1567,7 @@ public class WaylandCraftBridge {
 	
 	// Update internal key state
 	private static native void keyboardUpdate(long instance, int scancode, boolean pressed);
+	private static native void syncCapsLock(long instance, boolean capsOn);
 	
 	// Set Rust-side [kb-debug] log file path (eprintln also written to this file)
 	private static native void setKbLogFileNative(String path);

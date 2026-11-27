@@ -641,6 +641,36 @@ impl WLCSeatState {
         }
     }
 
+    /// v1.4.6（用户反馈"一些行为导致输入法 en 英文模式下大小写反转"）：
+    /// seat 的 xkb_state 只由流经我们的按键更新（mixin/keyboard_key）；用户在
+    /// **捕获关闭时/其他应用里**切换 Caps Lock（MC 的 GUI 场景、聊天框开合、
+    /// 桌面其它窗口）都会让宿主真实 caps 与本状态漂移，窗口收到的是过期的
+    /// locked 位 → en 模式大小写反转。修复=用 GLFW 读到的**平台真值**直接
+    /// 改写 xkb locked 位并给所有已聚焦键盘重发 modifiers（幂等：一致时零事件）。
+    pub fn keyboard_sync_caps(&mut self, caps_on: bool) {
+        // xkb MOD2 = Caps Lock（modmap 位 1）
+        const MOD2_CAPS: xkb::ModMask = 1 << 1;
+        let dep = self.xkb_state.serialize_mods(xkb::STATE_MODS_DEPRESSED);
+        let lat = self.xkb_state.serialize_mods(xkb::STATE_MODS_LATCHED);
+        let locked = self.xkb_state.serialize_mods(xkb::STATE_MODS_LOCKED);
+        let want = if caps_on { locked | MOD2_CAPS } else { locked & !MOD2_CAPS };
+        if want == locked {
+            return;
+        }
+        self.xkb_state.update_mask(dep, lat, want, 0, 0, 0);
+        kb_log!(
+            "[kb-debug] keyboard_sync_caps: locked {:#x} -> {:#x}（宿主真值校准，mods 已重发）",
+            locked,
+            want
+        );
+        let serial = new_serial();
+        self.for_all_keyboards(|keyboard, data| {
+            if data.focus.is_some() {
+                self.send_modifiers(keyboard, serial);
+            }
+        });
+    }
+
     pub fn keyboard_focus(&mut self, surface: WlSurface) {
         if !surface.is_alive() {
             kb_log!("[kb-debug] keyboard_focus: surface NOT ALIVE —— 焦点设置失败！");

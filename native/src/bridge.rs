@@ -737,6 +737,11 @@ bind_java_type! {
             sig = (instance: jlong, scancode: jint, pressed: jboolean),
             fn = keyboard_update,
         },
+        static extern fn sync_caps_lock {
+            sig = (instance: jlong, caps_on: jboolean),
+            name = "syncCapsLock",
+            fn = sync_caps_lock,
+        },
         static extern fn set_kb_log_file {
             sig = (path: JString),
             name = "setKbLogFileNative",
@@ -2268,6 +2273,20 @@ fn keyboard_update<'local>(
         .state
         .seat
         .keyboard_update_xkb(scancode as u32, pressed);
+    Ok(())
+}
+
+/// v1.4.6（大小写反转修复）：Java 每键读 GLFW 的平台 Caps Lock 真值进来，
+/// 校平 seat xkb 的 locked 位并给已聚焦键盘重发 modifiers——用户在其他
+/// 应用/聊天框里切 caps 造成的双端不同步，从"下一键自动对齐"起消失。
+fn sync_caps_lock<'local>(
+    _env: &mut Env<'local>,
+    _class: JClass<'local>,
+    instance: jlong,
+    caps_on: jboolean,
+) -> Result<(), BridgeError> {
+    let instance = jptr_to_instance!(instance, "syncCapsLock")?;
+    instance.state.seat.keyboard_sync_caps(caps_on);
     Ok(())
 }
 

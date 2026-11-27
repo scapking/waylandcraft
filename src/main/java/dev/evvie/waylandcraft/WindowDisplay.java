@@ -193,24 +193,46 @@ public class WindowDisplay {
 		
 		WLCSurface hitSurface = null;
 		Vec3 localCoordsRelative = null;
-		
-		for(WLCSurface surface = window.getSurfaceTreeLast(); surface != null; surface = surface.getPrevChild()) {
+
+		// v1.4.6（用户反馈"点击还是 Minecraft 十字架，不是自适应模拟鼠标"）：
+		// 命中测试从 updateSurfaceTree 返回的 lastChild 起沿 prevChild 回溯。
+		// 该链任何一次断裂/未建立（首帧、树重建、瞬时异常后的幂等重扫）都会让
+		// 循环体一次都不执行 → hitSurface 恒 null → enter/motion/button/scroll
+		// 全链路死——画面却照常显示（渲染走 root 直取），症状即"看得见点不着"。
+		// 兜底：链缺失时直接用 root surface 做命中（root 永远存在且合法）。
+		WLCSurface walk = window.getSurfaceTreeLast();
+		if(walk == null) walk = window.getSurfaceTree();
+
+		for(WLCSurface surface = walk; surface != null; surface = surface.getPrevChild()) {
 			Vec3 rel = localCoords.subtract(surface.xSubpos, surface.ySubpos, 0);
-			
+
 			int width = surface.width();
 			int height = surface.height();
-			
+
+			// 同理兜底：surface 尚无 buffer（首帧前/暴毙）时用窗口几何尺寸判命中，
+			// 不再静默拒绝一切点击。
+			if(width <= 0 || height <= 0) {
+				var wg = window.geometry;
+				if(wg != null && wg.width() > 0 && wg.height() > 0) {
+					width = wg.width();
+					height = wg.height();
+				}
+			}
+
 			if(rel.x < 0 || rel.y < 0 || rel.x > width || rel.y > height) {
 				continue;
 			}
-			
-			if(WaylandCraft.instance.bridge.inputRegionContains(surface, rel.x, rel.y)) {
+
+			// 输入区域检查仅在 native 句柄有效时有意义（句柄 0 恒 false 会掐死整窗）
+			boolean inRegion = !surface.isAlive()
+					|| WaylandCraft.instance.bridge.inputRegionContains(surface, rel.x, rel.y);
+			if(inRegion) {
 				hitSurface = surface;
 				localCoordsRelative = rel;
 				break;
 			}
 		}
-		
+
 		return new DisplayHitResult(this, hitSurface, hitPos, geometryLocal, localCoords, localCoordsRelative, dist);
 	}
 
