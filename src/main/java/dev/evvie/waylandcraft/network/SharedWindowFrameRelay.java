@@ -86,7 +86,7 @@ public class SharedWindowFrameRelay {
 	/** P1-2：慢观察者追踪（转发线程读写） */
 	private final SlowViewerTracker slowTracker = new SlowViewerTracker();
 
-	// ===== P3：累计统计（供 SharedWindowDebug 状态报告），跨会话在 clear() 归零 =====
+	// ===== overload-guard：累计统计（供 SharedWindowDebug 状态报告），跨会话在 clear() 归零 =====
 	private final AtomicLong totalFrames = new AtomicLong();
 	private final AtomicLong totalBytes = new AtomicLong();
 	private final AtomicLong totalSends = new AtomicLong();
@@ -95,6 +95,15 @@ public class SharedWindowFrameRelay {
 	private final AtomicLong droppedNoCapability = new AtomicLong();
 	private final AtomicLong skippedUnwritable = new AtomicLong();
 	private final AtomicLong slowViewerEvents = new AtomicLong();
+	private final AtomicLong skippedNotSubscribed = new AtomicLong();
+	private final AtomicLong skippedLoadLevel = new AtomicLong();
+	private final AtomicLong skippedOverLimit = new AtomicLong();
+	private final AtomicLong droppedMemoryGuard = new AtomicLong();
+
+	public SharedWindowFrameRelay() {
+		// 任务A-3：把视频缓存字节数注册进全局内存守卫（求和来源，无增量计数器）
+		RelayMemoryGuard.bindVideoSource(this::cachedFrameBytes);
+	}
 
 	/**
 	 * P2-1/P2-3：入口帧校验（纯函数，可单测）：
@@ -170,8 +179,32 @@ public class SharedWindowFrameRelay {
 			}
 			return false;
 		}
+		// 任务A-3：全局内存守卫（视频侧）——所有窗口最新帧缓存字节总和上限。
+		// 替换语义：现有总缓存 − 该窗口旧帧 + 新帧 ≤ 上限；超限拒收新帧（旧帧
+		// 保留 = 该窗口画面原地停留一拍），宁可不更新也不挤占其他窗口的缓冲预算。
+		// 弱一致：并发 accept 的求和基线可能略旧，守卫是背压上界而非精确配额。
+		SharedWindowImagePayload prev = latestFrames.get(payload.windowHandle());
+		long prevLen = prev == null ? 0 : prev.imageData().length;
+		if (!RelayMemoryGuard.videoAcceptAllowed(RelayMemoryGuard.totalBufferedBytes(), prevLen, dataLength)) {
+			droppedMemoryGuard.incrementAndGet();
+			if (ServerWarnThrottle.allow("frame-memory-guard:" + payload.windowHandle(), 5000)) {
+				WaylandCraftCommon.LOGGER.warn("[SERVER] frame dropped by global memory guard: handle=0x{} bytes={} buffered={}/{}",
+					Long.toHexString(payload.windowHandle()), dataLength,
+					RelayMemoryGuard.totalBufferedBytes(), RelayMemoryGuard.GLOBAL_BUFFER_BYTES_LIMIT);
+			}
+			return false;
+		}
 		latestFrames.put(payload.windowHandle(), payload);
 		return true;
+	}
+
+	/** 当前所有窗口最新帧缓存总字节（全局内存守卫的求和来源；O(窗口数)，只读 length） */
+	public long cachedFrameBytes() {
+		long total = 0;
+		for (SharedWindowImagePayload p : latestFrames.values()) {
+			total += p.imageData().length;
+		}
+		return total;
 	}
 
 	/** 窗口注销时立即清掉缓存帧（防旧帧泄露给下一个复用 handle 的窗口） */
@@ -211,6 +244,8 @@ public class SharedWindowFrameRelay {
 		Map<UUID, ServerPlayer> online = new HashMap<>();
 		for (ServerPlayer player : players) online.put(player.getUUID(), player);
 		slowTracker.retainOnly(online.keySet());
+		// 任务A-2：分级状态同步清理（订阅登记由 SharedWindowServerHandler tick 清理）
+		ViewerLoadController.retainOnly(online.keySet());
 
 		// 收集待转发帧（迭代器逐个 remove，不用 clear()：并发 put 的新帧不会被误删）
 		List<SharedWindowImagePayload> frames = new ArrayList<>();
@@ -258,6 +293,7 @@ public class SharedWindowFrameRelay {
 		// 批量转发给所有有 VIEW 权限且本轮 canSend 通过的在线玩家（跳过发送者本人）
 		int forwarded = 0;
 		long now = System.currentTimeMillis();
+		boolean overLimit = RelayMemoryGuard.isOverLimit();
 		for (ServerPlayer player : capable) {
 			UUID uuid = player.getUUID();
 			if (uuid.equals(senderUUID)) continue;
@@ -265,10 +301,14 @@ public class SharedWindowFrameRelay {
 			// 转发线程读 PermissionManager 的并发表（ConcurrentHashMap/volatile），无锁安全。
 			if (!manager.effectivePermission(entry, uuid, now).hasPermission(WindowPermission.VIEW)) continue;
 
-			// P1-2 背压：channel 不可写（发送队列超水位）跳帧，不让视频流拖垮连接/堆
+			// P1-2 背压 + 任务A-2 分级观测：可写性探测必须对所有 VIEW 观众执行
+			//（包括被订阅/分级门跳过的）——暂停中的观众也只有持续探测才能拿到
+			// 恢复证据，否则分级永远无法回落。
 			if (!RelaySinks.isChannelWritable(player)) {
 				skippedUnwritable.incrementAndGet();
-				if (slowTracker.observeUnwritable(uuid, now)) {
+				boolean slowEvent = slowTracker.observeUnwritable(uuid, now);
+				ViewerLoadController.observeUnwritable(uuid, now, slowEvent);
+				if (slowEvent) {
 					slowViewerEvents.incrementAndGet();
 					WaylandCraftCommon.LOGGER.info("[SERVER] slow viewer {} on window 0x{}: unwritable >1s, frames being skipped",
 						uuid, Long.toHexString(payload.windowHandle()));
@@ -276,6 +316,26 @@ public class SharedWindowFrameRelay {
 				continue;
 			}
 			slowTracker.observeWritable(uuid);
+			ViewerLoadController.observeWritable(uuid, now);
+
+			// 任务A-1：订阅上限——未登记交付的窗口不转发（列表广播为权威，fail-open）
+			if (!ViewerSubscriptions.isDelivered(uuid, payload.windowHandle())) {
+				skippedNotSubscribed.incrementAndGet();
+				continue;
+			}
+			// 任务A-2：分级推送（L1 减半 / L2 每秒 1 帧心跳 / L3 暂停，画面冻结，
+			// 缓存只存最新帧故恢复即追上最新画面）
+			if (!ViewerLoadController.trySendVideo(uuid, now)) {
+				skippedLoadLevel.incrementAndGet();
+				continue;
+			}
+			// 任务A-3：全局内存守卫联动——超限时先对已降级观众（level ≥ 1，优先级
+			// 最低）跳帧：他们的 channel 大概率本就不可写，危机时刻优先保全 L0
+			// 观众与 owner 链路；恢复 L0 后自动重新获得全量转发。
+			if (overLimit && ViewerLoadController.levelOf(uuid) > ViewerLoadController.LEVEL_NORMAL) {
+				skippedOverLimit.incrementAndGet();
+				continue;
+			}
 			ServerPlayNetworking.send(player, payload);
 			forwarded++;
 		}
@@ -322,6 +382,10 @@ public class SharedWindowFrameRelay {
 	public long getDroppedNoCapability() { return droppedNoCapability.get(); }
 	public long getSkippedUnwritable() { return skippedUnwritable.get(); }
 	public long getSlowViewerEvents() { return slowViewerEvents.get(); }
+	public long getSkippedNotSubscribed() { return skippedNotSubscribed.get(); }
+	public long getSkippedLoadLevel() { return skippedLoadLevel.get(); }
+	public long getSkippedOverLimit() { return skippedOverLimit.get(); }
+	public long getDroppedMemoryGuard() { return droppedMemoryGuard.get(); }
 
 	/** P2-5：SERVER_STOPPED 清缓存与统计，防止跨会话残留 */
 	public void clear() {
@@ -336,6 +400,10 @@ public class SharedWindowFrameRelay {
 		droppedNoCapability.set(0);
 		skippedUnwritable.set(0);
 		slowViewerEvents.set(0);
+		skippedNotSubscribed.set(0);
+		skippedLoadLevel.set(0);
+		skippedOverLimit.set(0);
+		droppedMemoryGuard.set(0);
 		synchronized (statsLock) {
 			statsFrames = 0; statsBytes = 0; statsReceivers = 0;
 			statsWindowStartMs = System.currentTimeMillis();

@@ -46,24 +46,22 @@ public class WaylandHudRenderer {
 	
 	private void extractAppListRenderState(GuiGraphicsExtractor context, DeltaTracker deltaTracker) {
 		Font font = Minecraft.getInstance().font;
-		int yoff = 30;
 		
+		// ⑨ v1.4.9：捕获提示移到左下角、常规小字号（用户裁定：不要超大横条，能看清即可）
 		if(WaylandCraft.instance.keyboardCaptureMode == KeyboardCaptureMode.CAPTURE) {
-			String text = "KEYBOARD CAPTURED [PRESS ESCAPE]";
-			drawWarningTag(context, font, text, yoff);
+			drawWarningTag(context, font, "KEYBOARD CAPTURED [ESC]");
 		}
 		else if(WaylandCraft.instance.keyboardCaptureMode == KeyboardCaptureMode.HARD_CAPTURE) {
-			String text = "KEYBOARD CAPTURED [PRESS ALT+Q]";
-			drawWarningTag(context, font, text, yoff);
+			drawWarningTag(context, font, "KEYBOARD CAPTURED [ALT+Q]");
 		}
 	}
 	
-	private void drawWarningTag(GuiGraphicsExtractor context, Font font, String text, int yoff) {
-		int x = context.guiWidth() - font.width(text) - 14;
-		// 危险提示条
-		context.fill(x - 8, yoff - 3, context.guiWidth() - 6, yoff + font.lineHeight + 3, WcColors.DANGER_DIM);
-		context.fill(x - 2, yoff - 3, x, yoff + font.lineHeight + 3, WcColors.DANGER);
-		context.text(font, text, x, yoff, WcColors.DANGER, true);
+	/** ⑨ 左下角紧凑提示条：单行常规字号，窄底色，不再横贯屏幕 */
+	private void drawWarningTag(GuiGraphicsExtractor context, Font font, String text) {
+		int x = 6;
+		int y = context.guiHeight() - font.lineHeight - 6;
+		context.fill(x - 4, y - 2, x + font.width(text) + 4, y + font.lineHeight + 2, WcColors.DANGER_DIM);
+		context.text(font, text, x, y, WcColors.DANGER, true);
 	}
 	
 	private void extractDNDIconRenderState(GuiGraphicsExtractor context, DeltaTracker tracker) {

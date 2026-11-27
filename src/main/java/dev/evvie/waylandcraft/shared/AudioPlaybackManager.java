@@ -71,6 +71,9 @@ public class AudioPlaybackManager {
 	private volatile long lateDroppedPackets = 0;
 	/** ⑧ OpenAL 连续失败计数（成功一次清零；达到阈值才永久降级） */
 	private int consecutiveAlFailures = 0;
+	/** ⑨ 入参校验拒绝计数（异常/恶意服务端防线）与告警节流 */
+	private volatile long rejectedPackets = 0;
+	private volatile long lastRejectWarnMs = 0;
 	
 	/**
 	 * 网络线程调用：入队到主线程播放。
@@ -80,6 +83,17 @@ public class AudioPlaybackManager {
 	 */
 	public void enqueue(long windowHandle, int sampleRate, int channels, byte[] pcm, long captureTimestampMs) {
 		if(!alAvailable) return;
+		// ⑨ v1.4.9 接收侧入参校验（服务端 AudioFrameRelay 同规格的客户端防线）：
+		// 异常/恶意服务端的畸形包在进 OpenAL 排队前拦下（畸形采样率会破坏 AL 缓冲，巨包直接内存压力）
+		String invalid = validateAudioPacket(sampleRate, channels, pcm);
+		if(invalid != null) {
+			rejectedPackets++;
+			if(lastRejectWarnMs == 0 || System.currentTimeMillis() - lastRejectWarnMs > 10_000) {
+				lastRejectWarnMs = System.currentTimeMillis();
+				LOGGER.warn("Audio packet rejected (window 0x{}): {}", Long.toHexString(windowHandle), invalid);
+			}
+			return;
+		}
 		receivedPackets++;
 		
 		if(!firstAudioLogged) {
@@ -214,22 +228,28 @@ public class AudioPlaybackManager {
 	 * ⑦ "范围不对"修复：按玩家与窗口 pivot 的距离做线性衰减。
 	 * range=0（settings 缺失或显式关闭）→ 恒 1.0，保持旧全局广播行为。
 	 * near = 窗口锚定距离量级（2 格），窗内恒满量避免近距闪烁。
+	 * ⑨ v1.4.9 修复：range &lt; near 时旧式 (dist-near)/(range-near) 分母为负 →
+	 * dist&gt;near 的增益反而被放大（&gt;1 爆音，越远越响的"反向衰减"）。
+	 * 现在 range≤near 一律视为"无有效衰减范围"→ 恒 1.0（同旧行为）。
 	 */
 	private void updateGain(StreamHandle stream, long windowHandle) {
 		double range = audioRangeBlocks();
-		if(range <= 0) {
-			AL10.alSourcef(stream.source, AL10.AL_GAIN, 1.0f);
-			return;
-		}
 		Minecraft mc = Minecraft.getInstance();
 		Vec3 windowPos = SharedWindowClientHandler.getWindowPivot(windowHandle);
 		if(mc.player == null || windowPos == null) return; // 信息不足保持上次 gain
 		
-		Vec3 ear = mc.player.getEyePosition();
-		double dist = ear.distanceTo(windowPos);
-		double near = 2.0;
-		float gain = dist <= near ? 1.0f : (float)Math.max(0.0, 1.0 - (dist - near) / (range - near));
+		double dist = mc.player.getEyePosition().distanceTo(windowPos);
+		float gain = distanceGain(dist, range);
 		AL10.alSourcef(stream.source, AL10.AL_GAIN, gain);
+	}
+	
+	/** ⑨ 纯函数（可单测）：距离→增益。range≤near 视为无衰减（恒 1.0，防反向放大） */
+	static float distanceGain(double dist, double range) {
+		if(range <= 0) return 1.0f;
+		double near = 2.0;
+		if(range <= near) return 1.0f;
+		if(dist <= near) return 1.0f;
+		return (float)Math.max(0.0, 1.0 - (dist - near) / (range - near));
 	}
 	
 	private static double audioRangeBlocks() {
@@ -278,6 +298,7 @@ public class AudioPlaybackManager {
 		sb.append("  packets received: ").append(receivedPackets).append("\n");
 		sb.append("  bytes received: ").append(totalAudioBytes).append("\n");
 		sb.append("  stale dropped: ").append(droppedStalePackets).append("\n");
+		sb.append("  ⑨ invalid rejected: ").append(rejectedPackets).append("\n");
 		sb.append("  ⑧ late dropped (realign): ").append(lateDroppedPackets).append("\n");
 		sb.append("  playoutDelayMs: ").append(RemoteWindowRenderer.playoutDelayMs()).append("\n");
 		sb.append("  audioRangeBlocks: ").append(audioRangeBlocks()).append("\n");
@@ -298,6 +319,21 @@ public class AudioPlaybackManager {
 	/** ⑧ 自适应采样输入：迟到丢弃累计（渲染线程读，主线程写，volatile 语义足够） */
 	public long lateDroppedPackets() {
 		return lateDroppedPackets;
+	}
+	
+	/**
+	 * ⑨ 纯函数（可单测）：接收端音频包入参校验。
+	 * 与服务端 AudioFrameRelay.acceptAudio 同规格（≤64KB、采样率/声道合法），
+	 * 另加 PCM 帧对齐（16-bit × 声道的整数倍——不对齐说明流已损坏/被拼接）。
+	 * @return null=合法；否则拒绝原因
+	 */
+	static String validateAudioPacket(int sampleRate, int channels, byte[] pcm) {
+		if(pcm == null || pcm.length == 0) return "empty pcm";
+		if(sampleRate < 8000 || sampleRate > 192_000) return "sampleRate out of range: " + sampleRate;
+		if(channels < 1 || channels > 2) return "channels out of range: " + channels;
+		if(pcm.length > 64 * 1024) return "pcm oversize: " + pcm.length;
+		if(pcm.length % (channels * 2) != 0) return "pcm not frame-aligned: " + pcm.length + "B @ " + channels + "ch";
+		return null;
 	}
 	
 	private static class PendingChunk {

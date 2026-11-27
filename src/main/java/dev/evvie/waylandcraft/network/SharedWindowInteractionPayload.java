@@ -16,7 +16,13 @@ public record SharedWindowInteractionPayload(long windowHandle, InteractionType 
 		MOUSE_RELEASE(2),
 		KEY_PRESS(3),
 		KEY_RELEASE(4),
-		SCROLL(5);
+		SCROLL(5),
+		/**
+		 * ⑨ v1.4.9 键盘自动重复透传（wayland owner 走 wl_keyboard repeat 语义；
+		 * X11 owner 降级为重复 down——与 v1.4.x REPEAT 透传需求一致）。
+		 * 旧 owner 收到未知 id 回落 MOUSE_MOVE（fromId）安全忽略。
+		 */
+		KEY_REPEAT(6);
 		
 		private final int id;
 		

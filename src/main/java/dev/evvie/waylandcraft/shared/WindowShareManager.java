@@ -77,16 +77,13 @@ public class WindowShareManager {
 	public WindowShareManager(WaylandCraft clientMod) {
 		this.clientMod = clientMod;
 		this.serverMod = null;
-		// 默认全分辨率 + 高质量（scale=1.0, quality=0.85, fps=24）：
-		// - scale=1.0：UI 大小与共享端完全一致（底线，绝不动）。
-		// - quality=0.85：内容画质足够（0.85 vs 1.0 视觉几乎无差），
-		//   单帧体积约 300-350KB（quality=1.0 时 450KB+），显著降低
-		//   服务端/查看端的 GC 与解码压力（v0.2.30 实测弱服务器被大帧拖垮）。
-		// - fps=24：电影级流畅（v0.9.18 起从 10 提升）；24fps 对窗口内容
-		//   （文本/UI/视频）已足够顺滑，且比 60fps 对弱服务器/手机端解码压力小。
-		//   可自定义：fps>0 为上限、fps=0 无限制（跟随性能上限）。
-		// maxBitrate=0（不限速）→ evaluateAdaptiveQuality 自动禁用。
-		this.captureConfig = new ImageCapture.CaptureConfig(1.0f, 0.85f, 24);
+		// ⑨ v1.4.9 用户裁定默认：scale=1.0（底线绝不动）、quality=0.95（默认最高档；
+		// 1.0 是 JPEG 病态档——体积暴涨 40%+ 无视觉增益，故"最高"取 0.95）、
+		// fps=0（解除帧率上限，跟随性能；diff 跳帧+每窗在途 1 帧编码自然节流）。
+		// maxBitrate=40000（40Mbps 宽松天花板）：它是画质自适应环的负载信号——
+		// 正常单窗/局域网永远用不满（≈不限速），仅多窗高画质并发时触发
+		// "降 fps → 降 quality"的自动降载（默认最高、按负载自动降低/提高）。
+		this.captureConfig = new ImageCapture.CaptureConfig(1.0f, 0.95f, 0, true, 40000, 3, 0, false, "jpeg", 0.02f);
 		this.frameRateController = new FrameRateController();
 		this.diffUpdateManager = new DiffUpdateManager();
 		
@@ -506,7 +503,7 @@ public class WindowShareManager {
 		long frameStart = System.nanoTime();
 		try {
 			ImageCapture.CaptureConfig config = job.config;
-			float quality = config.quality;
+			float quality = effectiveQuality(config); // ⑨ 自适应画质（编码线程读 volatile 快照）
 			byte[] imageData;
 			int w, h;
 			if(job.x11) {
@@ -773,8 +770,9 @@ public class WindowShareManager {
 	
 	/**
 	 * 在降级阶梯中取严格小于 current 的最大档位；阶梯为 null 或无更小档位时返回 -1。
+	 * ⑨ 包私有：ShareQualityLadderTest 直打（降/升档对偶语义的回归网）。
 	 */
-	private static float nextLadderValue(float[] ladder, float current) {
+	static float nextLadderValue(float[] ladder, float current) {
 		if(ladder == null) {
 			return -1f;
 		}
@@ -805,12 +803,84 @@ public class WindowShareManager {
 			// DEBUG 即可看回。分级表见 docs/LOGGING.md。
 			LOGGER.debug("[ADAPTIVE] FPS factor decreased to {} (over limit: {} frames)", String.format("%.2f", adaptiveFpsFactor), adaptiveOverLimitCount);
 			adaptiveOverLimitCount = 0;
+			// ⑨ v1.4.9 第二维降载（用户裁定：画质按负载自动降低）：fps 已降到最低档
+			// 仍持续超限 → 才动 quality（沿阶梯下一档）。fps 优先、画质兜底，
+			// 保证不到万不得已不牺牲观感。
+			if(adaptiveFpsFactor <= ADAPTIVE_FPS_MIN + 0.001f) {
+				if(++adaptiveQualityDownStreak >= QUALITY_DOWN_STREAK) {
+					lowerAdaptiveQuality(config);
+				}
+			}
+			else {
+				adaptiveQualityDownStreak = 0;
+			}
 		} else if(utilization < 0.5f && adaptiveFpsFactor < ADAPTIVE_FPS_MAX) {
 			// 利用率低于50% → 恢复 fps（逐步回到目标帧率）
 			adaptiveFpsFactor = Math.min(ADAPTIVE_FPS_MAX, adaptiveFpsFactor * ADAPTIVE_FPS_UP);
 			LOGGER.debug("[ADAPTIVE] FPS factor increased to {} (utilization: {}%)", String.format("%.2f", adaptiveFpsFactor), String.format("%.1f", utilization * 100));
 			adaptiveUnderUtilCount = 0;
 		}
+		else if(utilization < 0.4f && adaptiveFpsFactor >= ADAPTIVE_FPS_MAX - 0.001f) {
+			// ⑨ v1.4.9 升载：fps 已满且带宽持续宽裕 → 沿阶梯升回画质
+			//（升档更保守：连续 QUALITY_UP_STREAK 个周期 ≈ 15s 才升一档，防振荡）
+			if(++adaptiveQualityUpStreak >= QUALITY_UP_STREAK) {
+				raiseAdaptiveQuality(config);
+			}
+		}
+		else {
+			adaptiveQualityDownStreak = 0;
+			adaptiveQualityUpStreak = 0;
+		}
+	}
+	
+	// ===== ⑨ v1.4.9 自适应画质（默认最高档，按负载自动降低/提高；scale 永不动） =====
+	/** 当前自适应画质（-1 = 未启用自适应，用 config.quality）。编码线程跨线程读 → volatile */
+	private volatile float adaptiveQuality = -1f;
+	private int adaptiveQualityDownStreak = 0;
+	private int adaptiveQualityUpStreak = 0;
+	/** fps 到底仍连续这么多个评估周期超限才降画质（fps 优先、画质兜底） */
+	static final int QUALITY_DOWN_STREAK = 2;
+	/** fps 已满且连续这么多个评估周期低利用才升画质（≈15s/档，防振荡） */
+	static final int QUALITY_UP_STREAK = 6;
+	
+	private float currentAdaptiveQuality(ImageCapture.CaptureConfig config) {
+		float aq = adaptiveQuality;
+		return aq < 0 ? config.quality : aq;
+	}
+	
+	private void lowerAdaptiveQuality(ImageCapture.CaptureConfig config) {
+		float next = nextLadderValue(config.jpegQualityLadder, currentAdaptiveQuality(config));
+		adaptiveQualityDownStreak = 0;
+		if(next < 0) return; // 阶梯底，无可再降
+		adaptiveQuality = next;
+		adaptiveQualityUpStreak = 0;
+		LOGGER.info("[share] adaptive quality lowered to {} (bandwidth saturated even at min fps)", String.format("%.2f", next));
+	}
+	
+	private void raiseAdaptiveQuality(ImageCapture.CaptureConfig config) {
+		float next = nextLadderUpValue(config.jpegQualityLadder, currentAdaptiveQuality(config));
+		adaptiveQualityUpStreak = 0;
+		if(next < 0) return; // 阶梯顶（默认最高档），无可再升
+		adaptiveQuality = next;
+		adaptiveQualityDownStreak = 0;
+		LOGGER.info("[share] adaptive quality raised to {} (sustained bandwidth headroom)", String.format("%.2f", next));
+	}
+	
+	/** ⑨ 纯函数（可单测）：阶梯中取严格大于 current 的最小档；无更高档/阶梯空返回 -1 */
+	static float nextLadderUpValue(float[] ladder, float current) {
+		if(ladder == null) return -1f;
+		float best = -1f;
+		for(float v : ladder) {
+			if(v > current + 1e-4f && (best < 0 || v < best)) {
+				best = v;
+			}
+		}
+		return best;
+	}
+	
+	/** ⑨ 编码线程取生效画质：自适应未启用时用配置值（默认最高档恒定） */
+	private float effectiveQuality(ImageCapture.CaptureConfig config) {
+		return currentAdaptiveQuality(config);
 	}
 	
 	/**
@@ -885,12 +955,6 @@ public class WindowShareManager {
 		}
 	}
 	
-	/**
-	 * executor 线程：把实际捕获会话对齐到**最新**意图。
-	 * 去抖关键：audioWindowHandle != target 的任务直接 no-op——start all 连发 N 个
-	 * 意图时只有最后一个真正执行 PipeWire 会话建立（旧实现 N 次全套同步 stop+boot，
-	 * 每次最坏 25s 预算）；重复提交天然幂等（已应用且仍在运行则跳过）。
-	 */
 	/** ⑧ reconcile 单任务动作（decideAudioSync 返回值） */
 	enum AudioSyncAction { SKIP, STOP, START, ALREADY }
 	
@@ -908,6 +972,12 @@ public class WindowShareManager {
 		return AudioSyncAction.START;
 	}
 	
+	/**
+	 * executor 线程：把实际捕获会话对齐到**最新**意图。
+	 * 去抖关键：audioWindowHandle != target 的任务直接 no-op——start all 连发 N 个
+	 * 意图时只有最后一个真正执行 PipeWire 会话建立（旧实现 N 次全套同步 stop+boot，
+	 * 每次最坏 25s 预算）；重复提交天然幂等（已应用且仍在运行则跳过）。
+	 */
 	private void syncAudioState(long target, long prev, @Nullable String title, @Nullable String appId) {
 		AudioCaptureManager capture = audioCapture;
 		if(capture == null) return;
@@ -980,6 +1050,10 @@ public class WindowShareManager {
 	
 	public void setCaptureConfig(ImageCapture.CaptureConfig config) {
 		this.captureConfig = config;
+		// ⑨ 手动画质/帧率变更即复位自适应画质（新配置档成为基准，避免环状态覆盖手动档）
+		this.adaptiveQuality = -1f;
+		this.adaptiveQualityDownStreak = 0;
+		this.adaptiveQualityUpStreak = 0;
 		LOGGER.info("Updated capture config: {}", config.getSummary());
 	}
 	
@@ -1034,9 +1108,9 @@ public class WindowShareManager {
 		long totalDegraded = shareStates.values().stream().mapToLong(s -> s.degradedFrames).sum();
 		long totalSizeDropped = shareStates.values().stream().mapToLong(s -> s.sizeDroppedFrames).sum();
 		
-		return String.format("Windows: %d, Frames: %d, Skipped: %d, RateLimited: %d, Degraded: %d, SizeDropped: %d, Bytes: %d, FpsFactor: %.2f, Utilization: %.1f%%", 
+		return String.format("Windows: %d, Frames: %d, Skipped: %d, RateLimited: %d, Degraded: %d, SizeDropped: %d, Bytes: %d, FpsFactor: %.2f, Quality: %s, Utilization: %.1f%%",
 			shareStates.size(), totalFrames, totalSkipped, totalRateLimited, totalDegraded, totalSizeDropped, totalBytes,
-			adaptiveFpsFactor, getBitrateUtilization() * 100);
+			adaptiveFpsFactor, adaptiveQuality < 0 ? "config" : String.format("%.2f (adaptive)", adaptiveQuality), getBitrateUtilization() * 100);
 	}
 	
 	/**

@@ -309,6 +309,8 @@ Two families: **per-window owner controls** (`/wl share …`, "who shares, who m
 
 ### Presets
 
+**Default profile (v1.4.9, user ruling):** scale 1.0 · quality **0.95 (highest tier)** · FPS **unlimited** (follows CPU; diff-skip throttles naturally) · 40 Mbps soft ceiling that feeds the **adaptive quality loop** — fps drops first, then JPEG quality steps down the ladder under sustained congestion, and climbs back after ~15 s of headroom. Scale/UI size never changes.
+
 | Preset | Scale | Quality | FPS | Bitrate |
 |--------|-------|---------|-----|---------|
 | `performance` | 0.25 | 0.5 | 60 | 1000 kbps |
@@ -397,7 +399,7 @@ A: Yes. `xwayland-satellite` is bundled inside the jar (both `x86_64` and `arm64
 A: Viewer-only. Install the same `waylandcraft.jar` — the mod auto-detects the platform, disables local window capture, and still receives shared windows. On iOS, use PojavLauncher/Amethyst to run Java Edition + Fabric (experimental, not yet field-tested).
 
 **Q: Shared image is blurry / laggy. How do I improve it?**
-A: Raise quality or fps: `/wl share quality <handle> <scale> <quality> <fps>`, or apply the `quality` preset. Remember the default is a balanced profile; UI size is preserved even when quality degrades.
+A: Default already ships at the highest tier (0.95, unlimited fps). Under bandwidth pressure the adaptive loop lowers fps first, then quality; it recovers automatically. Pin a fixed profile with `/wl share quality <handle> <scale> <quality> <fps>` (manual change resets the adaptive loop). UI size is preserved even when quality degrades.
 
 **Q: The window looks transparent/black with shaders on.**
 A: Iris is auto-detected and the mod falls back to the vanilla pipeline. Make sure all clients and the server run the same (≥ v0.2.32) version.

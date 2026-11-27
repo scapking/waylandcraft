@@ -134,7 +134,11 @@ public class SharedWindowDebug {
 			.append(" bad_dim=").append(frameRelay.getDroppedBadDimensions())
 			.append(" no_capability=").append(frameRelay.getDroppedNoCapability())
 			.append(" skip_unwritable=").append(frameRelay.getSkippedUnwritable())
-			.append(" slow_viewers=").append(frameRelay.getSlowViewerEvents()).append("\n");
+			.append(" slow_viewers=").append(frameRelay.getSlowViewerEvents())
+			.append(" unsubscribed=").append(frameRelay.getSkippedNotSubscribed())
+			.append(" load_level=").append(frameRelay.getSkippedLoadLevel())
+			.append(" over_limit=").append(frameRelay.getSkippedOverLimit())
+			.append(" mem_guard=").append(frameRelay.getDroppedMemoryGuard()).append("\n");
 		
 		var audioRelay = dev.evvie.waylandcraft.network.WaylandCraftNetworking.getAudioRelay();
 		sb.append("Audio relay: packets=").append(audioRelay.getTotalPackets())
@@ -143,8 +147,47 @@ public class SharedWindowDebug {
 		sb.append("Audio drops: invalid=").append(audioRelay.getDroppedInvalid())
 			.append(" no_capability=").append(audioRelay.getDroppedNoCapability())
 			.append(" skip_unwritable=").append(audioRelay.getSkippedUnwritable())
-			.append(" slow_viewers=").append(audioRelay.getSlowViewerEvents()).append("\n");
-		
+			.append(" slow_viewers=").append(audioRelay.getSlowViewerEvents())
+			.append(" unsubscribed=").append(audioRelay.getSkippedNotSubscribed())
+			.append(" load_level=").append(audioRelay.getSkippedLoadLevel())
+			.append(" over_limit=").append(audioRelay.getSkippedOverLimit())
+			.append(" mem_guard=").append(audioRelay.getDroppedMemoryGuard()).append("\n");
+
+		// 任务A-2：观众分级状态（L0 normal / L1 half / L2 keyframe / L3 paused）。
+		// 汇总 + 逐观众行（封顶 32 行防刷屏），排障时直接看出谁被降载、降到哪级。
+		Map<UUID, Integer> viewerLevels = dev.evvie.waylandcraft.network.ViewerLoadController.snapshot();
+		int[] levelCounts = new int[4];
+		for (int level : viewerLevels.values()) {
+			if (level >= 0 && level < levelCounts.length) levelCounts[level]++;
+		}
+		sb.append("Viewer load: L0=").append(levelCounts[0])
+			.append(" L1=").append(levelCounts[1])
+			.append(" L2=").append(levelCounts[2])
+			.append(" L3=").append(levelCounts[3]).append("\n");
+		int shownViewers = 0;
+		for (Map.Entry<UUID, Integer> e : viewerLevels.entrySet()) {
+			if (shownViewers++ >= 32) {
+				sb.append("  … +").append(viewerLevels.size() - 32).append(" more viewers\n");
+				break;
+			}
+			sb.append("  viewer ").append(e.getKey().toString(), 0, 8)
+				.append(": L").append(e.getValue())
+				.append(" (").append(dev.evvie.waylandcraft.network.ViewerLoadController.levelName(e.getValue())).append(")\n");
+		}
+
+		// 任务A-1：订阅上限状态
+		sb.append("Viewer caps: tracked=").append(dev.evvie.waylandcraft.network.ViewerSubscriptions.trackedViewers())
+			.append(" cap=").append(dev.evvie.waylandcraft.network.ViewerSubscriptions.MAX_WINDOWS_PER_VIEWER)
+			.append("/viewer denied=").append(dev.evvie.waylandcraft.network.ViewerSubscriptions.totalDenied()).append("\n");
+
+		// 任务A-3：全局内存守卫水位
+		long videoBytes = dev.evvie.waylandcraft.network.RelayMemoryGuard.videoBufferedBytes();
+		long audioBytes = dev.evvie.waylandcraft.network.RelayMemoryGuard.audioBufferedBytes();
+		sb.append("Memory guard: video=").append(videoBytes / 1024).append("KB")
+			.append(" audio=").append(audioBytes / 1024).append("KB")
+			.append(" / limit=").append(dev.evvie.waylandcraft.network.RelayMemoryGuard.GLOBAL_BUFFER_BYTES_LIMIT / (1024 * 1024)).append("MB")
+			.append(" over_limit=").append(dev.evvie.waylandcraft.network.RelayMemoryGuard.isOverLimit()).append("\n");
+
 		return sb.toString();
 	}
 	

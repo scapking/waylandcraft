@@ -1927,43 +1927,44 @@ public class WaylandCraft implements ClientModInitializer {
 			return;
 		}
 
-		// 普通键：先把远端修饰键状态同步到本次事件的 modifiers，再转发该键
+		// 普通键：先把远端修饰键状态同步到本次事件的 modifiers，再转发该键。
+		// ⑨ v1.4.9：key 字段由 X11 keysym 改为 **GLFW keycode** 原值——
+		// wayland owner 直接走 scancode 注入链（glfwGetKeyScancode→bridge），
+		// X11 owner 在本地 glfwKeyToKeysym 转换（两端同批交付，协议语义同步变更）。
 		syncForwardedModifiers(handle, modifiers);
 
-		int keysym = glfwKeyToKeysym(key);
 		if(action == GLFW.GLFW_PRESS) {
-			pressedForwardKeys.add(keysym);
+			pressedForwardKeys.add(key);
 			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_PRESS,
-					0, 0, 0, keysym);
+					0, 0, 0, key);
 		}
 		else if(action == GLFW.GLFW_RELEASE) {
-			pressedForwardKeys.remove(keysym);
+			pressedForwardKeys.remove(key);
 			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_RELEASE,
-					0, 0, 0, keysym);
+					0, 0, 0, key);
 		}
 		else if(action == GLFW.GLFW_REPEAT) {
 			// 长按透传（需求1 补全）：共享窗口网络转发路径之前只处理 PRESS/RELEASE，
-			// REPEAT 被静默丢弃 → 远端窗口长按失效（XTest injectKey 是单次注入，无 autorepeat）。
-			// X11 autorepeat 语义 = 重复 down 事件（无独立 up），因此 REPEAT 重发 KEY_PRESS；
+			// REPEAT 被静默丢弃 → 远端窗口长按失效。⑨ 改发 KEY_REPEAT 专用类型：
+			// wayland owner 走 bridge.repeatKey（wl repeat 语义），X11 owner 降级重复 down；
 			// 配对集合保持原有记录（press 已加入），只确保万一漏记时补上。
-			pressedForwardKeys.add(keysym);
-			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_PRESS,
-					0, 0, 0, keysym);
+			pressedForwardKeys.add(key);
+			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_REPEAT,
+					0, 0, 0, key);
 		}
 	}
 
 	/** 转发单个修饰键 press/release（与普通键同一配对集合，releaseAllForwardedKeys 统一兜底） */
 	private void forwardModifierKey(long handle, int key, boolean pressed) {
-		int keysym = glfwKeyToKeysym(key);
 		if(pressed) {
-			pressedForwardKeys.add(keysym);
+			pressedForwardKeys.add(key);
 			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_PRESS,
-					0, 0, 0, keysym);
+					0, 0, 0, key);
 		}
 		else {
-			pressedForwardKeys.remove(keysym);
+			pressedForwardKeys.remove(key);
 			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_RELEASE,
-					0, 0, 0, keysym);
+					0, 0, 0, key);
 		}
 	}
 
@@ -2009,16 +2010,18 @@ public class WaylandCraft implements ClientModInitializer {
 	private void releaseAllForwardedKeys(long handle) {
 		forwardedMods = 0;
 		if(handle < 0 || pressedForwardKeys.isEmpty()) return;
-		for(int keysym : pressedForwardKeys) {
+		for(int key : pressedForwardKeys) {
 			SharedWindowClientHandler.sendInteraction(handle, SharedWindowInteractionPayload.InteractionType.KEY_RELEASE,
-					0, 0, 0, keysym);
+					0, 0, 0, key);
 		}
 		pressedForwardKeys.clear();
 		lastKeyForwardHandle = -1;
 	}
-	
+
 	/**
-	 * GLFW keycode → X11 keysym（远端 XTest 注入用）。
+	 * GLFW keycode → X11 keysym。
+	 * ⑨ v1.4.9 起 owner X11 分支在本地做此转换（wire 上 key=GLFW keycode）；
+	 * wayland owner 不用此函数（走 scancode 链）。
 	 * 覆盖字母/数字/功能键/方向键/修饰键/常用符号；未知键原样返回（可能无效但不会崩）。
 	 */
 	public static int glfwKeyToKeysym(int key) {

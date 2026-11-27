@@ -85,6 +85,12 @@ public class SharedWindowServerHandler {
 	static final int MAX_INVITES_PER_BATCH = 16;
 
 	/**
+	 * 任务A-1：观众达"每观众同时观看窗口数上限"提示的冷却间隔。
+	 * 列表广播在注册风暴/权限抖动下可能每 tick 重算，提示必须节流。
+	 */
+	static final long VIEWER_CAP_NOTICE_INTERVAL_MS = 30_000;
+
+	/**
 	 * 与 receiver 注册一起调用：tick 合并广播 + 速率窗过期清理 + ACL 到期扫描 + 跨会话状态清零。
 	 */
 	public static void register() {
@@ -96,6 +102,14 @@ public class SharedWindowServerHandler {
 			long now = System.currentTimeMillis();
 			registerRates.entrySet().removeIf(e -> now - e.getValue()[0] > 30_000);
 			inviteCooldowns.entrySet().removeIf(e -> now - e.getValue() > INVITE_COOLDOWN_RETIRE_MS);
+
+			// 任务A-1/A-2：下线观众的订阅登记与分级状态清理，防 map 随玩家进出泄漏
+			java.util.Set<UUID> onlineIds = new java.util.HashSet<>();
+			for (ServerPlayer p : server.getPlayerList().getPlayers()) {
+				onlineIds.add(p.getUUID());
+			}
+			ViewerSubscriptions.retainOnly(onlineIds);
+			ViewerLoadController.retainOnly(onlineIds);
 
 			// ACL-1：限时授权到期扫描（每 20 tick，服务端线程——满足主线程约束）
 			if (++expiryTickCounter >= EXPIRY_SWEEP_INTERVAL_TICKS) {
@@ -112,6 +126,9 @@ public class SharedWindowServerHandler {
 		windowListDirty.set(false);
 		expiryTickCounter = 0;
 		inviteCooldowns.clear();
+		// 任务A-1/A-2：订阅登记与观众分级状态随会话清零
+		ViewerSubscriptions.clear();
+		ViewerLoadController.clear();
 	}
 
 	/**
@@ -860,6 +877,9 @@ private static void broadcastWindowListToAll(SharedWindowManager manager) {
 		UUID playerUUID = player.getUUID();
 		long nowMs = System.currentTimeMillis();
 		List<SharedWindowListPayload.WindowInfo> visible = new ArrayList<>();
+		// 任务A-1：非本人窗口为"观众候选"，受每观众交付上限约束；
+		// 本人窗口恒可见（relay 本就不向 owner 回发自己的帧，不占观众额度）
+		Map<Long, SharedWindowListPayload.WindowInfo> viewerCandidates = new java.util.LinkedHashMap<>();
 
 		for(SharedWindowEntry entry : manager.getAllWindows()) {
 			// ACL-3：列表广播走合成判定（owner 恒 CONTROL、黑白名单压过记录、过期即隐）
@@ -868,12 +888,37 @@ private static void broadcastWindowListToAll(SharedWindowManager manager) {
 			if(perm == WindowPermission.NONE) {
 				continue;
 			}
-			visible.add(new SharedWindowListPayload.WindowInfo(
+			SharedWindowListPayload.WindowInfo info = new SharedWindowListPayload.WindowInfo(
 				entry.getWindowHandle(),
 				entry.getOwnerUUID(),
 				entry.getWindowTitle(),
 				perm
-			));
+			);
+			if (entry.getOwnerUUID().equals(playerUUID)) {
+				visible.add(info);
+			} else {
+				viewerCandidates.put(entry.getWindowHandle(), info);
+			}
+		}
+
+		// 任务A-1：每观众同时观看窗口数上限——超出部分暂缓交付（不进列表 =
+		// 观众端不渲染不收帧；授权保留，窗口数回落自动恢复）。按句柄升序截断
+		// 保证交付集跨 tick 确定性、不抖动。
+		java.util.Set<Long> delivered = ViewerSubscriptions.capDelivered(
+			new ArrayList<>(viewerCandidates.keySet()), ViewerSubscriptions.MAX_WINDOWS_PER_VIEWER);
+		for (Map.Entry<Long, SharedWindowListPayload.WindowInfo> e : viewerCandidates.entrySet()) {
+			if (delivered.contains(e.getKey())) {
+				visible.add(e.getValue());
+			}
+		}
+		int denied = viewerCandidates.size() - delivered.size();
+		ViewerSubscriptions.refresh(playerUUID, delivered, denied);
+		if (denied > 0 && ServerWarnThrottle.allow("viewer-cap-notice:" + playerUUID, VIEWER_CAP_NOTICE_INTERVAL_MS)) {
+			// 直接走服务端系统消息（vanilla 通道，无需客户端 mod 注册 payload；
+			// 客户端效果与 PermissionResponsePayload 相同：聊天一行提示）
+			player.sendSystemMessage(Component.literal("[WLC] 同时观看窗口数已达上限 "
+				+ ViewerSubscriptions.MAX_WINDOWS_PER_VIEWER + "，" + denied
+				+ " 个窗口暂缓推送（关闭其他共享窗口后自动恢复）"));
 		}
 
 		SharedWindowListPayload listPayload = new SharedWindowListPayload(visible);

@@ -654,11 +654,29 @@ public class SharedWindowClientHandler {
 	}
 
 	/**
+	 * ⑨ 纯函数（可单测）：viewer 像素坐标（相对窗口渲染 origin + framebuffer
+	 * xoff/yoff，SharedWindowDisplay.intersect 口径）→ owner root-surface 相对
+	 * 坐标（sendMotionRefocus 期望的口径）。
+	 * 推导：本地路径 rel = geometryLocal + geometry.xy − surface.subpos，
+	 * 而 payload = geometryLocal + framebuffer.xoff/yoff
+	 * → surface = payload − fbOff + geomOff − rootSub。
+	 * 四个偏移通常全为 0（无 CSD/无子面偏移），此时恒等。
+	 */
+	static double surfaceCoord(double payloadPx, double fbOff, double geomOff, double rootSub) {
+		return payloadPx - fbOff + geomOff - rootSub;
+	}
+
+	/**
 	 * 窗口所有者侧：把远程玩家对共享窗口的操作注入到真实窗口。
-	 * 当前只支持 X11 窗口（XTest 注入）；wayland 窗口注入后续接入。
+	 * ⑨ v1.4.9 起双源支持：
+	 * - X11 窗口：XTest 注入（既有路径，key 由本地 glfwKeyToKeysym 转换——
+	 *   wire 上 key 字段已改为 GLFW keycode，两端同批交付）；
+	 * - Wayland 窗口：自研 compositor 协议级注入（bridge.sendMotionRefocus/
+	 *   sendButton/sendScroll/pressKey——本地路径 v1.4.5/1.4.6 已修稳的同一链路，
+	 *   键盘先 focusSurface 幂等聚焦，REPEAT 走 bridge.repeatKey）。
 	 *
-	 * 坐标约定：payload.x/y 是窗口内像素坐标（0..geometryW/H，原始尺寸），
-	 * 注入时换算到屏幕根坐标（窗口根坐标 + 偏移）。
+	 * 坐标约定：payload.x/y 是窗口内像素坐标（0..geometryW/H 口径，viewer 端已按
+	 * framebuffer 偏移修正），来源是远端玩家不可信，注入前必须钳位（P1-8）。
 	 */
 	private static void handleInteraction(SharedWindowInteractionPayload payload) {
 		WaylandCraft wlc = WaylandCraft.instance;
@@ -671,11 +689,17 @@ public class SharedWindowClientHandler {
 			return; // 不是正在共享的窗口（可能已停止）
 		}
 
-		// 目前只注入 X11 窗口；wayland 窗口的 wl 指针注入待后续接入
-		if(state.source != WindowShareManager.ShareState.Source.X11) {
-			return;
+		if(state.source == WindowShareManager.ShareState.Source.X11) {
+			handleX11Interaction(wlc, state, payload);
 		}
-
+		else {
+			handleWaylandInteraction(wlc, state, payload);
+		}
+	}
+	
+	/** X11 源：XTest 注入（既有路径，逻辑与 v1.4.x 一致；key 现为 GLFW keycode 本地转 keysym） */
+	private static void handleX11Interaction(WaylandCraft wlc, WindowShareManager.ShareState state,
+			SharedWindowInteractionPayload payload) {
 		String display = state.x11Display;
 		long xid = state.x11Xid;
 		// P1-8（坐标钳位）：payload.x/y 是"窗口内像素坐标"，但来源是远端玩家，不可信。
@@ -699,17 +723,20 @@ public class SharedWindowClientHandler {
 			case MOUSE_RELEASE -> {
 				dev.evvie.waylandcraft.utils.X11Interaction.injectButton(display, payload.button(), false);
 			}
-			case KEY_PRESS -> {
+			case KEY_PRESS, KEY_REPEAT -> {
 				// P1-8（按键越权）：XTest 键事件落在"当前输入焦点窗口"。注入前必须把
 				// 焦点移到被共享窗口（raise + XSetInputFocus + 回读验证），否则 INTERACT
 				// 等于 owner 桌面级键盘注入（焦点在终端时按键直进终端）。验证失败拒绝注入。
+				// ⑨ KEY_REPEAT：X11 autorepeat = 重复 down（与 v1.4.x REPEAT 透传语义一致）。
 				if(dev.evvie.waylandcraft.utils.X11Interaction.raiseAndFocusWindow(display, xid)) {
-					dev.evvie.waylandcraft.utils.X11Interaction.injectKey(display, payload.key(), true);
+					int keysym = WaylandCraft.glfwKeyToKeysym(payload.key());
+					dev.evvie.waylandcraft.utils.X11Interaction.injectKey(display, keysym, true);
 				}
 			}
 			case KEY_RELEASE -> {
 				if(dev.evvie.waylandcraft.utils.X11Interaction.raiseAndFocusWindow(display, xid)) {
-					dev.evvie.waylandcraft.utils.X11Interaction.injectKey(display, payload.key(), false);
+					int keysym = WaylandCraft.glfwKeyToKeysym(payload.key());
+					dev.evvie.waylandcraft.utils.X11Interaction.injectKey(display, keysym, false);
 				}
 			}
 			case SCROLL -> {
@@ -722,6 +749,89 @@ public class SharedWindowClientHandler {
 			}
 			default -> {}
 		}
+	}
+	
+	/**
+	 * ⑨ v1.4.9 Wayland 源：协议级注入（owner 本地操作同一 bridge 链路）。
+	 *
+	 * 关键点：
+	 * - 坐标：payload（origin 像素 + fb 偏移口径）→ root-surface 相对坐标
+	 *   （surfaceCoord 纯函数换算，四个偏移 owner 端实时取值）；
+	 * - 键盘：key 字段 = GLFW keycode → glfwGetKeyScancode → internalKeyUpdate
+	 *   （compositor xkb_state 同步，修饰键/ Caps 由远端修饰键透传维护）+ press/release/repeat；
+	 * - focusSurface 幂等（Rust "already focused" 短路），每次注入前调用——远端
+	 *   注入与 owner 本地 hover 焦点可能不一致，前置聚焦防按键落错窗口（等价 X11
+	 *   分支的 raiseAndFocusWindow 越权防线）。
+	 */
+	private static void handleWaylandInteraction(WaylandCraft wlc, WindowShareManager.ShareState state,
+			SharedWindowInteractionPayload payload) {
+		var bridge = wlc.bridge;
+		if(bridge == null) return; // owner native 不可用：无法注入
+		var toplevel = bridge.getToplevel(payload.windowHandle());
+		if(toplevel == null || !toplevel.isMapped()) return; // 窗口已关/未映射：注入目标不存在
+		var surface = toplevel.getSurfaceTree();
+		if(surface == null) return;
+
+		double fbOffX = toplevel.framebuffer != null ? toplevel.framebuffer.getXOff() : 0;
+		double fbOffY = toplevel.framebuffer != null ? toplevel.framebuffer.getYOff() : 0;
+		double rootSubX = surface.xSubpos;
+		double rootSubY = surface.ySubpos;
+		int winW = toplevel.geometry.width();
+		int winH = toplevel.geometry.height();
+		// P1-8 同款钳位（geometry 口径，与 viewer 发送端钳位一致）
+		double sx = surfaceCoord(clampToWindow(payload.x(), winW), fbOffX, toplevel.geometry.x(), rootSubX);
+		double sy = surfaceCoord(clampToWindow(payload.y(), winH), fbOffY, toplevel.geometry.y(), rootSubY);
+
+		switch(payload.interactionType()) {
+			case MOUSE_MOVE -> {
+				bridge.sendMotionRefocus(surface, sx, sy);
+			}
+			case MOUSE_CLICK -> {
+				bridge.sendMotionRefocus(surface, sx, sy);
+				bridge.sendButton(payload.button(), 1);
+			}
+			case MOUSE_RELEASE -> {
+				bridge.sendButton(payload.button(), 0);
+			}
+			case KEY_PRESS -> {
+				bridge.focusSurface(toplevel);
+				int scancode = glfwKeyToScancode(payload.key());
+				bridge.internalKeyUpdate(scancode, true);
+				bridge.pressKey(scancode);
+			}
+			case KEY_REPEAT -> {
+				bridge.focusSurface(toplevel);
+				bridge.repeatKey(glfwKeyToScancode(payload.key()));
+			}
+			case KEY_RELEASE -> {
+				bridge.focusSurface(toplevel);
+				int scancode = glfwKeyToScancode(payload.key());
+				bridge.internalKeyUpdate(scancode, false);
+				bridge.releaseKey(scancode);
+			}
+			case SCROLL -> {
+				// 编码：低16位 = scrollX*100，高16位 = scrollY*100；
+				// 轴序/符号与本地路径一致（sendScroll(0,-y) / sendScroll(1,-x)）
+				int data = payload.button();
+				double scrollX = (short) (data & 0xFFFF) / 100.0;
+				double scrollY = (short) ((data >> 16) & 0xFFFF) / 100.0;
+				bridge.sendMotionRefocus(surface, sx, sy);
+				bridge.sendScroll(0, -scrollY);
+				bridge.sendScroll(1, -scrollX);
+			}
+			default -> {}
+		}
+	}
+	
+	/**
+	 * ⑨ 纯函数（可单测）：GLFW keycode → scancode（bridge 键盘链路参数）。
+	 * GLFW 约定无效键返回 -1，但实测部分平台/headless 返回 0——scancode 0 本身
+	 * 也不是合法物理码，一并视为"未解析"兜底原值（旧版桥接曾直接吃 keycode，
+	 * 兜底保持该行为的容错性）。
+	 */
+	static int glfwKeyToScancode(int key) {
+		int scancode = org.lwjgl.glfw.GLFW.glfwGetKeyScancode(key);
+		return scancode > 0 ? scancode : key;
 	}
 	
 	/**

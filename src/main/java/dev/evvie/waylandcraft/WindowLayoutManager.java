@@ -448,20 +448,8 @@ public class WindowLayoutManager {
 			.add(d.localY().scale(bh / 2.0 - gh / 2.0 - yoff));
 	}
 
-	/** 窗口底部抬到地面 + groundClearance（基于实际渲染中心/高度） */
-	private void clampToGround(WindowDisplay d) {
-		Minecraft mc = Minecraft.getInstance();
-		if(mc.level == null || wlc.settings == null) return;
-		double clearance = wlc.settings.getGroundClearance();
-		int groundY = mc.level.getHeight(Heightmap.Types.MOTION_BLOCKING, (int) Math.floor(d.pivot.x), (int) Math.floor(d.pivot.z));
-		double halfHeight = worldHeight(d) / 2.0;
-		Vec3 off = renderCenterOffset(d);
-		double renderCenterY = d.pivot.y + off.y;
-		double minY = groundY + clearance + halfHeight;
-		if(renderCenterY < minY) {
-			d.pivot = new Vec3(d.pivot.x, minY - off.y, d.pivot.z);
-		}
-	}
+	// ⑨ v1.4.9：旧逐窗 clampToGround（以底部方块为基准、各窗抬到不同中心线=高低参差）
+	// 已删除；防插地改为 applyLayerHeights 的整层统一兜底（居中对齐最高窗语义）
 
 	// ==================== 角度制通用工具 ====================
 
@@ -481,33 +469,68 @@ public class WindowLayoutManager {
 	}
 
 	/**
-	 * 逐层设置窗口渲染中心 Y，并逐层贴地钳制。
-	 * 层基准：上一层"实际渲染最高点"（含贴地钳制抬升） + stackSpacing，再 + 本层半高。
-	 * 即上层窗口底部 = 下层窗口最高区域 + 0.4（用户要求的语义），任何分辨率/scale/地面都永不重叠。
-	 * pivot 按 renderCenterOffset 补偿，保证渲染中心落在目标 Y。
+	 * 逐层设置窗口渲染中心 Y。⑨ v1.4.9 改版（用户裁定：**居中对齐最高窗**）：
+	 * 层内所有窗口的渲染中心对齐同一条水平线（= layerCenterY），不再逐窗贴地——
+	 * 旧实现以"底部方块"（地面+净空）为逐窗基准，把不同高度的窗抬到各自不同的
+	 * 中心线，视觉高低参差。防插地改为**整层统一兜底**：按层内最低的渲染底边与
+	 * 层内最低地面计算缺口，需要时整层一起抬升（层内对齐关系保持不变）。
+	 * 层基准：上一层"实际渲染最高点"（含兜底抬升） + stackSpacing + 本层半高——
+	 * 上层窗口底部 = 下层最高区域 + stackSpacing，任何分辨率/scale/地面都永不重叠。
+	 * pivot 按 renderCenterOffset 补偿，保证渲染中心精确落在目标 Y。
 	 */
 	private void applyLayerHeights(List<WindowDisplay> list, List<Integer> sizes, List<Double> maxHeights, double firstCenterY, double stackSpacing) {
+		Minecraft mc = Minecraft.getInstance();
+		boolean groundGuard = mc != null && mc.level != null && wlc.settings != null;
 		int pos = 0;
 		double prevMaxTop = Double.NaN; // 上一层实际渲染最高点
 		for(int l = 0; l < sizes.size(); l++) {
 			int count = sizes.get(l);
 			double thisMaxH = maxHeights.get(l);
 			double layerCenterY = (l == 0) ? firstCenterY : prevMaxTop + stackSpacing + thisMaxH / 2.0;
-			double layerMaxTop = Double.NEGATIVE_INFINITY;
+			// 1) 居中对齐：层内所有窗渲染中心 = layerCenterY（高低窗同一条中心线）
 			for(int j = 0; j < count; j++) {
 				WindowDisplay d = list.get(pos + j);
 				Vec3 off = renderCenterOffset(d);
 				d.pivot = new Vec3(d.pivot.x - off.x, layerCenterY - off.y, d.pivot.z - off.z);
-				// 贴地钳制（只抬升）：第一层大窗口不会插地，且下一层基准会含抬升效果
-				clampToGround(d);
-				Vec3 off2 = renderCenterOffset(d);
-				double renderCenterY = d.pivot.y + off2.y;
-				double top = renderCenterY + worldHeight(d) / 2.0;
+			}
+			// 2) 整层防插地兜底：以层内最低地面 + 层内最低渲染底边算缺口，整层统一抬
+			if(groundGuard) {
+				double clearance = wlc.settings.getGroundClearance();
+				double groundY = Double.MAX_VALUE;
+				double minBottom = Double.POSITIVE_INFINITY;
+				for(int j = 0; j < count; j++) {
+					WindowDisplay d = list.get(pos + j);
+					double gy = mc.level.getHeight(Heightmap.Types.MOTION_BLOCKING, (int) Math.floor(d.pivot.x), (int) Math.floor(d.pivot.z));
+					if(gy < groundY) groundY = gy;
+					Vec3 off = renderCenterOffset(d);
+					double bottom = d.pivot.y + off.y - worldHeight(d) / 2.0;
+					if(bottom < minBottom) minBottom = bottom;
+				}
+				double lift = layerLiftDelta(minBottom, groundY, clearance);
+				if(lift > 0) {
+					for(int j = 0; j < count; j++) {
+						WindowDisplay d = list.get(pos + j);
+						d.pivot = new Vec3(d.pivot.x, d.pivot.y + lift, d.pivot.z);
+					}
+				}
+			}
+			// 3) 层顶（下一层堆叠基准；含兜底抬升效果）
+			double layerMaxTop = Double.NEGATIVE_INFINITY;
+			for(int j = 0; j < count; j++) {
+				WindowDisplay d = list.get(pos + j);
+				Vec3 off = renderCenterOffset(d);
+				double top = d.pivot.y + off.y + worldHeight(d) / 2.0;
 				if(top > layerMaxTop) layerMaxTop = top;
 			}
 			prevMaxTop = layerMaxTop;
 			pos += count;
 		}
+	}
+	
+	/** ⑨ 纯函数（可单测）：整层防插地统一抬升量——层内最低底边低于 地面+净空 时补齐差额，否则 0 */
+	static double layerLiftDelta(double minBottom, double groundY, double clearance) {
+		double required = groundY + clearance;
+		return minBottom < required ? required - minBottom : 0.0;
 	}
 
 	// ==================== cube 方块模板 ====================

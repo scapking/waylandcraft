@@ -53,6 +53,10 @@ public class InteractionForwarder {
 				// 审计行与 WARN 同节流（否则恶意刷包把 P1-6 日志洪泛修复打回原形）；
 				// 计数不受节流影响，保持可观测。
 				dev.evvie.waylandcraft.shared.ShareAclAudit.logDeny("interact", payload.windowHandle(), senderUUID);
+				// ⑨ v1.4.9 观众侧回执：拒绝不再只落在服务端日志——观众点共享窗口
+				// 无反应时能直接看到原因（同 5s 节流，不做洪泛放大）。
+				sender.sendSystemMessage(net.minecraft.network.chat.Component.literal(
+					"§7[WLC] §fInteraction denied for window 0x" + Long.toHexString(payload.windowHandle())));
 			}
 			dev.evvie.waylandcraft.shared.ShareAclAudit.deniedInteract.incrementAndGet();
 			return;

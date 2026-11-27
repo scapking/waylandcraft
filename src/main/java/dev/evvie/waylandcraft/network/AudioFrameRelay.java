@@ -50,6 +50,13 @@ public class AudioFrameRelay {
 	/** 每窗口队列最大包数（30KB × 50 = 1.5MB 缓冲 ≈ 0.5 秒积压） */
 	private static final int MAX_PENDING_PER_WINDOW = 50;
 
+	/**
+	 * 任务A-3：每窗口 FIFO 字节预算，与视频对齐（复用视频"单帧缓存"上限
+	 * MAX_FRAME_BYTES = 1.9MB）。原实现只有包数上限：50 × 64KB 恶意包 = 3.2MB/窗，
+	 * 与视频 1.9MB/窗不对称；字节上限后两者预算一致，谁先触发谁丢旧。
+	 */
+	static final int MAX_PENDING_BYTES_PER_WINDOW = SharedWindowFrameRelay.MAX_FRAME_BYTES;
+
 	/** P2-2：单包 PCM 上限 64KB（合法 ~30KB，超限视为恶意/坏端） */
 	static final int MAX_AUDIO_BYTES = 64 * 1024;
 
@@ -72,7 +79,7 @@ public class AudioFrameRelay {
 	/** P1-2：慢观察者追踪 */
 	private final SlowViewerTracker slowTracker = new SlowViewerTracker();
 
-	// ===== P3：累计统计 =====
+	// ===== P3 + overload-guard：累计统计 =====
 	private final AtomicLong totalPackets = new AtomicLong();
 	private final AtomicLong totalBytes = new AtomicLong();
 	private final AtomicLong totalSends = new AtomicLong();
@@ -80,6 +87,15 @@ public class AudioFrameRelay {
 	private final AtomicLong droppedNoCapability = new AtomicLong();
 	private final AtomicLong skippedUnwritable = new AtomicLong();
 	private final AtomicLong slowViewerEvents = new AtomicLong();
+	private final AtomicLong skippedNotSubscribed = new AtomicLong();
+	private final AtomicLong skippedLoadLevel = new AtomicLong();
+	private final AtomicLong skippedOverLimit = new AtomicLong();
+	private final AtomicLong droppedMemoryGuard = new AtomicLong();
+
+	public AudioFrameRelay() {
+		// 任务A-3：把音频 FIFO 字节数注册进全局内存守卫（求和来源，无增量计数器）
+		RelayMemoryGuard.bindAudioSource(this::pendingAudioBytes);
+	}
 
 	/**
 	 * P2-2：音频包合法性判定（纯函数，可单测）。
@@ -138,13 +154,69 @@ public class AudioFrameRelay {
 			return false;
 		}
 		Deque<SharedWindowAudioPayload> queue = pending.computeIfAbsent(payload.windowHandle(), k -> new ArrayDeque<>());
+		// 任务A-3：全局总量守卫先于入队（不持任何队列锁，避免跨队列锁序死锁）：
+		// 现有总量 + 新包 ≤ 上限才准入；不足则从"当前最重队列"逐包丢旧（全局公平，
+		// 而非单窗口挨饿），全部队列清空仍放不下才拒新包（理论上不可达：单包
+		// ≤64KB ≪ 全局上限，全空队列求和为 0 必然准入）。
+		while (!RelayMemoryGuard.audioAcceptAllowed(pendingAudioBytes(), payload.pcmData().length)) {
+			Deque<SharedWindowAudioPayload> victim = heaviestQueue();
+			if (victim == null) {
+				droppedMemoryGuard.incrementAndGet();
+				if (ServerWarnThrottle.allow("audio-memory-guard:" + payload.windowHandle(), 5000)) {
+					WaylandCraftCommon.LOGGER.warn("[SERVER] audio packet rejected by global memory guard: handle=0x{} bytes={}",
+						Long.toHexString(payload.windowHandle()), payload.pcmData().length);
+				}
+				return false;
+			}
+			synchronized (victim) {
+				if (!victim.isEmpty()) victim.removeFirst();
+			}
+		}
 		synchronized (queue) {
 			queue.addLast(payload);
-			while (queue.size() > MAX_PENDING_PER_WINDOW) {
-				queue.removeFirst(); // 积压：丢最旧，保实时
+			// 积压：丢最旧保实时。任务A-3：包数与字节双上限（字节与视频"单帧缓存"
+			// 预算对齐），谁先触发谁丢旧。
+			while (queue.size() > MAX_PENDING_PER_WINDOW || queueBytes(queue) > MAX_PENDING_BYTES_PER_WINDOW) {
+				queue.removeFirst();
 			}
 		}
 		return true;
+	}
+
+	/** 单个队列的缓冲字节（调用方持有该队列锁或仅在扫描时短暂加锁） */
+	private static long queueBytes(Deque<SharedWindowAudioPayload> queue) {
+		long total = 0;
+		for (SharedWindowAudioPayload p : queue) {
+			total += p.pcmData().length;
+		}
+		return total;
+	}
+
+	/** 当前音频 FIFO 缓冲总字节（全局内存守卫求和来源；逐队列短暂加锁，无跨队列持锁） */
+	public long pendingAudioBytes() {
+		long total = 0;
+		for (Deque<SharedWindowAudioPayload> q : pending.values()) {
+			synchronized (q) {
+				total += queueBytes(q);
+			}
+		}
+		return total;
+	}
+
+	/** 找到当前缓冲字节最多的非空队列（全局公平驱逐的受害者选择） */
+	private Deque<SharedWindowAudioPayload> heaviestQueue() {
+		Deque<SharedWindowAudioPayload> heaviest = null;
+		long heaviestBytes = 0;
+		for (Deque<SharedWindowAudioPayload> q : pending.values()) {
+			synchronized (q) {
+				long bytes = queueBytes(q);
+				if (bytes > heaviestBytes) {
+					heaviestBytes = bytes;
+					heaviest = q;
+				}
+			}
+		}
+		return heaviest;
 	}
 
 	/** P2-2：窗口注销立即移除队列条目 */
@@ -184,6 +256,8 @@ public class AudioFrameRelay {
 		Map<UUID, ServerPlayer> online = new HashMap<>();
 		for (ServerPlayer player : players) online.put(player.getUUID(), player);
 		slowTracker.retainOnly(online.keySet());
+		// 任务A-2：分级状态同步清理（订阅登记由 SharedWindowServerHandler tick 清理）
+		ViewerLoadController.retainOnly(online.keySet());
 
 		// 收集待转发包；顺带 P2-2 清理：窗口已不存在（注销/断连）的队列条目直接移除
 		List<SharedWindowAudioPayload> packets = new ArrayList<>();
@@ -236,21 +310,44 @@ public class AudioFrameRelay {
 
 		int forwarded = 0;
 		long now = System.currentTimeMillis();
+		boolean overLimit = RelayMemoryGuard.isOverLimit();
 		for (ServerPlayer player : capable) {
 			UUID uuid = player.getUUID();
 			if (uuid.equals(senderUUID)) continue;
 			// ACL-3：同帧中继——VIEW 门走合成判定（黑白名单/过期即刻生效）
 			if (!manager.effectivePermission(entry, uuid, now).hasPermission(WindowPermission.VIEW)) continue;
 
-			// P1-2 背压：不可写跳包（音频丢包可听感无损，保实时不保完整）
+			// P1-2 背压 + 任务A-2 分级观测：可写性探测对所有 VIEW 观众执行（含被
+			// 订阅/分级门跳过的观众），保证分级状态有持续恢复证据。
+			// 音频丢包可听感无损，保实时不保完整。
 			if (!RelaySinks.isChannelWritable(player)) {
 				skippedUnwritable.incrementAndGet();
-				if (slowTracker.observeUnwritable(uuid, now)) {
+				boolean slowEvent = slowTracker.observeUnwritable(uuid, now);
+				ViewerLoadController.observeUnwritable(uuid, now, slowEvent);
+				if (slowEvent) {
 					slowViewerEvents.incrementAndGet();
 				}
 				continue;
 			}
 			slowTracker.observeWritable(uuid);
+			ViewerLoadController.observeWritable(uuid, now);
+
+			// 任务A-1：订阅上限——未登记交付的窗口不转发（与列表广播一致，fail-open）
+			if (!ViewerSubscriptions.isDelivered(uuid, payload.windowHandle())) {
+				skippedNotSubscribed.incrementAndGet();
+				continue;
+			}
+			// 任务A-2：分级推送（L0/L1 全量，L2 隔包减半，L3 暂停）
+			if (!ViewerLoadController.trySendAudio(uuid)) {
+				skippedLoadLevel.incrementAndGet();
+				continue;
+			}
+			// 任务A-3：全局内存守卫联动——超限时先对已降级观众（level ≥ 1）跳包
+			//（取舍见 SharedWindowFrameRelay.relayFrame 同款注释）
+			if (overLimit && ViewerLoadController.levelOf(uuid) > ViewerLoadController.LEVEL_NORMAL) {
+				skippedOverLimit.incrementAndGet();
+				continue;
+			}
 			ServerPlayNetworking.send(player, payload);
 			forwarded++;
 		}
@@ -270,6 +367,10 @@ public class AudioFrameRelay {
 	public long getDroppedNoCapability() { return droppedNoCapability.get(); }
 	public long getSkippedUnwritable() { return skippedUnwritable.get(); }
 	public long getSlowViewerEvents() { return slowViewerEvents.get(); }
+	public long getSkippedNotSubscribed() { return skippedNotSubscribed.get(); }
+	public long getSkippedLoadLevel() { return skippedLoadLevel.get(); }
+	public long getSkippedOverLimit() { return skippedOverLimit.get(); }
+	public long getDroppedMemoryGuard() { return droppedMemoryGuard.get(); }
 
 	/** P2-5：SERVER_STOPPED 清队列与统计 */
 	public void clear() {
@@ -283,5 +384,9 @@ public class AudioFrameRelay {
 		droppedNoCapability.set(0);
 		skippedUnwritable.set(0);
 		slowViewerEvents.set(0);
+		skippedNotSubscribed.set(0);
+		skippedLoadLevel.set(0);
+		skippedOverLimit.set(0);
+		droppedMemoryGuard.set(0);
 	}
 }

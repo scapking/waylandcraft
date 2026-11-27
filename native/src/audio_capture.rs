@@ -50,7 +50,8 @@
 //   - start/stop 全程被 SESSION_LIFECYCLE 互斥量串行化：任意时刻最多一个
 //     owner 线程活着，两个会话不可能并存。
 //   - poll 的 pcm 交换经 Mutex 原子完成；共享状态里只有纯数据（Vec<u8> +
-//     数值/字符串），Send+Sync 由类型系统保证（静态测试断言）。
+//     数值/字符串，PCM 带 PCM_BUFFER_CAP_BYTES 环形上限防 poll 停摆 OOM），
+//     Send+Sync 由类型系统保证（静态测试断言）。
 //
 // `enumerate_topology`（独立连接、调用线程自持自放 + quit 回执 join）仅供
 // 测试/诊断使用，不参与捕获会话生命周期。
@@ -139,6 +140,13 @@ const START_ACK_BUDGET_MS: u64 = 15_000;
 /// 自行释放，外部线程只是不再等它）。
 const STOP_JOIN_BUDGET_MS: u64 = 10_000;
 
+/// 单流 PCM 缓冲上限（字节）。process 回调只 append，消费靠 Java poll 取走；
+/// 若 poll 停摆（GC 长暂停 / 渲染卡顿 / 断线），缓冲原本会无限增长直到 OOM。
+/// 依据：48kHz × 2ch × 16bit(S16LE) = 192,000 B/s，2 秒 PCM 仅 ~384KB；Java
+/// 正常 poll 间隔为亚秒级（渲染循环每帧取走一次）。取 8MB ≈ 43s 音频余量，
+/// 即把最坏情形（poll 彻底停摆）的内存上界钉死在单流 8MB，超限丢最旧保最新。
+const PCM_BUFFER_CAP_BYTES: usize = 8 * 1024 * 1024;
+
 /// 跨线程共享的捕获状态：累积 PCM 缓冲 + 诊断字段。
 /// **只允许线程安全纯数据**——历史上 `_stream/_mainloop/_listener` 字段 +
 /// `unsafe impl Send` 就是本次崩溃的载体（pw 对象被 move 进 state 后由任意
@@ -152,6 +160,12 @@ pub struct AudioCaptureState {
     /// 诊断计数：process 回调触发次数 / 累计捕获字节
     pub capture_events: u64,
     pub total_bytes: u64,
+    /// PCM 环形上限触发后从最旧端丢弃的累计字节数（透出状态 JSON
+    /// pcm_overflow_drops，供 /wl audio status 观察 poll 停摆丢数据）。
+    pub pcm_overflow_drops: u64,
+    /// "溢出丢数据"只播报一次，防 poll 长时间停摆时日志刷屏
+    /// （poll 取空缓冲后复位 → 下一次溢出事件再报一行）。同 silence_logged 模式。
+    pub pcm_overflow_logged: bool,
     /// 全链路状态（JSON 字符串，供 Java audioCaptureStatus 查询）
     pub pid: u32,
     /// 当前捕获模式与目标（per-app: 应用播放流节点；monitor: sink 节点）
@@ -179,6 +193,19 @@ pub struct AudioCaptureState {
     pub last_error: Option<String>,
 }
 
+/// 计算为维持 PCM 环形上限（cap）需从缓冲**最旧端**丢弃的字节数。
+/// 纯函数，便于单测：
+/// - `Some(0)`：未溢出，整块追加；
+/// - `Some(n)`：先从头部丢 n 字节再追加 incoming（append 后 len 恒 <= cap）；
+/// - `None`：单块 incoming 本身 >= cap（正常 PipeWire quantum 不可能，
+///   防御分支）——整块丢弃不追加，保持缓冲长度不变式。
+fn pcm_ring_drop_for(buffered: usize, incoming: usize, cap: usize) -> Option<usize> {
+    if incoming >= cap {
+        return None;
+    }
+    Some((buffered + incoming).saturating_sub(cap))
+}
+
 impl AudioCaptureState {
     fn new(pid: u32) -> Self {
         let now = Instant::now();
@@ -189,6 +216,8 @@ impl AudioCaptureState {
             active: true,
             capture_events: 0,
             total_bytes: 0,
+            pcm_overflow_drops: 0,
+            pcm_overflow_logged: false,
             pid,
             mode: CaptureMode::MonitorFallback,
             target_node: 0,
@@ -207,6 +236,32 @@ impl AudioCaptureState {
             stream_node: 0,
             linked: false,
             last_error: None,
+        }
+    }
+
+    /// process 回调的字节入口：追加 PCM 并维护环形上限（超限丢最旧保最新）。
+    /// 返回本次丢弃的字节数（0 = 未溢出）。**调用方必须已持有 shared 锁**
+    /// （owner 线程 process 回调 / 测试）——缓冲操作全部在锁内完成，
+    /// 不引入任何跨线程 pw/缓冲访问（v1.3.0-sync7 单 owner 线程模型不变）。
+    fn push_pcm(&mut self, src: &[u8]) -> u64 {
+        match pcm_ring_drop_for(self.pcm.len(), src.len(), PCM_BUFFER_CAP_BYTES) {
+            Some(0) => {
+                self.pcm.extend_from_slice(src);
+                0
+            }
+            Some(n) => {
+                self.pcm.drain(..n);
+                self.pcm.extend_from_slice(src);
+                let dropped = n as u64;
+                self.pcm_overflow_drops += dropped;
+                dropped
+            }
+            // 防御分支：单块 >= 上限，整块丢弃不追加（缓冲长度不变式保持）
+            None => {
+                let dropped = src.len() as u64;
+                self.pcm_overflow_drops += dropped;
+                dropped
+            }
         }
     }
 }
@@ -782,11 +837,21 @@ fn connect_capture(
                             {
                                 let mut s = shared_process.lock().unwrap();
                                 if s.active {
-                                    s.pcm.extend_from_slice(src);
-                                    s.total_bytes += src.len() as u64;
+                                    let incoming = src.len();
+                                    let dropped = s.push_pcm(src);
+                                    s.total_bytes += incoming as u64;
                                     s.capture_events += 1;
                                     // watchdog 的存活依据：收到数据的最新时刻
                                     s.last_data_at = Instant::now();
+                                    if dropped > 0 && !s.pcm_overflow_logged {
+                                        // 分级=失败行（poll 停摆丢数据）：每次
+                                        // "溢出事件段"只报一行，poll 取空缓冲后复位。
+                                        s.pcm_overflow_logged = true;
+                                        log_line = Some(format!(
+                                            "[audio] PCM buffer overflow: dropped {} bytes this event, {} total (cap={} bytes, Java poll 停摆？) — 后续丢弃仅累计 pcm_overflow_drops",
+                                            dropped, s.pcm_overflow_drops, PCM_BUFFER_CAP_BYTES
+                                        ));
+                                    }
                                     if s.capture_events == 1 {
                                         // 分级=里程碑（首包 LIVE 证据，会话一次）：保留。
                                         log_line = Some(format!(
@@ -1042,6 +1107,7 @@ fn stop_locked() {
         let mut s = session.shared.lock().unwrap_or_else(|e| e.into_inner());
         s.active = false;
         s.pcm.clear();
+        s.pcm_overflow_logged = false;
     }
     join_owner(&session);
     audio_log!("[audio] capture stopped");
@@ -1096,6 +1162,8 @@ pub fn poll_audio_capture() -> Option<Vec<u8>> {
     out.extend_from_slice(&(s.channels as u32).to_le_bytes());
     // append：一次锁内整段转移（等价原子交换；s.pcm 变空、保留分配）
     out.append(&mut s.pcm);
+    // 缓冲已取空 → 下一次溢出事件重新播报一行（与 pcm_overflow_logged 的一次性语义配套）
+    s.pcm_overflow_logged = false;
     Some(out)
 }
 
@@ -1130,7 +1198,8 @@ pub fn get_audio_capture_status() -> String {
             r#"{{"active":{},"stage":"{}","mode":"{}","pid":{},"#,
             r#""target_node":{},"target_name":"{}","fallback_reason":{},"#,
             r#""sink_node":{},"sink_name":"{}","stream_node":{},"linked":{},"#,
-            r#""capture_events":{},"total_bytes":{},"reconnects":{},"#,
+            r#""capture_events":{},"total_bytes":{},"pcm_overflow_drops":{},"#,
+            r#""reconnects":{},"#,
             r#""sample_rate":{},"channels":{},"last_error":{}}}"#
         ),
         s.active,
@@ -1149,6 +1218,7 @@ pub fn get_audio_capture_status() -> String {
         s.linked,
         s.capture_events,
         s.total_bytes,
+        s.pcm_overflow_drops,
         s.total_reconnects,
         s.sample_rate,
         s.channels,
@@ -1793,6 +1863,86 @@ mod tests {
     fn shared_state_is_send_sync_by_construction() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<AudioCaptureState>();
+    }
+
+    // ── PCM 环形上限（poll 停摆防 OOM）───────────────────────────────
+
+    #[test]
+    fn pcm_ring_no_drop_below_cap() {
+        let cap = 1000;
+        assert_eq!(pcm_ring_drop_for(0, 400, cap), Some(0));
+        // 恰好填满：不丢
+        assert_eq!(pcm_ring_drop_for(600, 400, cap), Some(0));
+    }
+
+    #[test]
+    fn pcm_ring_overflow_drops_oldest_keeps_newest() {
+        let cap = 1000;
+        // 800 + 400 = 1200 > cap → 丢最旧 200（append 后 len == cap）
+        assert_eq!(pcm_ring_drop_for(800, 400, cap), Some(200));
+        // 丢弃量永远不会吃掉"保住的新数据"：drop = buffered + incoming - cap < buffered
+        assert_eq!(pcm_ring_drop_for(99, 98, 100), Some(97));
+    }
+
+    #[test]
+    fn pcm_ring_oversized_chunk_dropped_whole() {
+        // 单块 >= cap（正常 quantum 不可能的防御分支）：整块丢弃
+        assert_eq!(pcm_ring_drop_for(10, 1000, 1000), None);
+        assert_eq!(pcm_ring_drop_for(10, 2000, 1000), None);
+    }
+
+    #[test]
+    fn push_pcm_caps_buffer_counts_drops_and_keeps_newest() {
+        let mut s = AudioCaptureState::new(0);
+        let half = PCM_BUFFER_CAP_BYTES / 2;
+        let a = vec![0xAAu8; half];
+        let b = vec![0xBBu8; half];
+        let c = vec![0xCCu8; half];
+
+        assert_eq!(s.push_pcm(&a), 0);
+        assert_eq!(s.pcm.len(), half);
+        assert_eq!(s.push_pcm(&b), 0);
+        assert_eq!(s.pcm.len(), PCM_BUFFER_CAP_BYTES);
+        assert_eq!(s.pcm_overflow_drops, 0);
+
+        // 第三块触发溢出：丢最旧 half（整块 a），保留 b + c，缓冲钉在 cap
+        assert_eq!(s.push_pcm(&c), half as u64);
+        assert_eq!(s.pcm.len(), PCM_BUFFER_CAP_BYTES);
+        assert_eq!(&s.pcm[..half], &b[..], "应保留中间块 b（丢最旧保最新）");
+        assert_eq!(&s.pcm[half..], &c[..], "最新块 c 完整保留在尾部");
+        assert_eq!(s.pcm_overflow_drops, half as u64);
+    }
+
+    #[test]
+    fn push_pcm_steady_overflow_keeps_buffer_at_cap() {
+        // 模拟 poll 长期停摆：连续小块写入 4x cap 的量，
+        // 缓冲长度恒 <= cap，丢弃计数 = 超出部分，且后续仍持续接收新数据。
+        let mut s = AudioCaptureState::new(0);
+        let chunk = vec![0x7Fu8; 4096]; // 正常 PipeWire quantum 量级
+        let chunks = (PCM_BUFFER_CAP_BYTES / 4096) * 4;
+        let mut total_dropped = 0u64;
+        for _ in 0..chunks {
+            total_dropped += s.push_pcm(&chunk);
+        }
+        assert!(s.pcm.len() <= PCM_BUFFER_CAP_BYTES, "缓冲必须钉在 cap 内");
+        assert_eq!(s.pcm.len(), PCM_BUFFER_CAP_BYTES);
+        assert_eq!(
+            s.pcm_overflow_drops,
+            (chunks as usize * 4096 - PCM_BUFFER_CAP_BYTES) as u64
+        );
+        assert_eq!(total_dropped, s.pcm_overflow_drops);
+        // 丢弃后仍能继续接收（不进入任何"拒收"死态）
+        assert_eq!(s.push_pcm(&chunk), 4096);
+    }
+
+    #[test]
+    fn push_pcm_oversized_chunk_counts_but_appends_nothing() {
+        let mut s = AudioCaptureState::new(0);
+        s.pcm.extend_from_slice(&[1u8; 100]);
+        let huge = vec![0xDDu8; PCM_BUFFER_CAP_BYTES + 16];
+        assert_eq!(s.push_pcm(&huge), huge.len() as u64);
+        assert_eq!(s.pcm.len(), 100, "超大块不追加，旧数据原样保留");
+        assert_eq!(s.pcm_overflow_drops, huge.len() as u64);
     }
 }
 

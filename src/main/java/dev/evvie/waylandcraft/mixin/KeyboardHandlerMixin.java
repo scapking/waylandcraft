@@ -1,5 +1,9 @@
 package dev.evvie.waylandcraft.mixin;
 
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.Map;
+
 import org.lwjgl.glfw.GLFW;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -7,6 +11,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 import dev.evvie.waylandcraft.WaylandCraft;
+import dev.evvie.waylandcraft.WaylandCraft.KeyboardCaptureMode;
 import dev.evvie.waylandcraft.WaylandCraftCommon;
 import net.minecraft.client.KeyboardHandler;
 import net.minecraft.client.Minecraft;
@@ -14,6 +19,87 @@ import net.minecraft.client.input.KeyEvent;
 
 @Mixin(KeyboardHandler.class)
 public class KeyboardHandlerMixin {
+
+	// ═════════ release 丢失误吞兜底（"窗口里有个键永远按住"） ═════════
+	//
+	// 复现条件（本修复前的两条真实丢 release 路径）：
+	//  A) J/G 绑定（CAPTURE/HARD_CAPTURE）中按住窗口键 → G 模式鼠标未绑定，
+	//     鼠标点开任意 MC 屏幕（暂停/设置）→ 本方法仍被回调，但下方
+	//     screen!=null / level==null 早退把该键的 RELEASE 一并丢弃 →
+	//     窗口收不到 wl_keyboard release，永远认为键按住（卡键/自动重复）。
+	//  B) 绑定中按住窗口键 → ESC 退出绑定（模式变 NONE）→ 之后该键的
+	//     RELEASE 虽能进 onKeyPress，但 NONE 分支只做共享 hover 兜底后
+	//     return false，不路由本地 bridge → release 丢弃，同卡键。
+	//  C) MC 自身的窗口失焦处理会重置按键但不走 KeyboardHandler.keyPress
+	//     （如切窗口/最小化）→ release 事件根本不到这里。
+	//
+	// 修复（v1.4.6 syncCapsLock 同款"GLFW 真值校准"模式）：
+	//  1) 跟踪所有被 WaylandCraft 转发进窗口的 press（scancode → 记录）。
+	//     ESC 明确排除——其 release 的既定语义是退出绑定，绝不能合成；
+	//  2) 被跟踪键的 RELEASE 在早退门之前走修复路径：照常走 onKeyPress
+	//     完整路由（模式未变时路由目标正确）；press 走的是本地路径而模式
+	//     已回 NONE 时 onKeyPress 不会路由本地 → 直接 bridge.releaseKey 兜底；
+	//  3) 每个新 PRESS 事件对跟踪表做一次 GLFW 真值校准：glfwGetKey 报
+	//     RELEASE 而表内仍按住 = release 曾被吞（路径 C）→ 合成 release。
+	// 非窗口键（MC 自身消费的按键）零行为变化：跟踪表只记录被拦截转发的
+	// press，其余按键流程与旧版完全一致。
+
+	/** 被转发进窗口且尚未见到 release 的按键：scancode → 转发记录。 */
+	private static final Map<Integer, ForwardedPress> FORWARDED_WINDOW_KEYS = new HashMap<>();
+
+	/** 一条 press 转发记录：GLFW keycode（glfwGetKey 校准用）+ 是否本地 bridge 路径。 */
+	private static final class ForwardedPress {
+		final int keyCode;
+		final boolean localWindow;
+
+		ForwardedPress(int keyCode, boolean localWindow) {
+			this.keyCode = keyCode;
+			this.localWindow = localWindow;
+		}
+	}
+
+	/**
+	 * 被吞 release 的修复转发。本地键：模式未变时走 onKeyPress 完整路由；
+	 * 模式已回 NONE（复现 B）时 NONE 分支不路由本地，直接 bridge.releaseKey。
+	 * 共享键：一律走 onKeyPress——hover 在则 paired release，hover 丢则其
+	 * releaseAllForwardedKeys 兜底，均无需本地动作。
+	 */
+	private static void forwardLostRelease(long windowHandle, int scancode, ForwardedPress held, int modifiers) {
+		WaylandCraft wlc = WaylandCraft.instance;
+		if(wlc == null) return;
+		boolean routed = false;
+		if(held.localWindow) {
+			if(wlc.keyboardCaptureMode != KeyboardCaptureMode.NONE) {
+				routed = wlc.onKeyPress(windowHandle, held.keyCode, scancode, GLFW.GLFW_RELEASE, modifiers);
+			}
+			if(!routed && wlc.bridge != null) {
+				wlc.bridge.releaseKey(scancode);
+			}
+		} else {
+			wlc.onKeyPress(windowHandle, held.keyCode, scancode, GLFW.GLFW_RELEASE, modifiers);
+		}
+		// 修复转发是低频事件（只在丢 release 后发生一次），INFO 保留可观测性。
+		WaylandCraftCommon.LOGGER.info("[kb-debug] 丢 release 修复转发 key={} scancode={} local={}",
+			held.keyCode, scancode, held.localWindow);
+	}
+
+	/**
+	 * GLFW 真值校准（新 PRESS 事件时执行）：glfwGetKey 已报 RELEASE 而跟踪表
+	 * 仍按住的键 = release 事件曾被吞 → 合成修复转发。典型即 MC 失焦重置
+	 * （路径 C）——那些 release 不会经过 KeyboardHandler.keyPress。
+	 */
+	private static void calibrateStuckKeys(long windowHandle, int modifiers) {
+		if(FORWARDED_WINDOW_KEYS.isEmpty()) return;
+		Iterator<Map.Entry<Integer, ForwardedPress>> it = FORWARDED_WINDOW_KEYS.entrySet().iterator();
+		while(it.hasNext()) {
+			Map.Entry<Integer, ForwardedPress> e = it.next();
+			if(GLFW.glfwGetKey(windowHandle, e.getValue().keyCode) == GLFW.GLFW_RELEASE) {
+				it.remove();
+				forwardLostRelease(windowHandle, e.getKey(), e.getValue(), modifiers);
+			}
+		}
+	}
+
 	
 	/**
 	 * 游戏内按键拦截 + xkb 状态同步（合并为单个 HEAD 注入，顺序保证）。
@@ -73,17 +159,38 @@ public class KeyboardHandlerMixin {
 			WaylandCraft.instance.bridge.syncCapsLock(capsOn);
 			WaylandCraft.instance.bridge.internalKeyUpdate(scancode, action == GLFW.GLFW_PRESS);
 		}
-		
+
+		// 第一步半：被吞 release 的修复路径（先于早退门——见类头"复现条件"）。
+		// RELEASE：本键曾被转发进窗口 → 立即修复转发（不进 MC 屏幕流程）。
+		// PRESS：顺路做一次 GLFW 真值校准，合成曾被吞掉的 release。
+		if(action == GLFW.GLFW_RELEASE) {
+			ForwardedPress held = FORWARDED_WINDOW_KEYS.remove(scancode);
+			if(held != null) {
+				forwardLostRelease(windowHandle, scancode, held, event.modifiers());
+				return;
+			}
+		} else if(action == GLFW.GLFW_PRESS) {
+			calibrateStuckKeys(windowHandle, event.modifiers());
+		}
+
 		// 第二步：游戏内（无 UI 打开）才拦截转发到窗口
 		if(Minecraft.getInstance().level == null) return;
 		if(Minecraft.getInstance().screen != null) return;
-		
+
 		boolean intercepted = WaylandCraft.instance.onKeyPress(windowHandle, event.key(), scancode, action, event.modifiers());
 		if(intercepted) info.cancel();
 		// [kb-debug] onKeyPress 返回值 = 是否拦截（true 才 cancel，Minecraft 收不到该键）
 		// v1.4.2：逐键 INFO → verbose 门（同上）。
 		if(dev.evvie.waylandcraft.utils.WcLogging.verbose()) {
 			WaylandCraftCommon.LOGGER.info("[kb-debug] onKeyPress 返回 {} (key={} action={})", intercepted, event.key(), action);
+		}
+
+		// 第三步：跟踪窗口按键 press（release 兜底的依据）。只记录"被拦截
+		// 且 mode!=NONE（本地 bridge）或 NONE+hover（共享窗口）"的 press；
+		// ESC 排除——其 release 的既定语义是退出绑定，绝不能合成修复转发。
+		if(action == GLFW.GLFW_PRESS && intercepted && event.key() != GLFW.GLFW_KEY_ESCAPE) {
+			FORWARDED_WINDOW_KEYS.put(scancode, new ForwardedPress(event.key(),
+					WaylandCraft.instance.keyboardCaptureMode != KeyboardCaptureMode.NONE));
 		}
 	}
 	
