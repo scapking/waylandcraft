@@ -42,11 +42,19 @@ public final class ImmerseSkyRenderer {
 	
 	private ImmerseSkyRenderer() {}
 	
-	/** 立方壳半径（格）：远于一切窗口交互距离，近于 vanilla 天空盒深度 */
-	private static final float SKY_RADIUS = 150.0f;
-	/** 星域周期（格）：相对相机坐标按此折叠（无限环绕折返） */
-	private static final float STAR_PERIOD = 520.0f;
-	private static final int STAR_COUNT = 1400;
+	/**
+	 * 立方壳半径（格）。⑩ v1.5.2 语义变更：壳是**贴身不透明遮挡壳**——
+	 * 8 格外的一切世界内容（地形/实体/天空盒）被壳的深度遮挡"视觉消失"
+	 * （等效沉浸，且与 Sodium/Iris 的地形路径零冲突——1.5.1 的
+	 * LevelRendererImmerseMixin WrapOperation 在 Sodium 环境注入失败导致
+	 * 启动崩溃，已删除）。窗口摆位默认 ≤6 格，在壳内自然可见。
+	 * 贴脸（<8 格）的世界方块会穿出壳——如遇场景可将半径调大。
+	 */
+	private static final float SKY_RADIUS = 14.0f;
+	/** 星域周期（格）：星域贴身化（半径 3..7.5 < 壳 8）→ 周期同步缩到 16，
+	 *  飞行时星快速掠过（星际穿越式流动感），且永远在壳内可见 */
+	private static final float STAR_PERIOD = 14.0f;   // 折返立方对角 12.1 < 壳 14：星永远在壳内
+	private static final int STAR_COUNT = 700;
 	private static final int BRIGHT_STAR_COUNT = 40;
 	
 	public static final RenderPipeline SKY_PIPELINE = RenderPipelines.register(
@@ -110,11 +118,11 @@ public final class ImmerseSkyRenderer {
 			boolean bright = i >= STAR_COUNT;
 			double th = rnd.nextDouble() * Math.PI * 2;
 			double ph = Math.acos(2 * rnd.nextDouble() - 1);
-			double rr = bright ? 40 + rnd.nextDouble() * 180 : 30 + Math.pow(rnd.nextDouble(), 0.6) * 230;
+			double rr = bright ? 4.0 + rnd.nextDouble() * 3.0 : 3.0 + Math.pow(rnd.nextDouble(), 0.6) * 4.5;
 			float x = (float)(ax + rr * Math.sin(ph) * Math.cos(th));
 			float y = (float)(ay + rr * Math.cos(ph));
 			float z = (float)(az + rr * Math.sin(ph) * Math.sin(th));
-			float size = bright ? (float)(0.5 + rnd.nextDouble() * 0.4) : (float)(0.12 + rnd.nextDouble() * 0.16);
+			float size = bright ? (float)(0.22 + rnd.nextDouble() * 0.18) : (float)(0.05 + rnd.nextDouble() * 0.09);
 			float t = rnd.nextFloat();
 			float r, g, b;
 			if(t < 0.20f)      { r = 0.72f; g = 0.82f; b = 1.00f; }  // 蓝白
